@@ -605,9 +605,45 @@ static bool eager_capability_declared(enum ggml_op op) {
     }
 }
 
+// The HRX kernel corpus only provides quantized matmul/embedding kernels for a small set of weight
+// quantizations (Q4_K / Q6_K, plus unquantized F32/F16/BF16 operands). Weights stored in any other
+// quantization (q8_0, iq3_xxs, iq4_nl, iq4_xs, Q3_K, Q5_K, ...) have no HRX kernel, so HRX must NOT
+// claim them: doing so either pins the weight into an HRX buffer that cannot run its consuming op
+// (hard "unsupported HRX node" failure) or forces per-token weight copies back to the CPU. Declining
+// them lets the scheduler keep those weights on the CPU and run the op there.
+static bool hrx_weight_quant_supported(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op) {
     GGML_UNUSED(device);
-    return op != nullptr && eager_capability_declared(op->op);
+    if (op == nullptr || !eager_capability_declared(op->op)) {
+        return false;
+    }
+
+    switch (op->op) {
+        // Placement probe: the scheduler asks whether an HRX buffer may hold a pre-allocated tensor by
+        // presenting it as a NONE op. Decline weights whose quantization has no HRX kernel so they stay
+        // on the CPU instead of being pinned into an HRX buffer we cannot compute against.
+        case GGML_OP_NONE:
+            return hrx_weight_quant_supported(op->type);
+        // Weight-consuming ops: the first source is the weight. Decline unsupported weight quantizations.
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            return op->src[0] == nullptr || hrx_weight_quant_supported(op->src[0]->type);
+        default:
+            return true;
+    }
 }
 
 static bool device_supports_buffer_type(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
