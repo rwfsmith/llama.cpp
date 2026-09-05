@@ -338,6 +338,28 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
+if (TARGET ggml-hrx)
+    add_executable(test-hrx-buffer test-hrx-buffer.cpp)
+    target_link_libraries(test-hrx-buffer PRIVATE ggml-hrx ggml hrx::hrx)
+    target_include_directories(test-hrx-buffer PRIVATE ../ggml/include ../ggml/src ../ggml/src/ggml-hrx)
+    add_test(NAME test-hrx-buffer COMMAND test-hrx-buffer)
+
+    add_executable(hrx-backend-test hrx-backend-test.cpp)
+    target_link_libraries(hrx-backend-test PRIVATE ggml-hrx ggml hrx::hrx loomc::loomc)
+    target_include_directories(hrx-backend-test PRIVATE ../ggml/include ../ggml/src ../ggml/src/ggml-hrx)
+    add_test(NAME hrx-backend-test COMMAND hrx-backend-test)
+
+    add_executable(test-hrx-loom-jit test-hrx-loom-jit.cpp)
+    target_link_libraries(test-hrx-loom-jit PRIVATE ggml-hrx ggml-hrx-kernel-corpus hrx::hrx loomc::loomc)
+    target_include_directories(test-hrx-loom-jit PRIVATE ../ggml/include ../ggml/src ../ggml/src/ggml-hrx)
+    add_test(NAME test-hrx-loom-jit COMMAND test-hrx-loom-jit)
+
+    add_executable(test-hrx-ops test-hrx-ops.cpp)
+    target_link_libraries(test-hrx-ops PRIVATE ggml-hrx ggml hrx::hrx loomc::loomc)
+    target_include_directories(test-hrx-ops PRIVATE ../ggml/include ../ggml/src ../ggml/src/ggml-hrx)
+    add_test(NAME test-hrx-ops COMMAND test-hrx-ops)
+endif()
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)
