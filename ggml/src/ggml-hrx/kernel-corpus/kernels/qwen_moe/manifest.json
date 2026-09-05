@@ -105,6 +105,21 @@
       "size": 33238
     },
     {
+      "path": "qwen3_moe/routed_down_q8_0.loom",
+      "sha256": "52db0c0f65e9d0503a4950f17a52017d78f41b8c05f98a9aa6a4d8f75e9a1f43",
+      "size": 17044
+    },
+    {
+      "path": "qwen3_moe/routed_down_q5_1.loom",
+      "sha256": "72189a1f0da3da8ac618673dd2d7de76765ddf41b0b5b6381e158073ae9f21a4",
+      "size": 21105
+    },
+    {
+      "path": "qwen3_moe/routed_down_iq4_nl.loom",
+      "sha256": "fc80174ef33e91ad08e03d1281b71a41a8fb2b9b0e554ae5ff7fc7c058a34a91",
+      "size": 29358
+    },
+    {
       "path": "qwen3_moe/routed_down_q6k.loom",
       "sha256": "fd8bc76bafd174fd57e298849f65c2876186b1c6aeaa90e3b419f26b2a5d0326",
       "size": 64580
@@ -4471,6 +4486,263 @@
         "library_sources": []
       },
       "compile_dependencies": []
+    },
+    {
+      "name": "qwen3_moe_routed_down_q8_0_q8_1_x4",
+      "symbol": "qwen3_moe_routed_down_q8_0_q8_1_x4",
+      "source": "qwen3_moe/routed_down_q8_0.loom",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "route_count",
+          "type": "index"
+        },
+        {
+          "name": "route_id_stride",
+          "type": "index"
+        },
+        {
+          "name": "expert_count",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "route_count",
+          "type": "index"
+        },
+        {
+          "name": "route_id_stride",
+          "type": "index"
+        },
+        {
+          "name": "expert_count",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "q8_input",
+        "route_ids",
+        "route_weights",
+        "weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "routed_down_q8_0_linked",
+        "primary_sources": [
+          "qwen3_moe/routed_down_q8_0.loom"
+        ],
+        "library_sources": [
+          "ggml/quantize_q8_1_x4.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "ggml/quantize_q8_1_x4.loom"
+      ]
+    },
+    {
+      "name": "qwen3_moe_routed_down_q5_1_q8_1_x4",
+      "symbol": "qwen3_moe_routed_down_q5_1_q8_1_x4",
+      "source": "qwen3_moe/routed_down_q5_1.loom",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "route_count",
+          "type": "index"
+        },
+        {
+          "name": "route_id_stride",
+          "type": "index"
+        },
+        {
+          "name": "expert_count",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "route_count",
+          "type": "index"
+        },
+        {
+          "name": "route_id_stride",
+          "type": "index"
+        },
+        {
+          "name": "expert_count",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "q8_input",
+        "route_ids",
+        "route_weights",
+        "weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "routed_down_q5_1_linked",
+        "primary_sources": [
+          "qwen3_moe/routed_down_q5_1.loom"
+        ],
+        "library_sources": [
+          "ggml/quantize_q8_1_x4.loom",
+          "qwen3_moe/routed_gate_up_swiglu_q4k.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "ggml/quantize_q8_1_x4.loom",
+        "qwen3_moe/routed_gate_up_swiglu_q4k.loom"
+      ]
+    },
+    {
+      "name": "qwen3_moe_routed_down_iq4_nl_q8_1_x4",
+      "symbol": "qwen3_moe_routed_down_iq4_nl_q8_1_x4",
+      "source": "qwen3_moe/routed_down_iq4_nl.loom",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "route_count",
+          "type": "index"
+        },
+        {
+          "name": "route_id_stride",
+          "type": "index"
+        },
+        {
+          "name": "expert_count",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "route_count",
+          "type": "index"
+        },
+        {
+          "name": "route_id_stride",
+          "type": "index"
+        },
+        {
+          "name": "expert_count",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "q8_input",
+        "route_ids",
+        "route_weights",
+        "weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "routed_down_iq4_nl_linked",
+        "primary_sources": [
+          "qwen3_moe/routed_down_iq4_nl.loom"
+        ],
+        "library_sources": [
+          "ggml/quantize_q8_1_x4.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "ggml/quantize_q8_1_x4.loom"
+      ]
     }
   ],
   "link_modules": [

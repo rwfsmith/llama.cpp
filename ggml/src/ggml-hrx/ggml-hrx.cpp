@@ -624,6 +624,38 @@ static bool hrx_weight_quant_supported(enum ggml_type type) {
     }
 }
 
+// qwen4exp (Q4_K_XL / Q3_K_XL GGUF quantizations) stores its MoE down-projection expert weights
+// (ffn_down_exps) in 32-block quantizations -- Q5_1, Q8_0, IQ4_NL -- because its contraction width
+// (expert_hidden_size == kLlmMoeQwen4ExpDispatchProfile.expert_hidden_size == 640) is NOT a multiple
+// of 256, so the existing Q4_K/Q6_K (256-superblock) HRX down kernels cannot read it (see
+// hrx-moe-down-kernel-spec.md §4). A dedicated 32-block down kernel is authored against exactly that
+// (op == MUL_MAT_ID, quant, contraction-width) triple.
+//
+// Crucially, Q8_0 is ALSO the quantization used for this model family's attention/lm_head projection
+// weights, which are plain (dense) GGML_OP_MUL_MAT nodes, not GGML_OP_MUL_MAT_ID, and have NO HRX
+// kernel. That is why this check must stay separate from hrx_weight_quant_supported() (which is
+// op-agnostic): folding Q5_1/Q8_0/IQ4_NL into hrx_weight_quant_supported() would make HRX also claim
+// attention's dense Q8_0 MUL_MAT and crash at runtime with no kernel able to run it. Instead this is
+// consulted only from the GGML_OP_MUL_MAT_ID arm of device_supports_op(), and only for weights whose
+// shape matches the down-projection contraction width.
+static bool hrx_moe_down_quant_supported(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Contraction width (ne[0]) of a qwen4exp MUL_MAT_ID down-projection weight (ffn_down_exps):
+// expert_hidden_size == 640 per kLlmMoeQwen4ExpDispatchProfile. 640 is not a multiple of 256 -- unlike
+// qwen30b's expert_hidden_size == 768, which the existing Q4_K/Q6_K down kernels already cover -- so
+// checking this exact width is what distinguishes a qwen4exp down weight from any other MUL_MAT_ID
+// operand purely from the tensor itself, with no model/profile context available at this call site.
+static constexpr int64_t kHrxMoeDownExpertHiddenSizeQwen4Exp = 640;
+
 static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op) {
     GGML_UNUSED(device);
     if (op == nullptr || !eager_capability_declared(op->op)) {
@@ -639,8 +671,28 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // Weight-consuming ops: the first source is the weight. Decline unsupported weight quantizations.
         case GGML_OP_GET_ROWS:
         case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
             return op->src[0] == nullptr || hrx_weight_quant_supported(op->src[0]->type);
+        case GGML_OP_MUL_MAT_ID:
+            if (op->src[0] == nullptr) {
+                return true;
+            }
+            if (hrx_weight_quant_supported(op->src[0]->type)) {
+                return true;
+            }
+            // qwen4exp routed (MoE) down-projection: 32-block quant + down-projection contraction
+            // shape. See hrx_moe_down_quant_supported() above for why this is scoped to MUL_MAT_ID
+            // and to this specific shape, and hrx-moe-down-kernel-spec.md §4 for the full rationale.
+            // dispatch-routed-ffn.cpp registers "llm.routed_ffn.decode_down_qwen4exp", which matches
+            // Q5_1/Q8_0/IQ4_NL MUL_MAT_ID nodes fitting the decode-time weighted-reduce+residual-add
+            // topology. NOTE: this device_supports_op() check is still shape-only (op-level), so it
+            // will also claim MUL_MAT_ID nodes of this quant/shape whose surrounding graph topology
+            // does NOT match that dispatch (e.g. prefill, or an unexpected fusion) -- those nodes have
+            // no other registered matcher and will hard-abort in DispatchScheduler rather than falling
+            // back to CPU. This is the same general class of issue as the broader compute-op
+            // over-claim in the `default: return true;` case below (RMS_NORM/ADD/ROPE/etc.), just
+            // narrower in scope since it is gated to one specific weight quant+shape combination.
+            return hrx_moe_down_quant_supported(op->src[0]->type) &&
+                   op->src[0]->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp;
         default:
             return true;
     }
