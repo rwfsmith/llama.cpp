@@ -5,9 +5,17 @@
 //   k: 16 heads x 128
 //   v: 48 heads x 128
 //
-// The convolution history stores three contiguous F32 values per channel.
-// The recurrent state is transposed so each 128-value state column is
-// contiguous. No parameter or state repacking is required.
+// The convolution input is the already-assembled four-tap window (three
+// history taps followed by the new column), four contiguous F32 values per
+// channel -- this is qwen4exp.cpp's build_conv_state_at() CONCAT output.
+// That CONCAT's own persistent-state write-back (the [TAG_RECURRENT_ROLLBACK_SPLITS]
+// ggml_cpy in build_conv_state_at()) is a separate graph node this kernel does
+// not need to know about; the kernel only reads the four-tap window, it never
+// mutates conv-history state itself (see qwen4exp.gdn_conv_prepare_decode's
+// dispatch-side comment for why CONCAT is not, and cannot be, part of this
+// kernel's own fused match). The recurrent state is transposed so each
+// 128-value state column is contiguous. No parameter or state repacking is
+// required.
 
 // Every file that references this symbol must locally redeclare it -- loom-link
 // validates each corpus source standalone (--mode=archive --strip-check) before
@@ -16,42 +24,39 @@ config.decl @qwen4exp.model.rms_epsilon : f32
 
 func.decl @qwen38_gdn_key_head_for_value_head(%value_head: index) -> (index)
 
-// Applies the four-tap depthwise convolution for one physical QKV channel,
-// advances its three-value history, and returns the SiLU activation.
-func.def inline @qwen38_gdn_conv_channel(%channel: index, %qkv_input: buffer, %conv_weight: buffer, %conv_history: buffer) -> (f32) {
+// Applies the four-tap depthwise convolution for one physical QKV channel
+// and returns the SiLU activation. %conv_input holds the already-assembled
+// four-tap window (three history taps then the new column, see file header);
+// there is no history state to advance here -- qwen4exp.cpp's
+// build_conv_state_at() persists the rolled-forward window itself, straight
+// from the CONCAT node's own output, independently of this kernel.
+func.def inline @qwen38_gdn_conv_channel(%channel: index, %conv_input: buffer, %conv_weight: buffer) -> (f32) {
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
   %c3 = index.constant 3 : index
   %c4 = index.constant 4 : index
   %c0_offset = index.constant 0 : offset
-  %history_base = index.mul %channel, %c3 : index
-  %history1_index = index.add %history_base, %c1 : index
-  %history2_index = index.add %history_base, %c2 : index
-  %weight_base = index.mul %channel, %c4 : index
-  %weight1_index = index.add %weight_base, %c1 : index
-  %weight2_index = index.add %weight_base, %c2 : index
-  %weight3_index = index.add %weight_base, %c3 : index
-  %input_view = buffer.view %qkv_input[%c0_offset] : buffer -> view<10240xf32>
+  %tap_base = index.mul %channel, %c4 : index
+  %tap1_index = index.add %tap_base, %c1 : index
+  %tap2_index = index.add %tap_base, %c2 : index
+  %tap3_index = index.add %tap_base, %c3 : index
+  %input_view = buffer.view %conv_input[%c0_offset] : buffer -> view<40960xf32>
   %weight_view = buffer.view %conv_weight[%c0_offset] : buffer -> view<40960xf32>
-  %history_view = buffer.view %conv_history[%c0_offset] : buffer -> view<30720xf32>
-  %history0 = view.load %history_view[%history_base] : view<30720xf32> -> f32
-  %history1 = view.load %history_view[%history1_index] : view<30720xf32> -> f32
-  %history2 = view.load %history_view[%history2_index] : view<30720xf32> -> f32
-  %current = view.load %input_view[%channel] : view<10240xf32> -> f32
-  %weight0 = view.load %weight_view[%weight_base] : view<40960xf32> -> f32
-  %weight1 = view.load %weight_view[%weight1_index] : view<40960xf32> -> f32
-  %weight2 = view.load %weight_view[%weight2_index] : view<40960xf32> -> f32
-  %weight3 = view.load %weight_view[%weight3_index] : view<40960xf32> -> f32
-  %product0 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %history0, %weight0 : f32
-  %product1 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %history1, %weight1 : f32
-  %product2 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %history2, %weight2 : f32
-  %product3 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %current, %weight3 : f32
+  %tap0 = view.load %input_view[%tap_base] : view<40960xf32> -> f32
+  %tap1 = view.load %input_view[%tap1_index] : view<40960xf32> -> f32
+  %tap2 = view.load %input_view[%tap2_index] : view<40960xf32> -> f32
+  %tap3 = view.load %input_view[%tap3_index] : view<40960xf32> -> f32
+  %weight0 = view.load %weight_view[%tap_base] : view<40960xf32> -> f32
+  %weight1 = view.load %weight_view[%tap1_index] : view<40960xf32> -> f32
+  %weight2 = view.load %weight_view[%tap2_index] : view<40960xf32> -> f32
+  %weight3 = view.load %weight_view[%tap3_index] : view<40960xf32> -> f32
+  %product0 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %tap0, %weight0 : f32
+  %product1 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %tap1, %weight1 : f32
+  %product2 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %tap2, %weight2 : f32
+  %product3 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %tap3, %weight3 : f32
   %sum01 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %product0, %product1 : f32
   %sum23 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %product2, %product3 : f32
   %convolved = scalar.addf<reassoc|nnan|ninf|nsz|contract> %sum01, %sum23 : f32
-  view.store %history1, %history_view[%history_base] : f32, view<30720xf32>
-  view.store %history2, %history_view[%history1_index] : f32, view<30720xf32>
-  view.store %current, %history_view[%history2_index] : f32, view<30720xf32>
   %activated = scalar.siluf<afn> %convolved : f32
   func.return %activated : f32
 }
@@ -65,7 +70,7 @@ kernel.def export("qwen38_gdn_conv_prepare_decode") @qwen38_gdn_conv_prepare_dec
   %key_head_count = index.constant 16 : index
   %workgroup_size = index.constant 256 : index
   kernel.launch.config workgroups(%key_head_count, %unit, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
-} launch(%qkv_input: buffer, %conv_weight: buffer, %conv_history: buffer, %qkv_silu: buffer, %qk_inverse_norm: buffer) {
+} launch(%conv_input: buffer, %conv_weight: buffer, %qkv_silu: buffer, %qk_inverse_norm: buffer) {
   // rms_epsilon is a fixed model hyperparameter (qwen4exp.cpp: hparams.f_norm_rms_eps),
   // not a per-dispatch value, so it is a compile-time config rather than a launch
   // argument -- HRX's launch-parameter packer only accepts "index"-typed scalars.
@@ -101,7 +106,7 @@ kernel.def export("qwen38_gdn_conv_prepare_decode") @qwen38_gdn_conv_prepare_dec
     %k_channel = index.assume %k_channel0 [range(%k_channel0, 2048, 4095)] : index
     scf.yield %k_channel : index
   }
-  %q_or_k_value = func.call @qwen38_gdn_conv_channel(%q_or_k_channel, %qkv_input, %conv_weight, %conv_history) : (index, buffer, buffer, buffer) -> (f32)
+  %q_or_k_value = func.call @qwen38_gdn_conv_channel(%q_or_k_channel, %conv_input, %conv_weight) : (index, buffer, buffer) -> (f32)
   view.store %q_or_k_value, %qkv_view[%q_or_k_channel] : f32, view<10240xf32>
   %q_or_k_square = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %q_or_k_value, %q_or_k_value : f32
   %q_square = scf.select %is_q_lane, %q_or_k_square, %c0_f32 : f32
@@ -112,14 +117,14 @@ kernel.def export("qwen38_gdn_conv_prepare_decode") @qwen38_gdn_conv_prepare_dec
   %value0_channel_add = index.add %value_head_channel_base, %thread : index
   %value0_channel0 = index.add %v_channel_base, %value0_channel_add : index
   %value0_channel = index.assume %value0_channel0 [range(%value0_channel0, 4096, 10239)] : index
-  %value0 = func.call @qwen38_gdn_conv_channel(%value0_channel, %qkv_input, %conv_weight, %conv_history) : (index, buffer, buffer, buffer) -> (f32)
+  %value0 = func.call @qwen38_gdn_conv_channel(%value0_channel, %conv_input, %conv_weight) : (index, buffer, buffer) -> (f32)
   view.store %value0, %qkv_view[%value0_channel] : f32, view<10240xf32>
   %has_value1 = index.cmp ult, %value_thread1, %c384 : index
   scf.if %has_value1 {
     %value1_channel_add = index.add %value_head_channel_base, %value_thread1 : index
     %value1_channel0 = index.add %v_channel_base, %value1_channel_add : index
     %value1_channel = index.assume %value1_channel0 [range(%value1_channel0, 4096, 10239)] : index
-    %value1 = func.call @qwen38_gdn_conv_channel(%value1_channel, %qkv_input, %conv_weight, %conv_history) : (index, buffer, buffer, buffer) -> (f32)
+    %value1 = func.call @qwen38_gdn_conv_channel(%value1_channel, %conv_input, %conv_weight) : (index, buffer, buffer) -> (f32)
     view.store %value1, %qkv_view[%value1_channel] : f32, view<10240xf32>
   }
 
@@ -477,9 +482,8 @@ kernel.def export("qwen38_gdn_norm_gate_decode") @qwen38_gdn_norm_gate_decode() 
 // Production-shape timing boundary for the three recurrent primitives. The
 // quantized projections on either side are benchmarked independently.
 check.case public @qwen38_gdn_decode_benchmark_case {
-  %qkv_input = check.generate.fill value(0.125) : tensor<10240xf32>
+  %conv_input = check.generate.fill value(0.125) : tensor<40960xf32>
   %conv_weight = check.generate.fill value(0.25) : tensor<40960xf32>
-  %conv_history = check.generate.fill value(-0.0625) : tensor<30720xf32>
   %qkv_silu = check.generate.fill value(0.0) : tensor<10240xf32>
   %qk_inverse_norm = check.generate.fill value(0.0) : tensor<32xf32>
   %gate = check.generate.fill value(0.125) : tensor<48xf32>
@@ -490,7 +494,7 @@ check.case public @qwen38_gdn_decode_benchmark_case {
   %norm_weight = check.generate.fill value(1.0) : tensor<128xf32>
   %z = check.generate.fill value(0.25) : tensor<6144xf32>
   %output = check.generate.fill value(0.0) : tensor<6144xf32>
-  kernel.launch @qwen38_gdn_conv_prepare_decode(%qkv_input, %conv_weight, %conv_history, %qkv_silu, %qk_inverse_norm) : (tensor<10240xf32>, tensor<40960xf32>, tensor<30720xf32>, tensor<10240xf32>, tensor<32xf32>)
+  kernel.launch @qwen38_gdn_conv_prepare_decode(%conv_input, %conv_weight, %qkv_silu, %qk_inverse_norm) : (tensor<40960xf32>, tensor<40960xf32>, tensor<10240xf32>, tensor<32xf32>)
   kernel.launch @qwen38_gdn_recurrent_decode_x4(%qkv_silu, %qk_inverse_norm, %gate, %beta, %state, %new_state, %raw_output) : (tensor<10240xf32>, tensor<32xf32>, tensor<48xf32>, tensor<48xf32>, tensor<786432xf32>, tensor<786432xf32>, tensor<6144xf32>)
   kernel.launch @qwen38_gdn_norm_gate_decode(%raw_output, %norm_weight, %z, %output) : (tensor<6144xf32>, tensor<128xf32>, tensor<6144xf32>, tensor<6144xf32>)
   check.return
@@ -498,27 +502,31 @@ check.case public @qwen38_gdn_decode_benchmark_case {
 
 check.benchmark<@qwen38_gdn_decode_benchmark_case> @qwen38_gdn_decode
 
+// %conv_input is the already-assembled four-tap window (see file header) --
+// uniform-fill across every tap and channel, so the four-tap weighted sum
+// collapses to `4 * 0.125 * 0.25 == 0.125` for every channel; expected values
+// below are SiLU(0.125) and the matching per-head L2 reciprocal-norm,
+// independently recomputed (not just carried over from before the CONCAT/
+// SSM_CONV re-root, since the kernel's own input assembly changed).
 check.case public @qwen38_gdn_conv_prepare_decode_known_case {
-  %qkv_input = check.generate.fill value(0.125) : tensor<10240xf32>
+  %conv_input = check.generate.fill value(0.125) : tensor<40960xf32>
   %conv_weight = check.generate.fill value(0.25) : tensor<40960xf32>
-  %conv_history = check.generate.fill value(-0.0625) : tensor<30720xf32>
   %qkv_silu = check.generate.fill value(0.0) : tensor<10240xf32>
   %qk_inverse_norm = check.generate.fill value(0.0) : tensor<32xf32>
-  %expected_qkv = check.generate.fill value(-0.0077514660854831182) : tensor<10240xf32>
-  %expected_inverse_norm = check.generate.fill value(11.402790991223119) : tensor<32xf32>
-  kernel.launch @qwen38_gdn_conv_prepare_decode(%qkv_input, %conv_weight, %conv_history, %qkv_silu, %qk_inverse_norm) : (tensor<10240xf32>, tensor<40960xf32>, tensor<30720xf32>, tensor<10240xf32>, tensor<32xf32>)
+  %expected_qkv = check.generate.fill value(0.06640117167171954) : tensor<10240xf32>
+  %expected_inverse_norm = check.generate.fill value(1.331126325380239) : tensor<32xf32>
+  kernel.launch @qwen38_gdn_conv_prepare_decode(%conv_input, %conv_weight, %qkv_silu, %qk_inverse_norm) : (tensor<40960xf32>, tensor<40960xf32>, tensor<10240xf32>, tensor<32xf32>)
   check.expect.close actual(%qkv_silu) expected(%expected_qkv) atol(0.000001) rtol(0.000001) nan(same) : tensor<10240xf32>
   check.expect.close actual(%qk_inverse_norm) expected(%expected_inverse_norm) atol(0.00001) rtol(0.000001) nan(same) : tensor<32xf32>
   check.return
 }
 
 check.case public @qwen38_gdn_conv_prepare_decode_benchmark_case {
-  %qkv_input = check.generate.fill value(0.125) : tensor<10240xf32>
+  %conv_input = check.generate.fill value(0.125) : tensor<40960xf32>
   %conv_weight = check.generate.fill value(0.25) : tensor<40960xf32>
-  %conv_history = check.generate.fill value(-0.0625) : tensor<30720xf32>
   %qkv_silu = check.generate.fill value(0.0) : tensor<10240xf32>
   %qk_inverse_norm = check.generate.fill value(0.0) : tensor<32xf32>
-  kernel.launch @qwen38_gdn_conv_prepare_decode(%qkv_input, %conv_weight, %conv_history, %qkv_silu, %qk_inverse_norm) : (tensor<10240xf32>, tensor<40960xf32>, tensor<30720xf32>, tensor<10240xf32>, tensor<32xf32>)
+  kernel.launch @qwen38_gdn_conv_prepare_decode(%conv_input, %conv_weight, %qkv_silu, %qk_inverse_norm) : (tensor<40960xf32>, tensor<40960xf32>, tensor<10240xf32>, tensor<32xf32>)
   check.return
 }
 

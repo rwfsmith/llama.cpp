@@ -1,6 +1,7 @@
 #include "dispatch-gated-delta-net.h"
 
 #include "dispatch-llm-profiles.h"
+#include "ggml-impl.h"
 #include "ggml.h"
 #include "graph/graph-matcher.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
@@ -32,7 +33,6 @@ static constexpr int64_t kGdnValueHeadCount = 48;
 // conv_channels = head_k_dim*num_k_heads*2 (q,k) + head_v_dim*num_v_heads (v) = 4096 + 6144 = 10240.
 static constexpr int64_t kGdnConvChannels    = kGdnHeadDim * kGdnKeyHeadCount * 2 + kGdnHeadDim * kGdnValueHeadCount;
 static constexpr int64_t kGdnConvKernelSize  = 4;  // hparams.ssm_d_conv
-static constexpr int64_t kGdnConvHistoryLen  = kGdnConvKernelSize - 1;
 static constexpr size_t  kGdnQkInverseNormByteCount = static_cast<size_t>(2 * kGdnKeyHeadCount) * sizeof(float);
 static constexpr size_t  kGdnRawOutputByteCount =
     static_cast<size_t>(kGdnValueHeadCount * kGdnHeadDim) * sizeof(float);
@@ -62,18 +62,35 @@ static std::string to_config_value(int64_t value) {
 // ---------------------------------------------------------------------------------------------
 // qwen4exp.gdn_conv_prepare_decode
 //
-// Matches: CONCAT(conv_history, TRANSPOSE(qkv_mixed)) -> SSM_CONV -> UNARY(SILU)
-//          -> { VIEW(q), VIEW(k), VIEW(v) } -> { L2_NORM(q), L2_NORM(k) }
+// Matches: SSM_CONV -> UNARY(SILU) -> { VIEW(q), VIEW(k), VIEW(v) } -> { L2_NORM(q), L2_NORM(k) }
 //
-// This is qwen4exp.cpp's build_conv_state_at() (the CONCAT) feeding build_layer_attn_linear()'s
-// conv+silu+per-head L2-norm prelude. The root is CONCAT rather than SSM_CONV (as the task brief's
-// op list suggested) because the HRX dispatch scheduler only ever covers a match's root node plus
-// nodes *downstream* of it in one topological pass -- rooting at SSM_CONV would leave CONCAT
-// permanently unmatched (SSM_CONV's own producer), since nothing else claims it (CONCAT is not a
-// layout-alias op eligible for the generic auto-elide fallback). TRANSPOSE, by contrast, *is* a
-// pure layout-alias op (graph.cpp is_layout_alias_op()) and is left uncovered here deliberately --
-// it auto-elides on its own turn, so this match binds straight through its input instead of its
-// output (see qkv_input below); n_seq_tokens==1 makes that transpose a byte-identical no-op anyway.
+// This is qwen4exp.cpp's build_layer_attn_linear()'s conv+silu+per-head L2-norm prelude, fed by
+// build_conv_state_at()'s CONCAT. The root is SSM_CONV, *not* CONCAT, even though CONCAT is
+// SSM_CONV's own producer and topologically comes first -- ggml's own cross-backend scheduler
+// (ggml-backend.cpp's ggml_backend_sched_backend_id_from_cur(), *not* this backend's
+// device_supports_op) always assigns this specific CONCAT to CPU, independently of anything this
+// file declares support for: the CONCAT's source chain roots through build_rs()'s ggml_get_rows
+// gather of the persistent recurrent conv-state buffer, and ggml prefers to run an op on the same
+// backend as its inputs. That assignment happens during ggml's graph-splitting pass, *before* HRX's
+// own DispatchScheduler ever sees a Graph -- CONCAT is carved into a separate CPU split and never
+// appears as a node in the Graph this dispatcher's traversal visits at all (confirmed by tracing
+// graph_compute()'s per-split input: the split containing this SSM_CONV has no CONCAT node in it).
+// A matcher rooted at CONCAT therefore never fires; SSM_CONV is the only reachable root.
+//
+// Because CONCAT is not part of this match, `conv_input` below binds directly to SSM_CONV's own
+// src[0] -- the CONCAT's already-materialized [4,conv_channels,1,1] output value -- without tracing
+// into how it was produced (Graph/GraphIndex only record producer info for nodes actually present
+// in the current split; graph_value() still resolves the *value* itself correctly for any
+// cross-split/external tensor, the same way conv_weight below has always been resolved). The
+// four-tap window's own persistent-state write-back is a *separate* graph node
+// (build_conv_state_at()'s per-rollback-slot ggml_cpy, reading this same CONCAT output's tail) that
+// this dispatch does not need to cover or otherwise participate in -- it runs independently,
+// wherever ggml schedules it, same as CONCAT itself.
+//
+// TRANSPOSE is a pure layout-alias op (graph.cpp is_layout_alias_op()) that used to be traced
+// through explicitly here (back when this matcher rooted at CONCAT); now that SSM_CONV's src[0] is
+// consumed as one already-assembled external value, there is nothing left to trace -- TRANSPOSE
+// auto-elides on its own turn same as any other alias op, entirely outside this match.
 //
 // The kernel never materializes L2_NORM(q)/L2_NORM(k)'s literal "normalized q/k" output: normalization
 // is deferred and folded into a small `qk_inverse_norm` reciprocal-scale buffer applied at point of use
@@ -81,7 +98,6 @@ static std::string to_config_value(int64_t value) {
 // never get a written value of their own) and `qkv_silu` is bound to the shared, un-sliced SILU output
 // -- the kernel does its own q/k/v slicing internally via fixed channel-offset constants.
 struct ConvPrepareMatch {
-    const GraphNode * concat_node   = nullptr;
     const GraphNode * ssm_conv_node = nullptr;
     const GraphNode * silu_node     = nullptr;
     const GraphNode * view_q_node   = nullptr;
@@ -89,67 +105,37 @@ struct ConvPrepareMatch {
     const GraphNode * view_v_node   = nullptr;
     const GraphNode * l2norm_q_node = nullptr;
     const GraphNode * l2norm_k_node = nullptr;
-    const Value *      qkv_input    = nullptr;  // pre-transpose conv input (qkv_mixed), [10240,1,1,1]
+    const Value *      conv_input   = nullptr;  // CONCAT's own output (external to this split), [4,10240,1,1]
     const Value *      conv_weight  = nullptr;  // ssm_conv1d weight, [4,10240,1,1]
-    const Value *      conv_history = nullptr;  // persistent conv state slice, [3,10240,1,1]
     const Value *      qkv_silu     = nullptr;  // shared SILU output, [10240,1,1,1]
 
     bool matched() const {
-        return concat_node != nullptr && ssm_conv_node != nullptr && silu_node != nullptr &&
-               view_q_node != nullptr && view_k_node != nullptr && view_v_node != nullptr &&
-               l2norm_q_node != nullptr && l2norm_k_node != nullptr && qkv_input != nullptr &&
-               conv_weight != nullptr && conv_history != nullptr && qkv_silu != nullptr;
+        return ssm_conv_node != nullptr && silu_node != nullptr && view_q_node != nullptr &&
+               view_k_node != nullptr && view_v_node != nullptr && l2norm_q_node != nullptr &&
+               l2norm_k_node != nullptr && conv_input != nullptr && conv_weight != nullptr &&
+               qkv_silu != nullptr;
     }
 };
 
 static ConvPrepareMatch match_qwen4exp_gdn_conv_prepare(const Graph & graph, const GraphNode * node) {
     ConvPrepareMatch match;
-    if (node == nullptr || node->op != GGML_OP_CONCAT || node->inputs.size() != 2 || !graph.has_index()) {
+    if (node == nullptr || node->op != GGML_OP_SSM_CONV || node->inputs.size() != 2 || !graph.has_index()) {
         return match;
     }
 
-    const Value * conv_history = graph_value(graph, node->inputs[0]);
-    if (conv_history == nullptr || !is_shape(*conv_history, kGdnConvHistoryLen, kGdnConvChannels, 1, 1)) {
-        return {};
+    const Value * conv_input = graph_value(graph, node->inputs[0]);
+    if (conv_input == nullptr || !is_shape(*conv_input, kGdnConvKernelSize, kGdnConvChannels, 1, 1)) {
+        return {};  // n_seq_tokens > 1 (prefill) shows up here as a differently-shaped conv window.
     }
-
-    // node->inputs[1] is ggml_transpose(qkv_mixed); bind through to the transpose's own input instead
-    // of its output (see comment above) -- valid because n_seq_tokens==1 makes the transpose a byte-
-    // identical metadata no-op. qkv_input's own shape (ne[1]==1) is this match's decode-only gate.
-    const Value *      transpose_output = graph_value(graph, node->inputs[1]);
-    const GraphNode * transpose_node   = transpose_output == nullptr ? nullptr :
-                                                                       graph.index().producer(transpose_output->id);
-    if (transpose_node == nullptr || transpose_node->op != GGML_OP_TRANSPOSE || transpose_node->inputs.size() != 1) {
-        return {};
-    }
-    const Value * qkv_input = graph_value(graph, transpose_node->inputs[0]);
-    if (qkv_input == nullptr || !is_shape(*qkv_input, kGdnConvChannels, 1, 1, 1)) {
-        return {};  // n_seq_tokens > 1 (prefill) shows up here as ne[1] > 1; decode-only gate.
-    }
-
-    const Value * concat_output = graph_value(graph, node->output);
-    if (concat_output == nullptr || !is_shape(*concat_output, kGdnConvKernelSize, kGdnConvChannels, 1, 1)) {
-        return {};
-    }
-
-    const std::vector<const GraphNode *> & concat_consumers = graph.index().consumers(node->output);
-    if (concat_consumers.size() != 1 || concat_consumers.front() == nullptr) {
-        return {};
-    }
-    const GraphNode * ssm_conv_node = concat_consumers.front();
-    if (ssm_conv_node->op != GGML_OP_SSM_CONV || ssm_conv_node->inputs.size() != 2 ||
-        ssm_conv_node->inputs[0] != node->output) {
-        return {};
-    }
-    const Value * conv_weight     = graph_value(graph, ssm_conv_node->inputs[1]);
-    const Value * ssm_conv_output = graph_value(graph, ssm_conv_node->output);
+    const Value * conv_weight     = graph_value(graph, node->inputs[1]);
+    const Value * ssm_conv_output = graph_value(graph, node->output);
     if (conv_weight == nullptr || ssm_conv_output == nullptr ||
         !is_shape(*conv_weight, kGdnConvKernelSize, kGdnConvChannels, 1, 1) ||
         !is_shape(*ssm_conv_output, kGdnConvChannels, 1, 1, 1)) {
         return {};
     }
 
-    const std::vector<const GraphNode *> & ssm_conv_consumers = graph.index().consumers(ssm_conv_node->output);
+    const std::vector<const GraphNode *> & ssm_conv_consumers = graph.index().consumers(node->output);
     if (ssm_conv_consumers.size() != 1 || ssm_conv_consumers.front() == nullptr) {
         return {};
     }
@@ -225,17 +211,15 @@ static ConvPrepareMatch match_qwen4exp_gdn_conv_prepare(const Graph & graph, con
         return {};
     }
 
-    match.concat_node   = node;
-    match.ssm_conv_node = ssm_conv_node;
+    match.ssm_conv_node = node;
     match.silu_node     = silu_node;
     match.view_q_node   = view_q;
     match.view_k_node   = view_k;
     match.view_v_node   = view_v;
     match.l2norm_q_node = l2norm_q;
     match.l2norm_k_node = l2norm_k;
-    match.qkv_input     = qkv_input;
+    match.conv_input    = conv_input;
     match.conv_weight   = conv_weight;
-    match.conv_history  = conv_history;
     match.qkv_silu      = qkv_silu;
     return match;
 }
@@ -362,9 +346,8 @@ static bool match_qwen4exp_gdn_conv_prepare_decode_dispatch(const DispatchMatchC
     Dispatch dispatch;
     dispatch.kernel = make_kernel_specialization(kQwenGdnConvPrepareDecodeKernel);
     dispatch.kernel.compile_parameters.emplace("qwen4exp.model.rms_epsilon", "0.000001");
-    dispatch.bindings.push_back({ conv_match.qkv_input->id, 0, conv_match.qkv_input->byte_count });
+    dispatch.bindings.push_back({ conv_match.conv_input->id, 0, conv_match.conv_input->byte_count });
     dispatch.bindings.push_back({ conv_match.conv_weight->id, 0, conv_match.conv_weight->byte_count });
-    dispatch.bindings.push_back({ conv_match.conv_history->id, 0, conv_match.conv_history->byte_count });
     dispatch.bindings.push_back({ conv_match.qkv_silu->id, 0, conv_match.qkv_silu->byte_count });
     dispatch.bindings.push_back({ qk_inverse_norm_value, 0, kGdnQkInverseNormByteCount });
 
@@ -377,8 +360,7 @@ static bool match_qwen4exp_gdn_conv_prepare_decode_dispatch(const DispatchMatchC
         return false;
     }
 
-    if (!append_covered_node(context, conv_match.concat_node, match) ||
-        !append_covered_node(context, conv_match.ssm_conv_node, match) ||
+    if (!append_covered_node(context, conv_match.ssm_conv_node, match) ||
         !append_covered_node(context, conv_match.silu_node, match) ||
         !append_covered_node(context, conv_match.view_q_node, match) ||
         !append_covered_node(context, conv_match.view_k_node, match) ||
@@ -544,7 +526,7 @@ static bool match_qwen4exp_gdn_norm_gate_decode_dispatch(const DispatchMatchCont
 void register_gdn_dispatches(DispatchRegistryBuilder & registry) {
     registry.add({
         "qwen4exp.gdn_conv_prepare_decode",
-        GGML_OP_CONCAT,
+        GGML_OP_SSM_CONV,
         DispatchMatchKind::Fused,
         1000,
         DispatchSource::Qwen,

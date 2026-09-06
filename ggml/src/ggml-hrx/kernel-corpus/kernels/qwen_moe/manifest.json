@@ -233,8 +233,13 @@
     },
     {
       "path": "qwen4exp/gdn_decode.loom",
-      "sha256": "dedb267115af98b37dcceca226e66ad6349f7c4d521c3ab8e403aa0c2270ccce",
-      "size": 40421
+      "sha256": "3acd2521fb7cf0f5826dba0e0ba0b4295251a7d675118e2518ec0b307d7ed86a",
+      "size": 40757
+    },
+    {
+      "path": "qwen4exp/hc_norm.loom",
+      "sha256": "c094b330ac249ce8fa6da114e0e9ab87456a69f15344b3847bb0da4c699b663c",
+      "size": 6019
     },
     {
       "path": "qwen4exp/model_config.loom",
@@ -4782,16 +4787,14 @@
       "workload_parameters": [],
       "launch_parameters": [],
       "bindings": [
-        "qkv_input",
+        "conv_input",
         "conv_weight",
-        "conv_history",
         "qkv_silu",
         "qk_inverse_norm"
       ],
       "binding_access": [
         "read",
         "read",
-        "read_write",
         "write",
         "write"
       ],
@@ -4931,6 +4934,34 @@
         "qwen4exp/gdn_common.loom",
         "qwen4exp/model_config.loom"
       ]
+    },
+    {
+      "name": "qwen38_hc_grouped_norm_decode",
+      "symbol": "qwen38_hc_grouped_norm_decode",
+      "source": "qwen4exp/hc_norm.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "input",
+        "weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "hc_norm_linked",
+        "primary_sources": [
+          "qwen4exp/hc_norm.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
     },
     {
       "name": "qwen38_attention_query_prepare_decode",
@@ -5454,6 +5485,13 @@
         "qwen4exp/gdn_common.loom",
         "qwen4exp/model_config.loom"
       ]
+    },
+    {
+      "name": "hc_norm_linked",
+      "srcs": [
+        "qwen4exp/hc_norm.loom"
+      ],
+      "libraries": []
     },
     {
       "name": "attention_decode_linked",

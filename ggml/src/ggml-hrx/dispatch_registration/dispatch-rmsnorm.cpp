@@ -2,6 +2,7 @@
 
 #include "dispatch-llm-profiles.h"
 #include "ggml.h"
+#include "graph/graph-matcher.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cmath>
@@ -17,9 +18,18 @@ static constexpr KernelCatalogRef kQwenRmsNormF32QuantizeQ8_1X4Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_rmsnorm_f32_quantize_q8_1_x4");
 static constexpr KernelCatalogRef kGgmlLinearQ6KQ8_1X4Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_linear_q6k_q8_1_x4");
-static constexpr float   kQwenRmsNormEpsilon  = kQwen30BMoeDispatchProfile.rms_norm_epsilon;
-static constexpr int64_t kQwenHiddenSize      = kQwen30BMoeDispatchProfile.hidden_size;
-static constexpr int64_t kQwenVocabularyCount = 151936;
+static constexpr KernelCatalogRef kQwen4ExpHcGroupedNormDecodeKernel =
+    GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_hc_grouped_norm_decode");
+static constexpr float   kQwenRmsNormEpsilon      = kQwen30BMoeDispatchProfile.rms_norm_epsilon;
+static constexpr int64_t kQwenHiddenSize          = kQwen30BMoeDispatchProfile.hidden_size;
+static constexpr int64_t kQwenVocabularyCount     = 151936;
+static constexpr float   kQwen4ExpRmsNormEpsilon  = kQwen4ExpMoeDispatchProfile.rms_norm_epsilon;
+static constexpr int64_t kQwen4ExpHiddenSize      = kQwen4ExpMoeDispatchProfile.hidden_size;
+// hparams.dsv4_hc_mult, verified from the qwen4exp GGUF and from the observed decode-time
+// graph shape (RMS_NORM node [2560,4,1,1] seen in a real HRX run -- see qwen4exp.cpp's
+// build_ple()/grouped_norm()).
+static constexpr int64_t kQwen4ExpHcMultiplier    = 4;
+static constexpr int64_t kQwen4ExpHcDim           = kQwen4ExpHiddenSize * kQwen4ExpHcMultiplier;
 
 static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
@@ -32,6 +42,10 @@ static bool same_shape(const Value & lhs, const Value & rhs) {
         }
     }
     return true;
+}
+
+static bool is_qwen4exp_rms_norm_epsilon(float eps) {
+    return std::fabs(eps - kQwen4ExpRmsNormEpsilon) <= 1.0e-12f;
 }
 
 static bool is_qwen_rms_norm_epsilon(float eps) {
@@ -238,6 +252,130 @@ static RmsNormMatch match_qwen_endpoint_rmsnorm_from_projection(const Graph & gr
     return {};
 }
 
+// qwen4exp Hyper-Connections (HC) grouped RMSNorm: qwen4exp.cpp's build_ple()/grouped_norm()
+// reshapes [n_embd, n_tokens] to [n_embd, hc, n_tokens], RMS_NORM-s each of the hc groups
+// independently, reshapes to [hc*n_embd, n_tokens], then MULs by a weight of that SAME
+// [hc*n_embd] width (a private, non-broadcast slice per group) before reshaping back to 3D.
+//
+// Matches: RESHAPE -> RMS_NORM -> RESHAPE -> MUL(hc_dim-wide weight) [-> RESHAPE, not covered]
+//
+// This is structurally disjoint from every other matcher registered against GGML_OP_RMS_NORM
+// (here and in dispatch-gated-delta-net.cpp): they all require RMS_NORM's direct/immediate
+// consumer to be MUL itself, whereas this pattern's direct consumer is a layout-alias RESHAPE
+// (find_single_consumer_with_op_through_layout_aliases sees past it to the real MUL). The
+// weight-shape check (hc_dim=10240, not hidden_size=2560) is a second, independent
+// discriminator. Both surrounding RESHAPEs (the one feeding RMS_NORM's input and the one
+// consuming this MUL's output) are left uncovered -- dispatch-scheduler.cpp's generic
+// layout-alias elision (can_elide_layout_alias_node) picks them up for free once their
+// producer is covered, the same mechanism every other fused RMSNorm matcher here relies on.
+struct HcGroupedNormMatch {
+    const GraphNode * rms_node       = nullptr;
+    const GraphNode * mul_node       = nullptr;
+    const Value *     input          = nullptr;
+    const Value *     weight         = nullptr;
+    const Value *     output         = nullptr;
+    size_t            rms_node_index = 0;
+    size_t            mul_node_index = 0;
+    int64_t           token_count    = 0;
+
+    bool matched() const {
+        return rms_node != nullptr && mul_node != nullptr && input != nullptr && weight != nullptr &&
+               output != nullptr;
+    }
+};
+
+static bool is_hc_weight_shape(const Value & weight) {
+    if (weight.ne[0] != kQwen4ExpHcDim) {
+        return false;
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (weight.ne[i] != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static HcGroupedNormMatch match_qwen4exp_hc_grouped_rmsnorm_f32(const Graph &     graph,
+                                                                const GraphNode * node,
+                                                                size_t            node_index) {
+    HcGroupedNormMatch match;
+    if (node == nullptr || node->op != GGML_OP_RMS_NORM || node->inputs.size() != 1 || !graph.has_index()) {
+        return match;
+    }
+
+    const RmsNormParams * rms_params = op_params_as<RmsNormParams>(node->params);
+    if (rms_params == nullptr || !is_qwen4exp_rms_norm_epsilon(rms_params->eps)) {
+        return {};
+    }
+
+    // Owns only the "RESHAPE in between" case; the direct-MUL case belongs to the other
+    // qwen.rmsnorm_f32.mul_weight / qwen4exp.gdn_norm_gate_decode matchers.
+    const std::vector<const GraphNode *> & direct_consumers = graph.index().consumers(node->output);
+    if (direct_consumers.size() != 1 || direct_consumers.front() == nullptr ||
+        !is_layout_alias_node(graph, *direct_consumers.front())) {
+        return {};
+    }
+    const GraphNode * reshape_node = direct_consumers.front();
+
+    const GraphNode * mul_node = find_single_consumer_with_op_through_layout_aliases(graph, node->output, GGML_OP_MUL);
+    size_t            mul_node_index;
+    if (mul_node == nullptr || mul_node->inputs.size() != 2 || !graph.index().node_index(mul_node, mul_node_index)) {
+        return {};
+    }
+
+    const Value * weight = nullptr;
+    for (ValueId input : mul_node->inputs) {
+        if (input != reshape_node->output) {
+            weight = graph_value(graph, input);
+        }
+    }
+    const Value * input  = graph_value(graph, node->inputs[0]);
+    const Value * rms    = graph_value(graph, node->output);
+    const Value * output = graph_value(graph, mul_node->output);
+    if (input == nullptr || rms == nullptr || weight == nullptr || output == nullptr) {
+        return {};
+    }
+    if (input->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 ||
+        output->type != GGML_TYPE_F32) {
+        return {};
+    }
+    if (!input->contiguous || !rms->contiguous || !weight->contiguous || !output->contiguous) {
+        return {};
+    }
+    if (!same_shape(*input, *rms)) {
+        return {};
+    }
+
+    // qwen4exp HC geometry: RMS_NORM operates on [n_embd, hc, n_tokens] groups. Scoped to
+    // decode (n_tokens==1) like every other qwen4exp HRX kernel; prefill (n_tokens>1) falls
+    // back to CPU.
+    if (input->ne[0] != kQwen4ExpHiddenSize || input->ne[1] != kQwen4ExpHcMultiplier || input->ne[3] != 1) {
+        return {};
+    }
+    const int64_t token_count = input->ne[2];
+    if (!is_llm_decode_query_length(token_count)) {
+        return {};
+    }
+    if (!is_hc_weight_shape(*weight)) {
+        return {};
+    }
+    if (output->ne[0] != kQwen4ExpHcDim || output->ne[1] != token_count || output->ne[2] != 1 ||
+        output->ne[3] != 1) {
+        return {};
+    }
+
+    match.rms_node       = node;
+    match.mul_node       = mul_node;
+    match.input          = input;
+    match.weight         = weight;
+    match.output         = output;
+    match.rms_node_index = node_index;
+    match.mul_node_index = mul_node_index;
+    match.token_count    = token_count;
+    return match;
+}
+
 static std::string to_config_value(int64_t value) {
     return std::to_string(value);
 }
@@ -272,6 +410,33 @@ static bool match_qwen_rmsnorm_f32_dispatch(const DispatchMatchContext & context
 
     match.covered_nodes.push_back(rms_match.rms_node_index);
     match.covered_nodes.push_back(rms_match.mul_node_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
+static bool match_qwen4exp_hc_grouped_rmsnorm_f32_dispatch(const DispatchMatchContext & context,
+                                                            DispatchMatch &              match) {
+    const std::vector<GraphNode> & nodes = context.graph.nodes();
+    if (context.root_index >= nodes.size()) {
+        return false;
+    }
+    const HcGroupedNormMatch hc_match =
+        match_qwen4exp_hc_grouped_rmsnorm_f32(context.graph, &nodes[context.root_index], context.root_index);
+    if (!hc_match.matched() || hc_match.rms_node_index >= context.covered_nodes.size() ||
+        hc_match.mul_node_index >= context.covered_nodes.size() || context.covered_nodes[hc_match.rms_node_index] ||
+        context.covered_nodes[hc_match.mul_node_index]) {
+        return false;
+    }
+
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kQwen4ExpHcGroupedNormDecodeKernel);
+    dispatch.kernel.compile_parameters.emplace("qwen4exp.model.rms_epsilon", "0.000001");
+    dispatch.bindings.push_back({ hc_match.input->id, 0, hc_match.input->byte_count });
+    dispatch.bindings.push_back({ hc_match.weight->id, 0, hc_match.weight->byte_count });
+    dispatch.bindings.push_back({ hc_match.output->id, 0, hc_match.output->byte_count });
+
+    match.covered_nodes.push_back(hc_match.rms_node_index);
+    match.covered_nodes.push_back(hc_match.mul_node_index);
     match.dispatches.push_back(std::move(dispatch));
     return true;
 }
@@ -396,6 +561,21 @@ static bool match_qwen_decode_rmsnorm_f32_quantize_q8_1_x4_dispatch(const Dispat
 }
 
 void register_qwen_rmsnorm_dispatches(DispatchRegistryBuilder & registry) {
+    registry.add({
+        // Priority 1400 is deliberately above every other GGML_OP_RMS_NORM registration here and
+        // in dispatch-gated-delta-net.cpp (max 1300). Not required for correctness (this pattern's
+        // "RESHAPE-mediated MUL consumer" requirement is structurally disjoint from every other
+        // matcher's "direct MUL consumer" requirement -- see the comment on
+        // match_qwen4exp_hc_grouped_rmsnorm_f32), but kept first per this file's established
+        // convention of being explicit about ordering safety whenever multiple matchers share a
+        // root op.
+        "qwen4exp.hc_grouped_norm_decode",
+        GGML_OP_RMS_NORM,
+        DispatchMatchKind::Fused,
+        1400,
+        DispatchSource::Qwen,
+        match_qwen4exp_hc_grouped_rmsnorm_f32_dispatch,
+    });
     registry.add({
         "qwen.endpoint_rmsnorm_q6k_q8_1_x4",
         GGML_OP_MUL_MAT,
