@@ -5,12 +5,62 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
 
 namespace ggml::hrx {
 namespace {
+
+// When HRX_SURVEY_UNSUPPORTED is set, schedule_graph() keeps walking the graph after it hits a node
+// no dispatch matches, logging every one instead of bailing at the first. Scheduling still fails, so
+// nothing is executed -- this only exists so that bringing a new model up costs one run per pass
+// rather than one run per missing kernel. Nodes past the first are best-effort: a surveyed node is
+// marked covered so traversal can continue, which lets later matchers see its output as available.
+static bool survey_unsupported_nodes_enabled() {
+    const char * value = std::getenv("HRX_SURVEY_UNSUPPORTED");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// When HRX_TRACE_DISPATCH is set, every dispatch registration that wins a match is printed once, the
+// first time it fires, with the shape of the node it rooted at. A backend that computes the right
+// graph but the wrong numbers can only be bisected by moving whole op classes to the CPU, which says
+// "something under GGML_OP_MUL is wrong" and no more; this says *which matcher* under GGML_OP_MUL
+// actually ran on this model. Output is deduplicated by name and shape, so a 48-layer decode prints a
+// couple of dozen lines rather than tens of thousands.
+static bool trace_dispatch_matches_enabled() {
+    const char * value = std::getenv("HRX_TRACE_DISPATCH");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static void trace_dispatch_match(const Graph &                    graph,
+                                 const GraphNode *                node,
+                                 const DispatchMatchDiagnostics & diagnostics) {
+    const char * name = nullptr;
+    for (const DispatchRegistrationAttempt & attempt : diagnostics.attempts) {
+        if (attempt.matched) {
+            name = attempt.name.c_str();
+            break;
+        }
+    }
+    if (name == nullptr || node == nullptr) {
+        return;
+    }
+    std::ostringstream stream;
+    stream << name << " " << ggml_op_name(node->op) << " ";
+    const Value * output = graph.values().find(node->output);
+    if (output != nullptr) {
+        stream << ggml_type_name(output->type) << "[" << output->ne[0] << "," << output->ne[1] << "," << output->ne[2]
+               << "," << output->ne[3] << "]";
+    }
+    static std::set<std::string> seen;
+    if (seen.insert(stream.str()).second) {
+        fprintf(stderr, "HRX dispatch: %s\n", stream.str().c_str());
+    }
+}
 
 static bool match_covers_root(const DispatchMatch & match, size_t root_index) {
     return std::find(match.covered_nodes.begin(), match.covered_nodes.end(), root_index) != match.covered_nodes.end();
@@ -151,6 +201,9 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
     }
     std::vector<bool>         covered_nodes(nodes.size(), false);
     Status                    pending_diagnostics;
+    const bool                survey_unsupported   = survey_unsupported_nodes_enabled();
+    const bool                trace_matches        = trace_dispatch_matches_enabled();
+    bool                      unsupported_surveyed = false;
     const GraphTraversalOrder traversal = GraphTraversalOrder::build(graph);
     for (const GraphNode * node : traversal.nodes()) {
         size_t i = 0;
@@ -183,8 +236,17 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
                 diagnostics->unsupported_message    = message;
                 diagnostics->match                  = std::move(match_diagnostics);
             }
+            if (survey_unsupported) {
+                unsupported_surveyed = true;
+                covered_nodes[i]     = true;
+                pending_diagnostics  = {};
+                continue;
+            }
             clear_plan_results(plan_);
             return false;
+        }
+        if (trace_matches) {
+            trace_dispatch_match(graph, node, match_diagnostics);
         }
         if (match.covered_nodes.empty() || match.dispatches.empty() || !match_covers_root(match, i) ||
             match_overlaps_covered_nodes(match, covered_nodes)) {
@@ -255,6 +317,10 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
             clear_plan_results(plan_);
             return false;
         }
+    }
+    if (unsupported_surveyed) {
+        clear_plan_results(plan_);
+        return false;
     }
     return true;
 }

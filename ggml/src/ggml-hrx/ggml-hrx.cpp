@@ -23,6 +23,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -487,8 +488,39 @@ static const char * status_first_error(const ggml::hrx::Status & status) {
     return status.errors().empty() ? "" : status.errors().front().c_str();
 }
 
+// Companion to HRX_TRACE_DISPATCH (dispatch-scheduler.cpp): that one names the matchers that fire,
+// this one shows the *splits* ggml_backend_sched actually hands to HRX. The two answer different
+// questions -- a matcher can look right while the scheduler is routing a node here that should have
+// stayed on the CPU -- and a wrong split is invisible from inside the dispatch registry. Deduplicated
+// by the split's op/shape signature, so a 48-layer decode prints one line per distinct split shape.
+static void hrx_trace_split(const ggml_cgraph & graph) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TRACE_DISPATCH");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    std::string signature;
+    for (int i = 0; i < graph.n_nodes; ++i) {
+        const ggml_tensor * node = graph.nodes[i];
+        signature += ggml_op_name(node->op);
+        signature += "[";
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            signature += std::to_string(node->ne[d]);
+            signature += d + 1 < GGML_MAX_DIMS ? "," : "";
+        }
+        signature += "] ";
+    }
+    static std::set<std::string> seen;
+    if (seen.insert(signature).second) {
+        GGML_LOG_ERROR("HRX split: %d nodes: %s\n", graph.n_nodes, signature.c_str());
+    }
+}
+
 static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
-    auto *                                context  = static_cast<ggml_backend_hrx_context *>(backend->context);
+    auto * context = static_cast<ggml_backend_hrx_context *>(backend->context);
+    hrx_trace_split(*graph);
     const ggml::hrx::GraphExecutor        executor = ggml::hrx::GraphExecutor(*context);
     const ggml::hrx::GraphExecutionResult result   = executor.execute(*graph);
     if (!result.success()) {
@@ -574,6 +606,49 @@ static ggml_backend_buffer_type_t device_host_buffer_type(ggml_backend_dev_t dev
     return &device_context(device)->host_buft;
 }
 
+// HRX_DISABLE_DISPATCH holds a comma-separated list of dispatch groups to force onto the CPU:
+//
+//     HRX_DISABLE_DISPATCH=gdn,hc,attn,matmul,embed
+//
+// Groups are hierarchical: "gdn" covers "gdnconv"/"gdncore"/"gdngate", and "misc" covers
+// "mnorm"/"mrope"/"msoftmax"/"msetrows"/"mlayout" plus "melem", which in turn covers
+// "eadd"/"emul"/"eother".
+//
+// A model that runs but produces wrong tokens has to be bisected one subsystem at a time, and a full
+// rebuild-and-reload cycle per step is minutes of wall clock each. This makes each step an env var
+// instead. Declining is always safe -- it is the same path an unsupported shape already takes -- so
+// this only ever moves work to the CPU, never changes what HRX computes.
+static bool hrx_dispatch_group_disabled(const char * group) {
+    const char * disabled = std::getenv("HRX_DISABLE_DISPATCH");
+    if (disabled == nullptr) {
+        return false;
+    }
+    const size_t length = std::strlen(group);
+    for (const char * match = std::strstr(disabled, group); match != nullptr;
+         match             = std::strstr(match + 1, group)) {
+        const bool starts_token = match == disabled || match[-1] == ',';
+        const bool ends_token   = match[length] == '\0' || match[length] == ',';
+        if (starts_token && ends_token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// qwen4exp.gdn_conv_prepare_decode is numerically wrong, and measurably so: generating with it
+// enabled emits garbage ("[Start thinking] V边容量2..."), while declining just this one prelude --
+// leaving the recurrent GATED_DELTA_NET step, flash-attention, the dense matmuls and the embedding
+// gather on HRX -- reproduces the CPU reference token for token. The fault is inside the fused
+// conv+SiLU+L2-norm kernel or its bindings, not in the surrounding graph; it has never had a
+// numerical check-case (the corpus is linked with --strip-check), and it only started executing at
+// all once the matcher was re-rooted from CONCAT to SSM_CONV, so it has no history of being right.
+// Default to the CPU fallback until it is fixed; set HRX_ENABLE_GDN_CONV_PREPARE=1 to force it back
+// on for debugging.
+static bool hrx_gdn_conv_prepare_enabled() {
+    const char * enabled = std::getenv("HRX_ENABLE_GDN_CONV_PREPARE");
+    return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+}
+
 static bool eager_capability_declared(enum ggml_op op) {
     switch (op) {
         // The scheduler probes preallocated weight tensors as NONE operations when deciding whether their buffer type is
@@ -630,6 +705,33 @@ static bool hrx_weight_quant_supported(enum ggml_type type) {
     }
 }
 
+// Dense MUL_MAT is narrower than hrx_weight_quant_supported() above: every registered MUL_MAT
+// matcher (dispatch-llm-matmul.cpp's llm.dense_linear_{q4k,q6k}_wmma, and dispatch-qwen-matmul.cpp's
+// qwen.* projection fusions) hard-requires a Q4_K or Q6_K weight and returns "no match" for any
+// other weight type. An *unquantized* (F32/F16/BF16) weight therefore has no dense-matmul kernel at
+// all, so claiming it here would pin the node onto HRX with no dispatch able to run it -- which
+// DispatchScheduler reports as a hard "unsupported HRX node ...: MUL_MAT" failure that fails the
+// entire split, rather than degrading to CPU for just that node.
+//
+// qwen4exp hits exactly this with its two small per-head GDN projections, ssm_beta and ssm_alpha
+// ([n_embd, num_v_heads] == [2560,48], see build_layer_attn_linear() in src/models/qwen4exp.cpp),
+// which stay F32 even in the Q4_K_XL quantization because they are far too small to be worth
+// quantizing. Declining them leaves them on the CPU where they cost ~123K MACs each -- negligible
+// next to the layer's quantized projections.
+//
+// Note this deliberately does NOT narrow the GGML_OP_NONE placement probe or GET_ROWS, which must
+// keep accepting F32/F16/BF16: unquantized tensors like norm weights are consumed on HRX by
+// RMS_NORM/MUL/etc. and do need to be placeable in an HRX buffer.
+static bool hrx_dense_matmul_weight_supported(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // qwen4exp (Q4_K_XL / Q3_K_XL GGUF quantizations) stores its MoE down-projection expert weights
 // (ffn_down_exps) in 32-block quantizations -- Q5_1, Q8_0, IQ4_NL -- because its contraction width
 // (expert_hidden_size == kLlmMoeQwen4ExpDispatchProfile.expert_hidden_size == 640) is NOT a multiple
@@ -662,6 +764,68 @@ static bool hrx_moe_down_quant_supported(enum ggml_type type) {
 // operand purely from the tensor itself, with no model/profile context available at this call site.
 static constexpr int64_t kHrxMoeDownExpertHiddenSizeQwen4Exp = 640;
 
+// Same quant+shape test the GGML_OP_MUL_MAT_ID arm below applies to a down-projection weight's
+// src[0], factored out so the GGML_OP_NONE placement probe (where the weight tensor itself is
+// passed as `op`, with no src[0] indirection) can apply the identical test. See the comment on
+// GGML_OP_NONE in device_supports_op() for why the probe must agree with this decision: the model
+// loader picks a weight's buffer type by probing its real consuming op (MUL_MAT_ID here, which
+// accepts this weight), so the later NONE-probe on the pre-allocated weight tensor must accept the
+// same weight or ggml-backend's scheduler aborts with "pre-allocated tensor ... that cannot run the
+// operation (NONE)" -- the weight is stuck in an HRX buffer neither check will let it leave.
+//
+// Currently forced off: HRX's routed FFN is an all-or-nothing fused chain. The down dispatch
+// ("llm.routed_ffn.decode_down_qwen4exp") binds match.input_alternate->alternate_value -- the Q8
+// hidden state *produced by* the fused gate/up dispatch ("qwen.decode.moe.hidden_q8") -- so it can
+// only match when gate/up ran on HRX in the same graph. Since qwen4exp's gate/up has no matcher (see
+// hrx_moe_gate_up_weight_qwen4exp() below), that alternate never exists and the down node would be
+// claimed with no dispatch able to run it. Keeping the quant/shape test intact but gating it here
+// means restoring the whole path is a one-line change once a qwen4exp gate/up kernel exists.
+static constexpr bool kHrxMoeDownQwen4ExpEnabled = false;
+
+static bool hrx_moe_down_weight_supported(const ggml_tensor * weight) {
+    return kHrxMoeDownQwen4ExpEnabled && weight != nullptr && hrx_moe_down_quant_supported(weight->type) &&
+           weight->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp;
+}
+
+// qwen4exp hidden_size (n_embd). Shared by the HC residual-stream checks and the routed-FFN checks
+// below, both of which key off the full-width row.
+static constexpr int64_t kHrxHiddenSizeQwen4Exp = 2560;
+
+// qwen4exp routed gate/up expert weights (ffn_gate_exps / ffn_up_exps): Q4_K
+// [hidden_size=2560, expert_hidden_size=640, expert_count=512]. Note this is the transpose of the
+// down-projection geometry checked above ([640, 2560, 512]), so the two never collide.
+//
+// Every registered routed-FFN gate/up matcher in dispatch-routed-ffn.cpp
+// ("llm.routed_ffn.decode_gate_up_swiglu_q4k_q8" and "llm.routed_ffn.gate_up_swiglu_q4k_f16_wmma")
+// is written against the kRoutedFfn* constants, which are pinned to the *qwen30b* profile
+// (hidden_size 2048, expert_hidden_size 768, expert_count 128, route_count 8) and must stay pinned --
+// see dispatch-llm-profiles.h. Only the *down* projection ever got a qwen4exp-specific matcher
+// ("llm.routed_ffn.decode_down_qwen4exp"). So a qwen4exp gate/up MUL_MAT_ID matches nothing, and
+// claiming it strands the node with no dispatch and fails its whole split.
+//
+// Declining leaves the routed gate/up on the CPU. At decode that is route_count(10) x 2560 x 640 x 2
+// projections for a single token, which the CPU absorbs comfortably; a dedicated qwen4exp gate/up
+// kernel + matcher is the natural follow-up once the GDN/QSA decode path is validated.
+static constexpr int64_t kHrxMoeGateUpExpertCountQwen4Exp = 512;
+static constexpr int64_t kHrxMoeRouteCountQwen4Exp        = 10;
+
+static bool hrx_moe_gate_up_weight_qwen4exp(const ggml_tensor * weight) {
+    return weight != nullptr && weight->ne[0] == kHrxHiddenSizeQwen4Exp &&
+           weight->ne[1] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
+           weight->ne[2] == kHrxMoeGateUpExpertCountQwen4Exp;
+}
+
+// The SwiGLU between qwen4exp's routed gate/up and down projections. HRX only ever runs this
+// activation *inside* the fused "llm.routed_ffn.*gate_up_swiglu*" dispatches -- there is no matcher
+// rooted at a standalone GGML_OP_GLU. Since hrx_moe_gate_up_weight_qwen4exp() above keeps qwen4exp's
+// gate/up on the CPU, that fused dispatch never forms here and the GLU is left exposed, so it has to
+// follow its producers to the CPU. Scoped to the routed-expert decode shape
+// [expert_hidden_size=640, route_count=10] so other models' GLU nodes keep the permissive default.
+static bool hrx_moe_glu_qwen4exp_decode(const ggml_tensor * op) {
+    return op != nullptr && op->type == GGML_TYPE_F32 && op->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
+           op->ne[1] == kHrxMoeRouteCountQwen4Exp && op->ne[2] == 1 && op->ne[3] == 1;
+}
+
 // qwen4exp GDN (Gated DeltaNet) decode-only shape profile: head_k_dim == head_v_dim == 128
 // (hparams.ssm_d_state), num_k_heads == 16 (hparams.ssm_n_group), num_v_heads == 48
 // (hparams.ssm_dt_rank), single token / single sequence decode (K == 1). These constants are
@@ -691,6 +855,14 @@ static constexpr int64_t kHrxGdnConvKernelSizeQwen4Exp = 4;  // hparams.ssm_d_co
 static bool hrx_gdn_conv_concat_decode_supported(const ggml_tensor * op) {
     // qwen4exp.cpp's build_conv_state_at(): CONCAT(conv_history[3,conv_channels,1,1],
     // transpose(qkv_mixed)[1,conv_channels,1,1], dim=0) -> [4,conv_channels,1,1].
+    //
+    // In practice, ggml's own cross-backend scheduler always assigns qwen4exp's real GDN CONCAT to
+    // CPU regardless of what this function returns (its source chain roots through build_rs()'s
+    // ggml_get_rows gather of the persistent recurrent conv-state buffer, and ggml prefers to run an
+    // op on the same backend as its inputs) -- see qwen4exp.gdn_conv_prepare_decode's dispatch-side
+    // comment in dispatch-gated-delta-net.cpp for the full trace. This function is therefore dead in
+    // that specific case, but is kept (and still checked precisely) as a defensive gate should ggml's
+    // scheduler ever route a CONCAT of this shape through the normal per-op classification path.
     if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr) {
         return false;
     }
@@ -750,7 +922,12 @@ static bool hrx_gdn_unary_decode_supported(const ggml_tensor * op) {
     switch (ggml_get_unary_op(op)) {
         case GGML_UNARY_OP_SILU:
             // qwen4exp.gdn_conv_prepare_decode's post-SSM_CONV activation: [conv_channels,1,1,1].
-            return op->ne[0] == kHrxGdnConvChannelsQwen4Exp && op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1;
+            // The SSM_CONV producer check is load-bearing, not decoration: qwen4exp's GDN conv width
+            // (2*key_dim + value_dim == 10240) collides exactly with hc_dim == 4*n_embd, so build_ple()'s
+            // own depthwise-conv SILU has an identical shape but is fed by the ADD that sums its taps.
+            // Only the SSM_CONV-rooted one has a dispatch; claiming PLE's would strand it.
+            return op->ne[0] == kHrxGdnConvChannelsQwen4Exp && op->ne[1] == 1 && op->ne[2] == 1 &&
+                   op->ne[3] == 1 && op->src[0] != nullptr && op->src[0]->op == GGML_OP_SSM_CONV;
         case GGML_UNARY_OP_SIGMOID:
             // qwen4exp.gdn_norm_gate_decode's z-gate: [head_v_dim,num_v_heads,1,1] == [128,48,1,1].
             // Deliberately narrower than the [1,48,1,1] shape of this same layer's *other* sigmoid
@@ -764,25 +941,348 @@ static bool hrx_gdn_unary_decode_supported(const ggml_tensor * op) {
     }
 }
 
+// qwen4exp's GDN prelude (build_layer_attn_linear() in src/models/qwen4exp.cpp) derives two per-head
+// scalar vectors of length num_v_heads == 48 from the ssm_alpha/ssm_beta projections:
+//
+//     alpha_biased   = ADD(alpha, ssm_dt)              -> f32[48,1,1,1]
+//     alpha_softplus = SOFTPLUS(alpha_biased)          -> declined by hrx_gdn_unary_decode_supported()
+//     gate           = MUL(alpha_softplus, ssm_a)      -> f32[48,1,1,1]
+//
+// No dispatch matcher roots at either of these -- the GDN kernels take `gate` and `beta` as already
+// -computed inputs -- so, exactly like the sibling SIGMOID documented above, claiming them would
+// strand them with no dispatch and fail the whole split. Their projections already run on the CPU
+// (their ssm_alpha/ssm_beta weights are F32, declined by hrx_dense_matmul_weight_supported()), so
+// keeping these two 48-element elementwise ops there as well costs nothing and avoids a round trip.
+static bool hrx_gdn_per_head_scalar_decode_op(const ggml_tensor * op) {
+    return op != nullptr && op->type == GGML_TYPE_F32 && op->ne[0] == kHrxGdnValueHeadCountQwen4Exp &&
+           op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1;
+}
+
+// qwen4exp attention geometry, from the GGUF: n_embd_head_k == n_embd_head_v == 256, n_head_kv == 2,
+// plus a lightning-indexer key cache of indexer.key_length == 128 with a single head. These mirror
+// kQwen4ExpAttentionHeadSize / kQwen4ExpKeyValueHeadCount in
+// dispatch_registration/dispatch-qwen4exp-flash-attention.cpp.
+static constexpr int64_t kHrxAttentionHeadSizeQwen4Exp = 256;
+static constexpr int64_t kHrxIndexerKeyLengthQwen4Exp  = 128;
+
+// qwen4exp Hyper-Connections geometry: hparams.dsv4_hc_mult == 4 parallel [n_embd] residual streams,
+// so the flattened stream layout is hc_dim == 4*2560 == 10240 wide.
+static constexpr int64_t kHrxHcMultiplierQwen4Exp = 4;
+static constexpr int64_t kHrxHcDimQwen4Exp        = kHrxHcMultiplierQwen4Exp * kHrxHiddenSizeQwen4Exp;
+
+// HRX's only GET_ROWS kernels are embedding lookups: they read a leaf weight tensor. qwen4exp's
+// build_qsa_top_k() emits two gathers that are not lookups at all -- ggml_get_rows(k_all, blk_cells)
+// over an F16 view of the indexer key cache (src/models/qwen4exp.cpp line 593) and
+// ggml_get_rows(score, cell_blk) expanding per-block scores to per-token ones (line 651) -- neither of
+// which any matcher roots at. Requiring a leaf source keeps every embedding lookup claimed, including
+// F16 ones, while declining both.
+static bool hrx_non_leaf_gather_qwen4exp(const ggml_tensor * op) {
+    const ggml_tensor * source = op == nullptr ? nullptr : op->src[0];
+    return source != nullptr && source->op != GGML_OP_NONE;
+}
+
+// qwen4exp's lightning indexer (build_qsa_top_k() in src/models/qwen4exp.cpp) works entirely in
+// indexer.key_length == 128 wide rows: the pooled block keys [128, n_blocks], the four query heads
+// [128, 4, T], their RMS norms and mropes, and the slice sums that collapse both. It has no HRX
+// dispatch of any kind -- register_* in dispatch_registration/ never mentions it -- so every one of
+// those nodes has to stay on the CPU.
+//
+// GDN is the only other qwen4exp subsystem that works in 128-wide rows (head_v_dim == 128), and its
+// kernels do need to be claimed, so its three shapes are carved out: [128, num_k_heads == 16] for q/k,
+// [128, num_v_heads == 48] for v and the norm/gate pair, and [128, 128, 48] for the recurrent state.
+// The carve-out is by shape rather than provenance, so an indexer tensor whose block count happened to
+// equal 16, 48 or 128 would be claimed and strand its split; n_blocks is n_kv/compress_ratio, and n_kv
+// is padded to a multiple of 256, so that needs an unusual ratio to occur.
+static bool hrx_qsa_indexer_row_qwen4exp(const ggml_tensor * op) {
+    if (op == nullptr || op->ne[0] != kHrxIndexerKeyLengthQwen4Exp) {
+        return false;
+    }
+    const bool gdn_shape = op->ne[1] == kHrxGdnKeyHeadCountQwen4Exp || op->ne[1] == kHrxGdnValueHeadCountQwen4Exp ||
+                           op->ne[1] == kHrxGdnHeadDimQwen4Exp;
+    return !gdn_shape || hrx_dispatch_group_disabled("gdn");
+}
+
+// The GDN pipeline is split into two independently disableable bisect groups: "gdnconv" (the
+// CONCAT/SSM_CONV/SILU/L2_NORM conv-prepare prelude) and "gdncore" (the recurrent GATED_DELTA_NET
+// step). "gdn" remains an umbrella that disables both, so existing invocations keep working.
+static bool hrx_gdn_group_disabled(const char * half) {
+    if (std::strcmp(half, "gdnconv") == 0 && !hrx_gdn_conv_prepare_enabled()) {
+        return true;  // see hrx_gdn_conv_prepare_enabled(): declined by default, it computes garbage
+    }
+    return hrx_dispatch_group_disabled("gdn") || hrx_dispatch_group_disabled(half);
+}
+
+// "misc" is an umbrella over the per-op-class groups; see the switch in device_supports_op().
+// "melem" is in turn an umbrella over the elementwise sub-classes "eadd"/"emul"/"eother".
+static bool hrx_misc_group_disabled(const char * op_class) {
+    if (hrx_dispatch_group_disabled("misc") || hrx_dispatch_group_disabled(op_class)) {
+        return true;
+    }
+    const bool elementwise = std::strcmp(op_class, "eadd") == 0 || std::strcmp(op_class, "emul") == 0 ||
+                             std::strcmp(op_class, "eother") == 0;
+    return elementwise && hrx_dispatch_group_disabled("melem");
+}
+
+// qwen4exp.gdn_norm_gate_decode (dispatch-gated-delta-net.cpp) is a *third* GDN dispatch, rooted at
+// the [head_dim, value_head_count] RMS_NORM of the delta-net output and swallowing the gamma MUL,
+// the SIGMOID and the gated MUL. Because it roots at RMS_NORM rather than at a GDN-specific op, the
+// CONCAT/SSM_CONV/GATED_DELTA_NET arms do not cover it, so it needs its own decline hook to be
+// separable from the rest of GDN. Only the RMS_NORM root and the MUL shapes are keyed here; the
+// SIGMOID rides along on the UNARY arm.
+static bool hrx_gdn_norm_gate_row(const ggml_tensor * op) {
+    if (op == nullptr || !hrx_gdn_group_disabled("gdngate")) {
+        return false;
+    }
+    return op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnValueHeadCountQwen4Exp;
+}
+
+// The "hc" bisect group: the grouped RMS_NORM registered in dispatch-rmsnorm.cpp roots at the
+// stream-major [n_embd, hc, T] norm and fuses the gamma MUL over its flattened [hc_dim, T] view, so
+// both row widths have to be declined to push the whole hyper-connection norm back onto the CPU.
+static bool hrx_hc_grouped_norm_row_qwen4exp(const ggml_tensor * op) {
+    if (op == nullptr || !hrx_dispatch_group_disabled("hc")) {
+        return false;
+    }
+    return op->ne[0] == kHrxHcDimQwen4Exp ||
+           (op->ne[0] == kHrxHiddenSizeQwen4Exp && op->ne[1] == kHrxHcMultiplierQwen4Exp);
+}
+
+// qwen4exp's attention preamble -- the per-head RMS_NORM, its gamma MUL, and the ROPE for Q and K --
+// operates on head-major [256, n_head, T] tensors. Every matcher in dispatch-rmsnorm.cpp and
+// dispatch-qwen-attention-postprocess.cpp is written for either the flat hidden width or
+// kQwenAttentionHeadSize == 128 heads, so none of them can root at a 256-wide head. The qwen4exp flash
+// attention dispatch does not need them: it roots at FLASH_ATTN_EXT and takes Q/K/V as plain inputs
+// (see match_qwen4exp_flash_attention_gate in dispatch-qwen4exp-flash-attention.cpp), so leaving the
+// preamble on the CPU costs one small transfer per attention layer and nothing else.
+static bool hrx_attention_head_major_qwen4exp(const ggml_tensor * op) {
+    return op != nullptr && op->ne[0] == kHrxAttentionHeadSizeQwen4Exp;
+}
+
+// Walk back through pure-layout nodes looking for a tensor of the given row width. A cache publish
+// source arrives flattened to [n_embd_gqa, T], but the head-major [head_size, head_count, T] shape it
+// was reshaped from is still one or two hops up: ggml records the immediate parent in src[0] for both
+// views and reshapes. Every hop is tested, not just the terminal one, because the value projection
+// reshapes head-major and then straight back to flat before the store.
+static bool hrx_layout_chain_has_row_width(const ggml_tensor * t, int64_t row_width) {
+    for (int hop = 0; hop < 5 && t != nullptr; ++hop) {
+        if (t->ne[0] == row_width) {
+            return true;
+        }
+        switch (t->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+                t = t->src[0];
+                break;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+// The KV-cache publish dispatches in dispatch_registration/dispatch-qwen-attention-postprocess.cpp are
+// written entirely against kQwenAttentionHeadSize == 128 with several key/value heads. qwen4exp has
+// neither geometry and publishes two caches that no matcher can accept:
+//
+//   build_attn_qsa() K/V:      head-major [256,2,T] -- 256-wide heads, so every head-size check fails
+//   build_qsa_top_k() indexer: head-major [128,1,T] -- one head, and the key is cached *raw* (line 581
+//                              of src/models/qwen4exp.cpp: pooling precedes norm and rotation), so the
+//                              key-publish chain's mandatory ROPE producer is absent
+//
+// Claiming either strands the SET_ROWS with no dispatch. This only ever fires on qwen4exp shapes; any
+// geometry it does not positively recognise stays claimed, so the qwen30b profile is untouched.
+static bool hrx_cache_publish_unmatched_qwen4exp(const ggml_tensor * op) {
+    const ggml_tensor * source = op == nullptr ? nullptr : op->src[0];
+    if (source == nullptr) {
+        return false;
+    }
+    if (hrx_layout_chain_has_row_width(source, kHrxAttentionHeadSizeQwen4Exp)) {
+        return true;
+    }
+    return source->ne[0] == kHrxIndexerKeyLengthQwen4Exp && source->ne[1] == 1;
+}
+
+// HRX's only hc_dim-wide MUL kernel is the gamma scale fused into the grouped RMS_NORM registered in
+// dispatch-rmsnorm.cpp, whose second operand is always a leaf norm weight. qwen4exp emits two other
+// MULs at exactly the same f32[10240,T] shape, both multiplying two *computed* activations and neither
+// rooted at by any matcher:
+//
+//   build_hc_mix():            MUL(hc_norm_out, SIGMOID(...))  -- gates the streams before collapsing
+//   build_ple() depthwise conv: MUL(CONT(view), RESHAPE(wk))   -- one shifted tap times its per-channel
+//                                                                 weight column, summed over the kernel
+//
+// Requiring the second operand to be a leaf keeps the fused grouped norm claimed while declining both.
+static bool hrx_hc_dim_activation_mul_qwen4exp(const ggml_tensor * op) {
+    if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[1] == nullptr) {
+        return false;
+    }
+    return op->ne[0] == kHrxHcDimQwen4Exp && op->src[1]->op != GGML_OP_NONE;
+}
+
+// The only CLAMP the HRX corpus can execute is the epsilon floor folded into the MoE router and
+// routed-FFN dispatches (dispatch-moe-router.cpp, dispatch-routed-ffn.cpp), which always sits directly
+// on a router-weight SUM_ROWS. qwen4exp's build_ple() emits a second, unrelated CLAMP -- the magnitude
+// floor of its signed-sqrt gate, which sits on an ABS -- and a MUL that re-applies the sign, neither of
+// which any matcher roots at. Keying off the producing op rather than a shape keeps this exact: the
+// router clamp never reads an ABS, and nothing but PLE multiplies by an SGN.
+static bool hrx_ple_signed_sqrt_gate_qwen4exp(const ggml_tensor * op) {
+    const ggml_tensor * src = op == nullptr ? nullptr : op->src[0];
+    return src != nullptr && src->op == GGML_OP_UNARY &&
+           (ggml_get_unary_op(src) == GGML_UNARY_OP_ABS || ggml_get_unary_op(src) == GGML_UNARY_OP_SGN);
+}
+
+// An elementwise MUL over qwen4exp's stream-major [n_embd, streams] layout, where `streams` is the
+// hyper-connection count (4) or the routed-expert count (10). qwen4exp emits four of these, none of
+// which any dispatch matcher roots at:
+//
+//   build_hc_combine():         f32[2560,4]  * f32[1,4]     -- scatters a block output back across the
+//                                                              hc residual streams, consumed by an ADD
+//   build_ple() gate scaling:   f32[2560,4]  * f32[1,4]     -- broadcasts the PLE gate over the value
+//   build_ple() dot product:    f32[2560,4]  * f32[2560,4]  -- per-stream key.query, consumed by SUM_ROWS
+//   routed-FFN weighted reduce: f32[2560,10] * f32[1,10]    -- scales each expert's contribution by its
+//                                                              router weight
+//
+// The HC kernels registered in dispatch-rmsnorm.cpp cover the grouped *norm*, a different pattern that
+// MULs by a full hc_dim-wide (10240) weight; there is no PLE dispatch at all; and the routed-FFN reduce
+// only ever runs fused inside "llm.routed_ffn.*down*" -- which cannot match here (see
+// hrx_moe_down_weight_supported()). So claiming any of them would strand the node with no dispatch.
+//
+// The `op->ne[1] > 1` guard is load-bearing: it keeps the ordinary RMS_NORM-times-weight fusion
+// (f32[2560,T] * f32[2560,1]) out of this predicate, which would otherwise collide during single-token
+// decode where T == 1. Every shape here is at most n_embd*10 == 25600 elements per layer, so the CPU
+// handles them for free.
+static bool hrx_stream_major_mul_qwen4exp(const ggml_tensor * op) {
+    if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * rows    = op->src[0];
+    const ggml_tensor * scalars = op->src[1];
+    return op->ne[0] == kHrxHiddenSizeQwen4Exp && op->ne[1] > 1 && op->ne[3] == 1 &&
+           rows->ne[0] == kHrxHiddenSizeQwen4Exp && rows->ne[1] == op->ne[1] &&
+           (scalars->ne[0] == 1 || scalars->ne[0] == kHrxHiddenSizeQwen4Exp) &&
+           scalars->ne[1] == op->ne[1];
+}
+
+// The only SUM_ROWS the HRX corpus can execute are the two folded into the MoE router and routed-FFN
+// dispatches (dispatch-moe-router.cpp, dispatch-routed-ffn.cpp), which reduce a [n_expert_used, T]
+// router-weight row. qwen4exp's build_ple() emits a second, unrelated SUM_ROWS that reduces the
+// [n_embd, hc] per-stream key.query product; it has no matcher, so decline it by its input width.
+static bool hrx_ple_stream_reduce_qwen4exp(const ggml_tensor * op) {
+    return op != nullptr && op->src[0] != nullptr && op->src[0]->ne[0] == kHrxHiddenSizeQwen4Exp;
+}
+
 static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op) {
     GGML_UNUSED(device);
     if (op == nullptr || !eager_capability_declared(op->op)) {
         return false;
     }
+    // Zero-token graphs are real: llama.cpp builds worst-case reserve graphs and, for qwen4exp, an MTP
+    // draft layer whose ubatch can carry no tokens, which reaches here as e.g. f32[2560,4,0,1]. Every
+    // dispatch matcher requires a positive token count, so an empty node would be claimed and then
+    // strand its split. Nothing is lost by declining: an empty op is a no-op wherever it runs.
+    if (ggml_is_empty(op)) {
+        return false;
+    }
+    // The "misc" bisect group covers every op HRX claims by default rather than through one of the
+    // named subsystem groups below -- the elementwise, normalisation, layout and residual ops.
+    // Disabling it alongside the named groups leaves nothing at all on HRX, which is the known-good
+    // starting point a numerical bisection needs. It is further subdivided by op class ("mnorm",
+    // "mrope", "msoftmax", "msetrows", "melem", "mlayout") so a bisection can narrow to one class
+    // without giving up the rest; "misc" is the umbrella that disables all six.
+    switch (op->op) {
+        // Owned by a named subsystem group, so never part of "misc".
+        case GGML_OP_NONE:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_CONCAT:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_UNARY:
+        case GGML_OP_FLASH_ATTN_EXT:
+            break;
+        case GGML_OP_RMS_NORM:
+            if (hrx_misc_group_disabled("mnorm")) {
+                return false;
+            }
+            break;
+        case GGML_OP_ROPE:
+            if (hrx_misc_group_disabled("mrope")) {
+                return false;
+            }
+            break;
+        case GGML_OP_SOFT_MAX:
+            if (hrx_misc_group_disabled("msoftmax")) {
+                return false;
+            }
+            break;
+        case GGML_OP_SET_ROWS:
+            if (hrx_misc_group_disabled("msetrows")) {
+                return false;
+            }
+            break;
+        case GGML_OP_ADD:
+            if (hrx_misc_group_disabled("eadd")) {
+                return false;
+            }
+            break;
+        case GGML_OP_MUL:
+            if (hrx_misc_group_disabled("emul")) {
+                return false;
+            }
+            break;
+        case GGML_OP_DIV:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_GLU:
+            if (hrx_misc_group_disabled("eother")) {
+                return false;
+            }
+            break;
+        default:
+            if (hrx_misc_group_disabled("mlayout")) {
+                return false;
+            }
+            break;
+    }
 
     switch (op->op) {
         // Placement probe: the scheduler asks whether an HRX buffer may hold a pre-allocated tensor by
-        // presenting it as a NONE op. Decline weights whose quantization has no HRX kernel so they stay
-        // on the CPU instead of being pinned into an HRX buffer we cannot compute against.
+        // presenting it as a NONE op (see ggml_backend_sched_backend_id_from_cur() in
+        // ggml-backend.cpp, which calls device_supports_op() with the weight tensor itself, whose
+        // ->op field is GGML_OP_NONE for any leaf/weight tensor). Decline weights whose quantization
+        // has no HRX kernel so they stay on the CPU instead of being pinned into an HRX buffer we
+        // cannot compute against. This must accept exactly the same weights the real consuming-op
+        // arms below accept -- the model loader chooses a weight's buffer type by probing its real
+        // consuming op (e.g. MUL_MAT_ID for hrx_moe_down_weight_supported() below), so if this probe
+        // disagreed with that choice, ggml-backend's scheduler would abort with "pre-allocated tensor
+        // ... that cannot run the operation (NONE)" for a weight already placed on HRX0.
         case GGML_OP_NONE:
-            return hrx_weight_quant_supported(op->type);
+            return hrx_weight_quant_supported(op->type) || hrx_moe_down_weight_supported(op);
         // Weight-consuming ops: the first source is the weight. Decline unsupported weight quantizations.
         case GGML_OP_GET_ROWS:
+            return op->src[0] == nullptr ||
+                   (!hrx_dispatch_group_disabled("embed") && hrx_weight_quant_supported(op->src[0]->type) &&
+                    !hrx_non_leaf_gather_qwen4exp(op));
         case GGML_OP_MUL_MAT:
-            return op->src[0] == nullptr || hrx_weight_quant_supported(op->src[0]->type);
+            return op->src[0] == nullptr ||
+                   (!hrx_dispatch_group_disabled("matmul") && hrx_dense_matmul_weight_supported(op->src[0]->type));
         case GGML_OP_MUL_MAT_ID:
             if (op->src[0] == nullptr) {
                 return true;
+            }
+            if (hrx_dispatch_group_disabled("matmul")) {
+                return false;
+            }
+            // Checked before the quantization arm below: the qwen4exp routed gate/up weights are Q4_K,
+            // which hrx_weight_quant_supported() accepts, but no gate/up matcher covers qwen4exp's
+            // geometry. See hrx_moe_gate_up_weight_qwen4exp().
+            if (hrx_moe_gate_up_weight_qwen4exp(op->src[0])) {
+                return false;
             }
             if (hrx_weight_quant_supported(op->src[0]->type)) {
                 return true;
@@ -799,22 +1299,51 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             // back to CPU. This is the same general class of issue as the broader compute-op
             // over-claim in the `default: return true;` case below (RMS_NORM/ADD/ROPE/etc.), just
             // narrower in scope since it is gated to one specific weight quant+shape combination.
-            return hrx_moe_down_quant_supported(op->src[0]->type) &&
-                   op->src[0]->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp;
+            return hrx_moe_down_weight_supported(op->src[0]);
         // qwen4exp GDN (Gated DeltaNet): all five of these are real compute ops with the over-claim
         // risk described in the comment above hrx_gdn_conv_concat_decode_supported(), so each is
         // scoped to the exact qwen4exp decode-time shape profile and declined otherwise (falls back to
         // CPU, which still implements the general-shape/prefill case correctly).
+        // "gdnconv" (the CONCAT/SSM_CONV/SILU/L2_NORM conv-prepare prelude) and "gdncore" (the
+        // recurrent GATED_DELTA_NET step itself) are separately disableable so a numerical bisection
+        // can tell the two halves of the GDN pipeline apart; "gdn" disables both.
         case GGML_OP_CONCAT:
-            return hrx_gdn_conv_concat_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_conv_concat_decode_supported(op);
         case GGML_OP_SSM_CONV:
-            return hrx_gdn_ssm_conv_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_ssm_conv_decode_supported(op);
         case GGML_OP_L2_NORM:
-            return hrx_gdn_l2_norm_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_l2_norm_decode_supported(op);
         case GGML_OP_GATED_DELTA_NET:
-            return hrx_gdn_gated_delta_net_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdncore") && hrx_gdn_gated_delta_net_decode_supported(op);
         case GGML_OP_UNARY:
-            return hrx_gdn_unary_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_unary_decode_supported(op);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return !hrx_dispatch_group_disabled("attn");
+        // See hrx_gdn_per_head_scalar_decode_op(): qwen4exp's GDN alpha/gate prelude emits a 48-element
+        // ADD and MUL that no matcher roots at. Everything else keeps the permissive default.
+        case GGML_OP_ADD:
+            return !hrx_gdn_per_head_scalar_decode_op(op) && !hrx_qsa_indexer_row_qwen4exp(op);
+        case GGML_OP_MUL:
+            return !hrx_gdn_norm_gate_row(op) && !hrx_gdn_per_head_scalar_decode_op(op) &&
+                   !hrx_stream_major_mul_qwen4exp(op) &&
+                   !hrx_ple_signed_sqrt_gate_qwen4exp(op) && !hrx_hc_dim_activation_mul_qwen4exp(op) &&
+                   !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
+                   !hrx_hc_grouped_norm_row_qwen4exp(op);
+        case GGML_OP_RMS_NORM:
+            return !hrx_gdn_norm_gate_row(op) && !hrx_attention_head_major_qwen4exp(op) &&
+                   !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op);
+        case GGML_OP_ROPE:
+        case GGML_OP_VIEW:
+            return !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
+                   !hrx_hc_grouped_norm_row_qwen4exp(op);
+        case GGML_OP_CLAMP:
+            return !hrx_ple_signed_sqrt_gate_qwen4exp(op);
+        case GGML_OP_SUM_ROWS:
+            return !hrx_ple_stream_reduce_qwen4exp(op);
+        case GGML_OP_SET_ROWS:
+            return !hrx_cache_publish_unmatched_qwen4exp(op);
+        case GGML_OP_GLU:
+            return !hrx_moe_glu_qwen4exp_decode(op);
         default:
             return true;
     }
