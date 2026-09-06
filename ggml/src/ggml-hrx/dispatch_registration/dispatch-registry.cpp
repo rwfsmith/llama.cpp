@@ -1,6 +1,7 @@
 #include "dispatch-registry.h"
 
 #include "dispatch-add.h"
+#include "dispatch-gated-delta-net.h"
 #include "dispatch-gather-add.h"
 #include "dispatch-llm-matmul.h"
 #include "dispatch-moe-router.h"
@@ -8,6 +9,7 @@
 #include "dispatch-qwen-flash-attention.h"
 #include "dispatch-qwen-matmul.h"
 #include "dispatch-qwen-preamble.h"
+#include "dispatch-qwen4exp-flash-attention.h"
 #include "dispatch-rmsnorm.h"
 #include "dispatch-routed-ffn.h"
 
@@ -34,11 +36,13 @@ static void sort_registrations(std::vector<DispatchRegistration> & registrations
 static void register_llm_dispatches(DispatchRegistryBuilder & builder) {
     register_qwen_attention_postprocess_dispatches(builder);
     register_qwen_flash_attention_dispatches(builder);
+    register_qwen4exp_flash_attention_dispatches(builder);
     register_qwen_matmul_dispatches(builder);
     register_llm_matmul_dispatches(builder);
     register_routed_ffn_dispatches(builder);
     register_qwen_preamble_dispatches(builder);
     register_qwen_rmsnorm_dispatches(builder);
+    register_gdn_dispatches(builder);
     register_moe_router_dispatches(builder);
 }
 

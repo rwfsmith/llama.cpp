@@ -1,0 +1,8 @@
+// qwen4exp (Qwen3.8-Flash-Next / "qwen38") model-wide configuration shared
+// across independently linked GDN (Gated DeltaNet) kernels.
+//
+// qwen4exp.cpp binds both the L2-norm (Q/K normalization inside GDN) and the
+// RMSNorm (norm_gate output projection) epsilon to the SAME hparam
+// (hparams.f_norm_rms_eps), so a single shared config key covers both call
+// sites -- there is no separate ssm-specific epsilon in this architecture.
+config.decl @qwen4exp.model.rms_epsilon : f32

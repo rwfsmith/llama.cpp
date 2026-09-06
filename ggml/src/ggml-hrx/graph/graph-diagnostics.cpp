@@ -155,6 +155,21 @@ json op_params_json(const OpParams & params) {
                     { "beta_fast",   value.beta_fast   },
                     { "beta_slow",   value.beta_slow   },
                 };
+            } else if constexpr (std::is_same_v<T, L2NormParams>) {
+                return {
+                    { "kind", "l2_norm" },
+                    { "eps",  value.eps }
+                };
+            } else if constexpr (std::is_same_v<T, UnaryParams>) {
+                return {
+                    { "kind", "unary"                   },
+                    { "op",   static_cast<int>(value.op) }
+                };
+            } else if constexpr (std::is_same_v<T, GatedDeltaNetParams>) {
+                return {
+                    { "kind", "gated_delta_net" },
+                    { "k",    value.k           }
+                };
             }
         },
         params);
@@ -195,6 +210,15 @@ OpParams parse_op_params(const json & item) {
             item.value("freq_base", 0.0f),   item.value("freq_scale", 0.0f), item.value("ext_factor", 0.0f),
             item.value("attn_factor", 0.0f), item.value("beta_fast", 0.0f),  item.value("beta_slow", 0.0f),
         };
+    }
+    if (kind == "l2_norm") {
+        return L2NormParams{ item.value("eps", 0.0f) };
+    }
+    if (kind == "unary") {
+        return UnaryParams{ static_cast<ggml_unary_op>(item.value("op", static_cast<int>(GGML_UNARY_OP_ABS))) };
+    }
+    if (kind == "gated_delta_net") {
+        return GatedDeltaNetParams{ item.value("k", 0) };
     }
     return std::monostate{};
 }

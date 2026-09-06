@@ -67,6 +67,24 @@ static bool rope_params_equivalent(const OpParams & lhs, const OpParams & rhs) {
            nearly_equal(lhs_params->beta_slow, rhs_params->beta_slow);
 }
 
+static bool l2_norm_params_equivalent(const OpParams & lhs, const OpParams & rhs) {
+    const L2NormParams * lhs_params = op_params_as<L2NormParams>(lhs);
+    const L2NormParams * rhs_params = op_params_as<L2NormParams>(rhs);
+    return lhs_params != nullptr && rhs_params != nullptr && nearly_equal(lhs_params->eps, rhs_params->eps);
+}
+
+static bool unary_params_equivalent(const OpParams & lhs, const OpParams & rhs) {
+    const UnaryParams * lhs_params = op_params_as<UnaryParams>(lhs);
+    const UnaryParams * rhs_params = op_params_as<UnaryParams>(rhs);
+    return lhs_params != nullptr && rhs_params != nullptr && lhs_params->op == rhs_params->op;
+}
+
+static bool gated_delta_net_params_equivalent(const OpParams & lhs, const OpParams & rhs) {
+    const GatedDeltaNetParams * lhs_params = op_params_as<GatedDeltaNetParams>(lhs);
+    const GatedDeltaNetParams * rhs_params = op_params_as<GatedDeltaNetParams>(rhs);
+    return lhs_params != nullptr && rhs_params != nullptr && lhs_params->k == rhs_params->k;
+}
+
 }  // namespace
 
 OpParams import_op_params(const ggml_tensor & tensor) {
@@ -102,6 +120,12 @@ OpParams import_op_params(const ggml_tensor & tensor) {
                 ggml_get_op_params_f32(&tensor, 8),  ggml_get_op_params_f32(&tensor, 9),
                 ggml_get_op_params_f32(&tensor, 10),
             };
+        case GGML_OP_L2_NORM:
+            return L2NormParams{ ggml_get_op_params_f32(&tensor, 0) };
+        case GGML_OP_UNARY:
+            return UnaryParams{ ggml_get_unary_op(&tensor) };
+        case GGML_OP_GATED_DELTA_NET:
+            return GatedDeltaNetParams{ ggml_get_op_params_i32(&tensor, 0) };
         default:
             return std::monostate{};
     }
@@ -123,6 +147,12 @@ bool op_params_equivalent(ggml_op op, const OpParams & lhs, const OpParams & rhs
             return glu_params_equivalent(lhs, rhs);
         case GGML_OP_ROPE:
             return rope_params_equivalent(lhs, rhs);
+        case GGML_OP_L2_NORM:
+            return l2_norm_params_equivalent(lhs, rhs);
+        case GGML_OP_UNARY:
+            return unary_params_equivalent(lhs, rhs);
+        case GGML_OP_GATED_DELTA_NET:
+            return gated_delta_net_params_equivalent(lhs, rhs);
         default:
             return lhs.index() == rhs.index();
     }

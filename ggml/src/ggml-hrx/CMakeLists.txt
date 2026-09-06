@@ -161,6 +161,8 @@ ggml_add_backend_library(ggml-hrx
     dispatch/transient-allocator.h
     dispatch_registration/dispatch-add.cpp
     dispatch_registration/dispatch-add.h
+    dispatch_registration/dispatch-gated-delta-net.cpp
+    dispatch_registration/dispatch-gated-delta-net.h
     dispatch_registration/dispatch-gather-add.cpp
     dispatch_registration/dispatch-gather-add.h
     dispatch_registration/dispatch-llm-matmul.cpp
@@ -177,6 +179,8 @@ ggml_add_backend_library(ggml-hrx
     dispatch_registration/dispatch-moe-router.h
     dispatch_registration/dispatch-qwen-preamble.cpp
     dispatch_registration/dispatch-qwen-preamble.h
+    dispatch_registration/dispatch-qwen4exp-flash-attention.cpp
+    dispatch_registration/dispatch-qwen4exp-flash-attention.h
     dispatch_registration/dispatch-registry.cpp
     dispatch_registration/dispatch-registry.h
     dispatch_registration/dispatch-rmsnorm.cpp

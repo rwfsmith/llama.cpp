@@ -584,10 +584,13 @@ static bool eager_capability_declared(enum ggml_op op) {
         case GGML_OP_ADD:
         case GGML_OP_ARGSORT:
         case GGML_OP_CLAMP:
+        case GGML_OP_CONCAT:
         case GGML_OP_DIV:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GET_ROWS:
         case GGML_OP_GLU:
+        case GGML_OP_L2_NORM:
         case GGML_OP_MUL:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -597,7 +600,10 @@ static bool eager_capability_declared(enum ggml_op op) {
         case GGML_OP_ROPE:
         case GGML_OP_SET_ROWS:
         case GGML_OP_SOFT_MAX:
+        case GGML_OP_SSM_CONV:
         case GGML_OP_SUM_ROWS:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_UNARY:
         case GGML_OP_VIEW:
             return true;
         default:
@@ -656,6 +662,108 @@ static bool hrx_moe_down_quant_supported(enum ggml_type type) {
 // operand purely from the tensor itself, with no model/profile context available at this call site.
 static constexpr int64_t kHrxMoeDownExpertHiddenSizeQwen4Exp = 640;
 
+// qwen4exp GDN (Gated DeltaNet) decode-only shape profile: head_k_dim == head_v_dim == 128
+// (hparams.ssm_d_state), num_k_heads == 16 (hparams.ssm_n_group), num_v_heads == 48
+// (hparams.ssm_dt_rank), single token / single sequence decode (K == 1). These constants are
+// duplicated (rather than shared) from dispatch-gated-delta-net.cpp's matchers, mirroring how
+// kHrxMoeDownExpertHiddenSizeQwen4Exp above is likewise a local, self-contained shape constant: this
+// file has no dependency on dispatch_registration/.
+static constexpr int64_t kHrxGdnHeadDimQwen4Exp       = 128;
+static constexpr int64_t kHrxGdnKeyHeadCountQwen4Exp   = 16;
+static constexpr int64_t kHrxGdnValueHeadCountQwen4Exp = 48;
+static constexpr int64_t kHrxGdnConvChannelsQwen4Exp =
+    kHrxGdnHeadDimQwen4Exp * kHrxGdnKeyHeadCountQwen4Exp * 2 + kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp;
+static constexpr int64_t kHrxGdnConvKernelSizeQwen4Exp = 4;  // hparams.ssm_d_conv
+
+// GGML_OP_GATED_DELTA_NET, GGML_OP_SSM_CONV, GGML_OP_L2_NORM, GGML_OP_CONCAT, and GGML_OP_UNARY are
+// all real compute ops used by many models beyond qwen4exp -- e.g. every other delta-net-family model
+// built on delta-net-base.cpp (qwen3next, kimi-linear, ...) also emits GATED_DELTA_NET/L2_NORM/
+// SSM_CONV with their own, different head-dim/head-count profiles; GGML_OP_CONCAT is used pervasively
+// across nearly every model in src/models/ for unrelated purposes; and GGML_OP_UNARY is how virtually
+// every model's SiLU/sigmoid activations are represented (there is no separate GGML_OP_SILU/
+// GGML_OP_SIGMOID -- both are GGML_OP_UNARY with a different ggml_unary_op sub-code). Unlike
+// VIEW/RESHAPE/PERMUTE/TRANSPOSE (pure layout-alias ops with zero real-compute risk, handled by the
+// `default: return true;` fallthrough below), declaring these five in eager_capability_declared()
+// without narrowing them here would make HRX unconditionally claim every model's use of these ops
+// regardless of shape -- the same "wall #3" over-claim risk documented above
+// hrx_moe_down_quant_supported(). So each is checked below against qwen4exp's exact decode profile and
+// declined for anything else.
+static bool hrx_gdn_conv_concat_decode_supported(const ggml_tensor * op) {
+    // qwen4exp.cpp's build_conv_state_at(): CONCAT(conv_history[3,conv_channels,1,1],
+    // transpose(qkv_mixed)[1,conv_channels,1,1], dim=0) -> [4,conv_channels,1,1].
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * conv_history = op->src[0];
+    const ggml_tensor * new_column   = op->src[1];
+    return conv_history->ne[0] == kHrxGdnConvKernelSizeQwen4Exp - 1 &&
+           conv_history->ne[1] == kHrxGdnConvChannelsQwen4Exp && conv_history->ne[2] == 1 &&
+           conv_history->ne[3] == 1 && new_column->ne[0] == 1 && new_column->ne[1] == kHrxGdnConvChannelsQwen4Exp &&
+           new_column->ne[2] == 1 && new_column->ne[3] == 1 && op->ne[0] == kHrxGdnConvKernelSizeQwen4Exp &&
+           op->ne[1] == kHrxGdnConvChannelsQwen4Exp && op->ne[2] == 1 && op->ne[3] == 1;
+}
+
+static bool hrx_gdn_ssm_conv_decode_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * sx = op->src[0];  // conv_input: [d_conv, d_inner, n_s]
+    const ggml_tensor * c  = op->src[1];  // conv kernel: [d_conv, d_inner]
+    return sx->ne[0] == kHrxGdnConvKernelSizeQwen4Exp && sx->ne[1] == kHrxGdnConvChannelsQwen4Exp && sx->ne[2] == 1 &&
+           c->ne[0] == kHrxGdnConvKernelSizeQwen4Exp && c->ne[1] == kHrxGdnConvChannelsQwen4Exp &&
+           op->ne[0] == kHrxGdnConvChannelsQwen4Exp && op->ne[1] == 1 && op->ne[2] == 1;
+}
+
+static bool hrx_gdn_l2_norm_decode_supported(const ggml_tensor * op) {
+    // Only q/k get L2-normalized in qwen4exp's GDN prelude (per-head, head_k_dim=128 over
+    // num_k_heads=16); v is not. n_seq_tokens (ne[2]) == 1 additionally scopes this to decode.
+    return op != nullptr && op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnKeyHeadCountQwen4Exp &&
+           op->ne[2] == 1 && op->ne[3] == 1;
+}
+
+static bool hrx_gdn_gated_delta_net_decode_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr || op->src[2] == nullptr ||
+        op->src[3] == nullptr || op->src[4] == nullptr || op->src[5] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * q     = op->src[0];
+    const ggml_tensor * k     = op->src[1];
+    const ggml_tensor * v     = op->src[2];
+    const ggml_tensor * gate  = op->src[3];
+    const ggml_tensor * beta  = op->src[4];
+    const ggml_tensor * state = op->src[5];
+    return ggml_get_op_params_i32(op, 0) == 1 &&  // K == 1: single-chunk decode; chunked prefill (K>1) declines.
+           q->ne[0] == kHrxGdnHeadDimQwen4Exp && q->ne[1] == kHrxGdnKeyHeadCountQwen4Exp && q->ne[2] == 1 &&
+           q->ne[3] == 1 && k->ne[0] == kHrxGdnHeadDimQwen4Exp && k->ne[1] == kHrxGdnKeyHeadCountQwen4Exp &&
+           k->ne[2] == 1 && k->ne[3] == 1 && v->ne[0] == kHrxGdnHeadDimQwen4Exp &&
+           v->ne[1] == kHrxGdnValueHeadCountQwen4Exp && v->ne[2] == 1 && v->ne[3] == 1 && gate->ne[0] == 1 &&
+           gate->ne[1] == kHrxGdnValueHeadCountQwen4Exp && gate->ne[2] == 1 && gate->ne[3] == 1 &&
+           beta->ne[0] == 1 && beta->ne[1] == kHrxGdnValueHeadCountQwen4Exp && beta->ne[2] == 1 &&
+           beta->ne[3] == 1 && state->ne[0] == kHrxGdnHeadDimQwen4Exp && state->ne[1] == kHrxGdnHeadDimQwen4Exp &&
+           state->ne[2] == kHrxGdnValueHeadCountQwen4Exp && state->ne[3] == 1;
+}
+
+static bool hrx_gdn_unary_decode_supported(const ggml_tensor * op) {
+    if (op == nullptr) {
+        return false;
+    }
+    switch (ggml_get_unary_op(op)) {
+        case GGML_UNARY_OP_SILU:
+            // qwen4exp.gdn_conv_prepare_decode's post-SSM_CONV activation: [conv_channels,1,1,1].
+            return op->ne[0] == kHrxGdnConvChannelsQwen4Exp && op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1;
+        case GGML_UNARY_OP_SIGMOID:
+            // qwen4exp.gdn_norm_gate_decode's z-gate: [head_v_dim,num_v_heads,1,1] == [128,48,1,1].
+            // Deliberately narrower than the [1,48,1,1] shape of this same layer's *other* sigmoid
+            // (build_layer_attn_linear's `beta = ggml_sigmoid(ctx0, beta)`), which is left
+            // CPU-fallback: no dispatch matcher roots at a standalone SIGMOID, so claiming that shape
+            // too would strand it with no matcher (hard scheduling failure).
+            return op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnValueHeadCountQwen4Exp &&
+                   op->ne[2] == 1 && op->ne[3] == 1;
+        default:
+            return false;
+    }
+}
+
 static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op) {
     GGML_UNUSED(device);
     if (op == nullptr || !eager_capability_declared(op->op)) {
@@ -693,6 +801,20 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             // narrower in scope since it is gated to one specific weight quant+shape combination.
             return hrx_moe_down_quant_supported(op->src[0]->type) &&
                    op->src[0]->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp;
+        // qwen4exp GDN (Gated DeltaNet): all five of these are real compute ops with the over-claim
+        // risk described in the comment above hrx_gdn_conv_concat_decode_supported(), so each is
+        // scoped to the exact qwen4exp decode-time shape profile and declined otherwise (falls back to
+        // CPU, which still implements the general-shape/prefill case correctly).
+        case GGML_OP_CONCAT:
+            return hrx_gdn_conv_concat_decode_supported(op);
+        case GGML_OP_SSM_CONV:
+            return hrx_gdn_ssm_conv_decode_supported(op);
+        case GGML_OP_L2_NORM:
+            return hrx_gdn_l2_norm_decode_supported(op);
+        case GGML_OP_GATED_DELTA_NET:
+            return hrx_gdn_gated_delta_net_decode_supported(op);
+        case GGML_OP_UNARY:
+            return hrx_gdn_unary_decode_supported(op);
         default:
             return true;
     }

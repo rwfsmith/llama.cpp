@@ -210,6 +210,36 @@
       "sha256": "249b1d4c7167d0533277481cbb0e930207f14f9e2ba75fc1b8754eb0717ed094",
       "size": 2444,
       "owner": "ggml-hrx"
+    },
+    {
+      "path": "qwen4exp/attention_common.loom",
+      "sha256": "9e45d592d237ea95d69a37821b6767594cde1873068f51812a3a241c55424274",
+      "size": 2360
+    },
+    {
+      "path": "qwen4exp/attention_decode.loom",
+      "sha256": "af0a072aac9c9224a4fc162c03c910d0ff523363444e0a2f2cdd004a5f3f1d32",
+      "size": 15502
+    },
+    {
+      "path": "qwen4exp/attention_decode_split.loom",
+      "sha256": "49d95c1080b000251f8889314d644c6d8fec1f8418d775146136b31d8c9f6843",
+      "size": 57795
+    },
+    {
+      "path": "qwen4exp/gdn_common.loom",
+      "sha256": "64a4f79c3e042bfb111e725a0dc4e625372e614f204f4365bd14678ca1386c2b",
+      "size": 1807
+    },
+    {
+      "path": "qwen4exp/gdn_decode.loom",
+      "sha256": "dedb267115af98b37dcceca226e66ad6349f7c4d521c3ab8e403aa0c2270ccce",
+      "size": 40421
+    },
+    {
+      "path": "qwen4exp/model_config.loom",
+      "sha256": "65507e809ad5477581aaa1c7f90144ddca0234fbd2a6f433cdbe117bd33656ca",
+      "size": 492
     }
   ],
   "exports": [
@@ -4743,6 +4773,428 @@
       "compile_dependencies": [
         "ggml/quantize_q8_1_x4.loom"
       ]
+    },
+    {
+      "name": "qwen38_gdn_conv_prepare_decode",
+      "symbol": "qwen38_gdn_conv_prepare_decode",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "qkv_input",
+        "conv_weight",
+        "conv_history",
+        "qkv_silu",
+        "qk_inverse_norm"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write",
+        "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "qwen38_gdn_recurrent_decode",
+      "symbol": "qwen38_gdn_recurrent_decode",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "qkv_silu",
+        "qk_inverse_norm",
+        "gate",
+        "beta",
+        "state",
+        "new_state",
+        "raw_output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "qwen38_gdn_recurrent_decode_x4",
+      "symbol": "qwen38_gdn_recurrent_decode_x4",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "qkv_silu",
+        "qk_inverse_norm",
+        "gate",
+        "beta",
+        "state",
+        "new_state",
+        "raw_output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "qwen38_gdn_norm_gate_decode",
+      "symbol": "qwen38_gdn_norm_gate_decode",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "raw_output",
+        "norm_weight",
+        "z",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "qwen38_attention_query_prepare_decode",
+      "symbol": "qwen38_attention_query_prepare_decode",
+      "source": "qwen4exp/attention_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [
+        {
+          "name": "epsilon",
+          "type": "f32"
+        }
+      ],
+      "bindings": [
+        "control",
+        "query_gate_projection",
+        "norm_weight",
+        "query",
+        "gate"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "attention_decode_linked",
+        "primary_sources": [
+          "qwen4exp/attention_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/attention_common.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/attention_common.loom"
+      ]
+    },
+    {
+      "name": "qwen38_attention_kv_prepare_decode",
+      "symbol": "qwen38_attention_kv_prepare_decode",
+      "source": "qwen4exp/attention_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [
+        {
+          "name": "epsilon",
+          "type": "f32"
+        }
+      ],
+      "bindings": [
+        "control",
+        "key_projection",
+        "value_projection",
+        "norm_weight",
+        "key_cache",
+        "value_cache"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "attention_decode_linked",
+        "primary_sources": [
+          "qwen4exp/attention_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/attention_common.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/attention_common.loom"
+      ]
+    },
+    {
+      "name": "qwen38_attention_decode",
+      "symbol": "qwen38_attention_decode",
+      "source": "qwen4exp/attention_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "control",
+        "query",
+        "gate",
+        "key_cache",
+        "value_cache",
+        "mask",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "attention_decode_linked",
+        "primary_sources": [
+          "qwen4exp/attention_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/attention_common.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/attention_common.loom"
+      ]
+    },
+    {
+      "name": "qwen38_attention_decode_split_partial",
+      "symbol": "qwen38_attention_decode_split_partial",
+      "source": "qwen4exp/attention_decode_split.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "control",
+        "query",
+        "key_cache",
+        "value_cache",
+        "mask",
+        "partials"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "attention_decode_split_linked",
+        "primary_sources": [
+          "qwen4exp/attention_decode_split.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/attention_common.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/attention_common.loom"
+      ]
+    },
+    {
+      "name": "qwen38_attention_decode_split_wmma_partial",
+      "symbol": "qwen38_attention_decode_split_wmma_partial",
+      "source": "qwen4exp/attention_decode_split.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "token_ordinal",
+          "type": "index"
+        },
+        {
+          "name": "control_position_index",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "control",
+        "query",
+        "key_cache",
+        "value_cache",
+        "mask",
+        "partials"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "attention_decode_split_linked",
+        "primary_sources": [
+          "qwen4exp/attention_decode_split.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/attention_common.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/attention_common.loom"
+      ]
+    },
+    {
+      "name": "qwen38_attention_decode_split_reduce",
+      "symbol": "qwen38_attention_decode_split_reduce",
+      "source": "qwen4exp/attention_decode_split.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "token_ordinal",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "gate",
+        "partials",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "attention_decode_split_linked",
+        "primary_sources": [
+          "qwen4exp/attention_decode_split.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/attention_common.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/attention_common.loom"
+      ]
     }
   ],
   "link_modules": [
@@ -4991,6 +5443,34 @@
       "libraries": [
         "qwen3_moe/flash_attention_decode_split_f32_f16_wmma.loom",
         "ggml/quantize_q8_1_x4.loom"
+      ]
+    },
+    {
+      "name": "gdn_decode_linked",
+      "srcs": [
+        "qwen4exp/gdn_decode.loom"
+      ],
+      "libraries": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "attention_decode_linked",
+      "srcs": [
+        "qwen4exp/attention_decode.loom"
+      ],
+      "libraries": [
+        "qwen4exp/attention_common.loom"
+      ]
+    },
+    {
+      "name": "attention_decode_split_linked",
+      "srcs": [
+        "qwen4exp/attention_decode_split.loom"
+      ],
+      "libraries": [
+        "qwen4exp/attention_common.loom"
       ]
     }
   ],

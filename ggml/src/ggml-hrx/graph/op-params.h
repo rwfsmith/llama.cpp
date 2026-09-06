@@ -49,6 +49,18 @@ struct RopeParams {
     float beta_slow   = 0.0f;
 };
 
+struct L2NormParams {
+    float eps = 0.0f;
+};
+
+struct UnaryParams {
+    ggml_unary_op op = GGML_UNARY_OP_ABS;
+};
+
+struct GatedDeltaNetParams {
+    int32_t k = 0;
+};
+
 // clang-format off
 using OpParams = std::variant<
     std::monostate,
@@ -58,7 +70,10 @@ using OpParams = std::variant<
     ArgsortParams,
     ClampParams,
     GluParams,
-    RopeParams>;
+    RopeParams,
+    L2NormParams,
+    UnaryParams,
+    GatedDeltaNetParams>;
 // clang-format on
 
 template <typename T> const T * op_params_as(const OpParams & params) {
