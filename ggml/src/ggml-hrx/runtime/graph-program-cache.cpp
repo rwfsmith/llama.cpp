@@ -19,7 +19,16 @@ static bool tensor_metadata_matches(const Value & value, const ggml_tensor * ten
     }
     const bool tensor_alias = tensor->view_src != nullptr;
     const bool value_alias  = value.alias_source.value >= 0;
-    if (tensor_alias && (!value_alias || value.storage_offset != tensor->view_offs)) {
+    // A tensor may legitimately be a ggml view whose view_src lives *outside* this HRX split: the
+    // cross-backend scheduler cuts the graph at backend boundaries, so e.g. qwen4exp's "alpha"/"beta"
+    // RESHAPE of a CPU-computed GDN projection enters the split as a leaf that is still flagged as a
+    // view. ValueMap::get_or_add_tensor_value() imports such a tensor as its own storage root with
+    // storage_offset == 0 (find_alias_source() cannot resolve a view_src that is not in the graph),
+    // and the buffer binding is then derived directly from tensor->data, which already includes
+    // view_offs. So no alias bookkeeping is needed -- or even possible -- in that case. Key the check
+    // off the cached value rather than the tensor: only a value that really is an alias has to agree
+    // on the view offset.
+    if (value_alias && (!tensor_alias || value.storage_offset != tensor->view_offs)) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
@@ -28,6 +37,45 @@ static bool tensor_metadata_matches(const Value & value, const ggml_tensor * ten
         }
     }
     return true;
+}
+
+// Describe exactly which metadata field diverged, so a bind failure names the offending tensor
+// instead of only its node index. Only runs on the failure path.
+static std::string describe_metadata_mismatch(const Value & value, const ggml_tensor * tensor) {
+    std::ostringstream out;
+    if (tensor == nullptr) {
+        out << "tensor=null";
+        return out.str();
+    }
+    out << "tensor='" << (tensor->name[0] != '\0' ? tensor->name : "<unnamed>") << "' op=" << ggml_op_name(tensor->op);
+    if (value.type != tensor->type) {
+        out << " type " << static_cast<int>(value.type) << "!=" << static_cast<int>(tensor->type);
+    }
+    if (value.element_count != ggml_nelements(tensor)) {
+        out << " nelem " << value.element_count << "!=" << ggml_nelements(tensor);
+    }
+    if (value.byte_count != ggml_nbytes(tensor)) {
+        out << " nbytes " << value.byte_count << "!=" << ggml_nbytes(tensor);
+    }
+    if (value.contiguous != ggml_is_contiguous(tensor)) {
+        out << " contiguous " << value.contiguous << "!=" << ggml_is_contiguous(tensor);
+    }
+    const bool tensor_alias = tensor->view_src != nullptr;
+    const bool value_alias  = value.alias_source.value >= 0;
+    if (value_alias && !tensor_alias) {
+        out << " cached value aliases " << value.alias_source.value << " but tensor is not a view";
+    } else if (value_alias && value.storage_offset != tensor->view_offs) {
+        out << " view_offs " << value.storage_offset << "!=" << tensor->view_offs;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (value.ne[i] != tensor->ne[i]) {
+            out << " ne[" << i << "] " << value.ne[i] << "!=" << tensor->ne[i];
+        }
+        if (value.nb[i] != tensor->nb[i]) {
+            out << " nb[" << i << "] " << value.nb[i] << "!=" << tensor->nb[i];
+        }
+    }
+    return out.str();
 }
 
 static bool graph_node_params_match(const GraphNode & cached_node, const ggml_tensor * current_node) {
@@ -90,7 +138,8 @@ static Status bind_current_value(const ValueMap &                               
 
     if (existing_tensor == nullptr && existing_value == value_by_tensor.end() &&
         !tensor_metadata_matches(*value, tensor)) {
-        status.log("node %zu %s value %d metadata does not match current tensor", node_index, role, expected.value);
+        status.log("node %zu %s value %d metadata does not match current tensor [%s]", node_index, role, expected.value,
+                   describe_metadata_mismatch(*value, tensor).c_str());
         return status;
     }
 
