@@ -3,22 +3,9 @@
 #include "ggml-impl.h"
 
 #include <cassert>
-#include <unordered_map>
 #include <utility>
 
 namespace ggml::hrx {
-namespace {
-
-static bool tensor_is_external(const ggml_tensor *                                  tensor,
-                               const std::unordered_map<const ggml_tensor *, int> & use_counts) {
-    if (tensor->op == GGML_OP_NONE) {
-        return true;
-    }
-    const auto found = use_counts.find(tensor);
-    return found == use_counts.end() || found->second == 0;
-}
-
-}  // namespace
 
 GraphIndex GraphIndex::build(const Graph & graph) {
     GraphIndex                     index;
@@ -117,21 +104,21 @@ const GraphIndex & Graph::index() const {
 }
 
 GraphImportResult import_ggml_graph(const ggml_cgraph & graph) {
-    GraphImportResult                            result;
-    std::unordered_map<const ggml_tensor *, int> use_counts;
+    GraphImportResult result;
     for (int i = 0; i < graph.n_nodes; ++i) {
-        const ggml_tensor * node = graph.nodes[i];
-        if (node == nullptr) {
+        if (graph.nodes[i] == nullptr) {
             result.status.log("ggml graph contains a null node");
             return result;
         }
-        for (const ggml_tensor * source : node->src) {
-            if (source != nullptr) {
-                ++use_counts[source];
-            }
-        }
     }
 
+    // Every tensor in a ggml graph owns storage that the scheduler assigned, and ggml expects each node to be
+    // materialized there. Treating any of them as transient scratch is unsound: an earlier rule classified a
+    // tensor as external only when no node in the split consumed it, which inverted the test for inputs --
+    // a split input is consumed by definition, so it was bound to uninitialized arena memory and every kernel
+    // read zeros instead of the real activations. Leaves escaped that rule, which is why single-op backend
+    // tests passed while real graphs produced garbage. The transient arena stays available for values that
+    // fused dispatch plans synthesize, which are not ggml tensors and carry no scheduler-owned storage.
     ValueMap & values = result.graph.values();
     for (int i = 0; i < graph.n_nodes; ++i) {
         const ggml_tensor *  node = graph.nodes[i];
@@ -140,14 +127,12 @@ GraphImportResult import_ggml_graph(const ggml_cgraph & graph) {
             if (source == nullptr) {
                 continue;
             }
-            const ValueKind kind = tensor_is_external(source, use_counts) ? ValueKind::External : ValueKind::Transient;
-            inputs.push_back(values.get_or_add_tensor_value(source, kind));
+            inputs.push_back(values.get_or_add_tensor_value(source, ValueKind::External));
         }
 
-        const ValueKind output_kind = tensor_is_external(node, use_counts) ? ValueKind::External : ValueKind::Transient;
-        const ValueId   output      = values.get_or_add_tensor_value(node, output_kind);
-        GraphNode &     graph_node  = result.graph.add_node(node->op, output, std::move(inputs));
-        graph_node.params           = import_op_params(*node);
+        const ValueId   output     = values.get_or_add_tensor_value(node, ValueKind::External);
+        GraphNode &     graph_node = result.graph.add_node(node->op, output, std::move(inputs));
+        graph_node.params          = import_op_params(*node);
     }
 
     result.status.append(result.graph.build_index());
