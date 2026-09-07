@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -518,14 +520,150 @@ static void hrx_trace_split(const ggml_cgraph & graph) {
     }
 }
 
+// HRX_VERIFY_NODES=1: snapshot the inputs of every f32 same-shape ADD in a split *before* the split
+// runs, then read the destination back *after* it runs and compare against a host-computed a+b.
+// Capturing before execution matters: ggml's in-place ADD makes dst a view of src0, so a purely
+// post-hoc comparison reads the same memory twice and reports a bogus error equal to |b|.
+// This distinguishes "the kernel wrote wrong values" from "the values are right but the scheduler
+// consumes them from somewhere else" -- which no amount of output-text bisection can separate.
+// Deliberately slow and synchronous: it is a diagnostic, not a fast path.
+static bool hrx_read_tensor_f32(ggml_backend_hrx_context * context,
+                                const ggml_tensor *        tensor,
+                                std::vector<float> &       out,
+                                bool *                     from_device = nullptr) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    out.resize(bytes / sizeof(float));
+    ggml_backend_hrx_buffer_context * tensor_context = nullptr;
+    size_t                            tensor_offset  = 0;
+    if (ggml_backend_hrx_tensor_binding(tensor, &tensor_context, &tensor_offset)) {
+        if (from_device != nullptr) {
+            *from_device = true;
+        }
+        return HRX_CHECK(hrx_synchronous_d2h(context->device->device, tensor_context->buffer, tensor_offset, out.data(),
+                                             bytes));
+    }
+    ggml_backend_buffer_t buffer = tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
+    if (buffer == nullptr || !ggml_backend_buffer_is_host(buffer) || tensor->data == nullptr) {
+        return false;
+    }
+    if (from_device != nullptr) {
+        *from_device = false;
+    }
+    std::memcpy(out.data(), tensor->data, bytes);
+    return true;
+}
+
+struct hrx_verify_capture {
+    const ggml_tensor * node        = nullptr;
+    std::vector<float>  a;
+    std::vector<float>  b;
+    bool                a_device    = false;
+    bool                b_device    = false;
+    bool                dst_aliases_a = false;
+    bool                dst_aliases_b = false;
+    int                 n_nodes       = 0;
+    int                 node_index    = 0;
+};
+
+static bool hrx_verify_enabled() {
+    static const bool enabled = environment_flag_enabled("HRX_VERIFY_NODES");
+    return enabled;
+}
+
+static std::vector<hrx_verify_capture> hrx_verify_before(ggml_backend_hrx_context * context, const ggml_cgraph & graph) {
+    std::vector<hrx_verify_capture> captures;
+    if (!hrx_verify_enabled()) {
+        return captures;
+    }
+    for (int i = 0; i < graph.n_nodes; ++i) {
+        const ggml_tensor * node = graph.nodes[i];
+        if (node == nullptr || node->op != GGML_OP_ADD || node->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        if (a == nullptr || b == nullptr || !ggml_are_same_shape(a, node) || !ggml_are_same_shape(b, node)) {
+            continue;
+        }
+        hrx_verify_capture capture;
+        capture.node          = node;
+        capture.n_nodes       = graph.n_nodes;
+        capture.node_index    = i;
+        capture.dst_aliases_a = node->data == a->data;
+        capture.dst_aliases_b = node->data == b->data;
+        if (!hrx_read_tensor_f32(context, a, capture.a, &capture.a_device) ||
+            !hrx_read_tensor_f32(context, b, capture.b, &capture.b_device)) {
+            continue;
+        }
+        captures.push_back(std::move(capture));
+    }
+    return captures;
+}
+
+static void hrx_verify_after(ggml_backend_hrx_context * context, const std::vector<hrx_verify_capture> & captures) {
+    if (!hrx_verify_enabled()) {
+        return;
+    }
+    static std::set<std::string> reported;
+    for (const hrx_verify_capture & capture : captures) {
+        std::vector<float> host_out;
+        bool               out_device = false;
+        if (!hrx_read_tensor_f32(context, capture.node, host_out, &out_device)) {
+            continue;
+        }
+        double worst       = 0.0;
+        size_t worst_index = 0;
+        for (size_t e = 0; e < host_out.size() && e < capture.a.size() && e < capture.b.size(); ++e) {
+            const double diff = std::fabs(static_cast<double>(host_out[e]) -
+                                          (static_cast<double>(capture.a[e]) + static_cast<double>(capture.b[e])));
+            if (diff > worst) {
+                worst       = diff;
+                worst_index = e;
+            }
+        }
+        char key[128];
+        std::snprintf(key, sizeof(key), "ADD:%lld,%lld:nodes=%d:idx=%d", static_cast<long long>(capture.node->ne[0]),
+                      static_cast<long long>(capture.node->ne[1]), capture.n_nodes, capture.node_index);
+        if (!reported.insert(key).second) {
+            continue;
+        }
+        ggml_backend_hrx_buffer_context * dst_context = nullptr;
+        size_t                            dst_offset  = 0;
+        ggml_backend_hrx_tensor_binding(capture.node, &dst_context, &dst_offset);
+        GGML_LOG_ERROR(
+            "HRX verify %s n=%zu worst=%.6g at %zu (out=%.6g a=%.6g b=%.6g) dev(a=%d b=%d out=%d) alias(a=%d b=%d) "
+            "view_src=%d dst_buffer=%p dst_offset=%zu\n",
+            key, host_out.size(), worst, worst_index, worst_index < host_out.size() ? host_out[worst_index] : 0.0f,
+            worst_index < capture.a.size() ? capture.a[worst_index] : 0.0f,
+            worst_index < capture.b.size() ? capture.b[worst_index] : 0.0f, static_cast<int>(capture.a_device),
+            static_cast<int>(capture.b_device), static_cast<int>(out_device), static_cast<int>(capture.dst_aliases_a),
+            static_cast<int>(capture.dst_aliases_b), capture.node->view_src != nullptr ? 1 : 0,
+            static_cast<const void *>(dst_context != nullptr ? dst_context->buffer : nullptr), dst_offset);
+    }
+}
+
 static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto * context = static_cast<ggml_backend_hrx_context *>(backend->context);
     hrx_trace_split(*graph);
+    const std::vector<hrx_verify_capture> captures = hrx_verify_before(context, *graph);
     const ggml::hrx::GraphExecutor        executor = ggml::hrx::GraphExecutor(*context);
     const ggml::hrx::GraphExecutionResult result   = executor.execute(*graph);
     if (!result.success()) {
         GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(result.status));
     }
+    // Dispatches are recorded on the backend stream, but the buffer interface moves tensor data on the
+    // device's separate buffer_stream (see buffer_submit_and_wait). Nothing orders those two streams, so
+    // a caller that computes a split here and then reads the result with ggml_backend_tensor_get() would
+    // synchronize only buffer_stream and observe memory the kernel has not written yet. That is exactly
+    // what ggml_backend_sched does between splits, and it silently corrupts every model that offloads any
+    // op at all -- while ggml_backend_graph_compute() (used by test-backend-ops) hides the bug because it
+    // calls ggml_backend_synchronize() itself. Retire the compute stream here so the buffer interface and
+    // any host readback are guaranteed to see completed work.
+    HRX_CHECK(hrx_stream_synchronize(context->stream));
+    hrx_verify_after(context, captures);
     return result.code;
 }
 

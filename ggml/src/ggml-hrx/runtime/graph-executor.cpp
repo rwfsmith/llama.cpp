@@ -6,10 +6,35 @@
 #include "runtime/prepared-command-program-cache.h"
 #include "runtime/transient-arena.h"
 
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
 namespace ggml::hrx {
+
+static bool hrx_environment_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// Bounded so a long generation does not drown the log; the first splits are the interesting ones.
+static bool hrx_trace_bindings_enabled() {
+    static const bool enabled = hrx_environment_flag("HRX_TRACE_BINDINGS");
+    if (!enabled) {
+        return false;
+    }
+    static int remaining = 60;
+    if (remaining <= 0) {
+        return false;
+    }
+    --remaining;
+    return true;
+}
+
+static bool hrx_prepared_fast_path_disabled() {
+    static const bool disabled = hrx_environment_flag("HRX_DISABLE_PREPARED_FAST_PATH");
+    return disabled;
+}
 
 GraphExecutor::GraphExecutor(ggml_backend_hrx_context & context) : context_(context) {}
 
@@ -62,6 +87,12 @@ CommandProgramBindings GraphExecutor::bind_external_value_buffers(const GraphPro
             binding.generation = value_binding.generation;
             binding.capacity   = value_binding.capacity;
             binding.weight     = value_binding.weight;
+            if (hrx_trace_bindings_enabled()) {
+                GGML_LOG_ERROR("HRX bind value=%d tensor=%s op=%s buffer=%p offset=%zu length=%zu identity=%llu\n",
+                               external.value.value, external.tensor->name, ggml_op_name(external.tensor->op),
+                               static_cast<const void *>(binding.buffer), binding.offset, binding.length,
+                               static_cast<unsigned long long>(binding.identity));
+            }
         } else {
             status.log("external value %d is not bound", external.value.value);
         }
@@ -92,8 +123,9 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
         return result;
     }
 
-    const bool use_graph_prepared =
-        !lookup.program->has_prepared_program() || lookup.program->can_use_prepared_fast_path(graph);
+    const bool use_graph_prepared = !hrx_prepared_fast_path_disabled() &&
+                                    (!lookup.program->has_prepared_program() ||
+                                     lookup.program->can_use_prepared_fast_path(graph));
     GraphProgramMatch binding_match = std::move(lookup.match);
     if (use_graph_prepared && lookup.program->has_prepared_program()) {
         binding_match = lookup.program->match_host_staging_graph(graph);
