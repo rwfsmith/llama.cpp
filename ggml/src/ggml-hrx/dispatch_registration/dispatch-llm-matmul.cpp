@@ -16,6 +16,8 @@ static constexpr KernelCatalogRef kLlmDenseLinearQ4KF16WmmaKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_dense_linear_q4k_f16_wmma");
 static constexpr KernelCatalogRef kLlmDenseLinearQ6KF16WmmaKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_dense_linear_q6k_f16_wmma");
+static constexpr KernelCatalogRef kLlmDenseLinearQ8_0F16WmmaKernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_dense_linear_q8_0_f16_wmma");
 
 static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
@@ -36,6 +38,7 @@ static bool is_supported_dense_output_size(int64_t output_size) {
 enum class LlmDenseMatmulRoute {
     Q4K,
     Q6K,
+    Q8_0,
 };
 
 static std::string to_config_value(int64_t value) {
@@ -77,7 +80,7 @@ static LlmDenseMatmulMatch match_llm_dense_matmul(const Graph &       graph,
     const int64_t output_size = weight->ne[1];
     const int64_t token_count = input->ne[1];
     if (input->ne[0] != input_size || output->ne[0] != output_size || output->ne[1] != token_count ||
-        !is_llm_prefill_query_length(kActiveLlmMoeDispatchProfile, token_count) ||
+        !is_llm_supported_query_length(kActiveLlmMoeDispatchProfile, token_count) ||
         !is_supported_dense_input_size(input_size) || !is_supported_dense_output_size(output_size)) {
         return {};
     }
@@ -86,6 +89,8 @@ static LlmDenseMatmulMatch match_llm_dense_matmul(const Graph &       graph,
         match.kernel = kLlmDenseLinearQ4KF16WmmaKernel;
     } else if (route == LlmDenseMatmulRoute::Q6K && weight->type == GGML_TYPE_Q6_K) {
         match.kernel = kLlmDenseLinearQ6KF16WmmaKernel;
+    } else if (route == LlmDenseMatmulRoute::Q8_0 && weight->type == GGML_TYPE_Q8_0) {
+        match.kernel = kLlmDenseLinearQ8_0F16WmmaKernel;
     } else {
         return {};
     }
@@ -141,6 +146,16 @@ static bool match_llm_dense_q6k_dispatch(const DispatchMatchContext & context, D
     return true;
 }
 
+static bool match_llm_dense_q8_0_dispatch(const DispatchMatchContext & context, DispatchMatch & dispatch_match) {
+    const LlmDenseMatmulMatch match =
+        match_llm_dense_matmul(context.graph, context.root_node, LlmDenseMatmulRoute::Q8_0);
+    if (!match.matched()) {
+        return false;
+    }
+    build_llm_dense_matmul_dispatch(match, dispatch_match, context.root_index);
+    return true;
+}
+
 void register_llm_matmul_dispatches(DispatchRegistryBuilder & registry) {
     registry.add({
         "llm.matmul.dense_q4k_f16_wmma",
@@ -157,6 +172,14 @@ void register_llm_matmul_dispatches(DispatchRegistryBuilder & registry) {
         100,
         DispatchSource::Llm,
         match_llm_dense_q6k_dispatch,
+    });
+    registry.add({
+        "llm.matmul.dense_q8_0_f16_wmma",
+        GGML_OP_MUL_MAT,
+        DispatchMatchKind::SingleOp,
+        100,
+        DispatchSource::Llm,
+        match_llm_dense_q8_0_dispatch,
     });
 }
 

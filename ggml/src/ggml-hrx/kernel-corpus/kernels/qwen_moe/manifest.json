@@ -61,8 +61,8 @@
     },
     {
       "path": "qwen3_moe/dense_linear_quantized_f16_wmma.loom",
-      "sha256": "331fbf77a24fd22424d75e7d7716cc78af8f43899bfe15b2ee947aa9c68f0bd8",
-      "size": 68289
+      "sha256": "8a2623dd4dac57e1ba33a71bbdaf07af7807fd067651b7dc62019c83d10fe1b5",
+      "size": 74128
     },
     {
       "path": "qwen3_moe/expert_table_partition_fused.loom",
@@ -2146,6 +2146,132 @@
     {
       "name": "qwen3_moe_dense_linear_q6k_f16_wmma_parameterized",
       "symbol": "qwen3_moe_dense_linear_q6k_f16_wmma_parameterized",
+      "source": "qwen3_moe/dense_linear_quantized_f16_wmma.loom",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        },
+        {
+          "name": "output_accumulation",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        },
+        {
+          "name": "output_accumulation",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "dense_linear_quantized_f16_wmma_linked",
+        "primary_sources": [
+          "qwen3_moe/dense_linear_quantized_f16_wmma.loom"
+        ],
+        "library_sources": [
+          "ggml/linear_q6k_q8_1_x4.loom",
+          "qwen3_moe/attention_prepare_quantized.loom",
+          "qwen3_moe/model_config.loom",
+          "qwen3_moe/routed_linear_q4k_f16_wmma.loom",
+          "qwen3_moe/routed_gate_up_swiglu_q4k.loom",
+          "ggml/quantize_q8_1_x4.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "ggml/linear_q6k_q8_1_x4.loom",
+        "qwen3_moe/attention_prepare_quantized.loom",
+        "qwen3_moe/model_config.loom",
+        "qwen3_moe/routed_linear_q4k_f16_wmma.loom",
+        "qwen3_moe/routed_gate_up_swiglu_q4k.loom",
+        "ggml/quantize_q8_1_x4.loom"
+      ]
+    },
+    {
+      "name": "qwen3_moe_dense_linear_q8_0_f16_wmma",
+      "symbol": "qwen3_moe_dense_linear_q8_0_f16_wmma",
+      "source": "qwen3_moe/dense_linear_quantized_f16_wmma.loom",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "dense_linear_quantized_f16_wmma_linked",
+        "primary_sources": [
+          "qwen3_moe/dense_linear_quantized_f16_wmma.loom"
+        ],
+        "library_sources": [
+          "ggml/linear_q6k_q8_1_x4.loom",
+          "qwen3_moe/attention_prepare_quantized.loom",
+          "qwen3_moe/model_config.loom",
+          "qwen3_moe/routed_linear_q4k_f16_wmma.loom",
+          "qwen3_moe/routed_gate_up_swiglu_q4k.loom",
+          "ggml/quantize_q8_1_x4.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "ggml/linear_q6k_q8_1_x4.loom",
+        "qwen3_moe/attention_prepare_quantized.loom",
+        "qwen3_moe/model_config.loom",
+        "qwen3_moe/routed_linear_q4k_f16_wmma.loom",
+        "qwen3_moe/routed_gate_up_swiglu_q4k.loom",
+        "ggml/quantize_q8_1_x4.loom"
+      ]
+    },
+    {
+      "name": "qwen3_moe_dense_linear_q8_0_f16_wmma_parameterized",
+      "symbol": "qwen3_moe_dense_linear_q8_0_f16_wmma_parameterized",
       "source": "qwen3_moe/dense_linear_quantized_f16_wmma.loom",
       "workload_parameters": [
         {

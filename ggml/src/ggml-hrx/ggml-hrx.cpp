@@ -887,18 +887,28 @@ static bool hrx_weight_quant_supported(enum ggml_type type) {
 }
 
 // Dense MUL_MAT is narrower than hrx_weight_quant_supported() above: every registered MUL_MAT
-// matcher (dispatch-llm-matmul.cpp's llm.dense_linear_{q4k,q6k}_wmma, and dispatch-qwen-matmul.cpp's
-// qwen.* projection fusions) hard-requires a Q4_K or Q6_K weight and returns "no match" for any
-// other weight type. An *unquantized* (F32/F16/BF16) weight therefore has no dense-matmul kernel at
-// all, so claiming it here would pin the node onto HRX with no dispatch able to run it -- which
-// DispatchScheduler reports as a hard "unsupported HRX node ...: MUL_MAT" failure that fails the
-// entire split, rather than degrading to CPU for just that node.
+// matcher (dispatch-llm-matmul.cpp's llm.matmul.dense_{q4k,q6k,q8_0}_f16_wmma, and
+// dispatch-qwen-matmul.cpp's qwen.* projection fusions) hard-requires a Q4_K, Q6_K or Q8_0 weight and
+// returns "no match" for any other weight type. An *unquantized* (F32/F16/BF16) weight therefore has
+// no dense-matmul kernel at all, so claiming it here would pin the node onto HRX with no dispatch
+// able to run it -- which DispatchScheduler reports as a hard "unsupported HRX node ...: MUL_MAT"
+// failure that fails the entire split, rather than degrading to CPU for just that node.
 //
 // qwen4exp hits exactly this with its two small per-head GDN projections, ssm_beta and ssm_alpha
 // ([n_embd, num_v_heads] == [2560,48], see build_layer_attn_linear() in src/models/qwen4exp.cpp),
 // which stay F32 even in the Q4_K_XL quantization because they are far too small to be worth
 // quantizing. Declining them leaves them on the CPU where they cost ~123K MACs each -- negligible
 // next to the layer's quantized projections.
+//
+// Q8_0 is included because Unsloth's UD ("dynamic") quantizations keep most dense projection weights
+// at Q8_0 rather than Q4_K -- for the qwen4exp UD-Q4_K_XL GGUF that is 503 of 1224 tensors, and
+// without a Q8_0 dense route the loader pushes 1123 tensors to CPU and ~77% of the per-token graph
+// runs there. @qwen3_moe_dense_linear_q8_0_f16_wmma covers it.
+//
+// Q8_0 is deliberately NOT folded into hrx_weight_quant_supported() because that helper is
+// op-agnostic and also gates GET_ROWS (token_embd.weight is Q8_0 and there is no Q8_0 embed kernel)
+// and MUL_MAT_ID. Instead this narrower helper is OR'd into the GGML_OP_NONE placement probe so a
+// Q8_0 weight may live in an HRX buffer, exactly as hrx_moe_down_weight_supported() already is.
 //
 // Note this deliberately does NOT narrow the GGML_OP_NONE placement probe or GET_ROWS, which must
 // keep accepting F32/F16/BF16: unquantized tensors like norm weights are consumed on HRX by
@@ -907,10 +917,41 @@ static bool hrx_dense_matmul_weight_supported(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
             return true;
         default:
             return false;
     }
+}
+
+// device_supports_op() must not claim a Q8_0 MUL_MAT that match_llm_dense_matmul()
+// (dispatch-llm-matmul.cpp) would decline: an op HRX claims but that no matcher roots at strands the
+// whole split with a hard "unsupported HRX node" abort instead of degrading to the CPU for that node.
+// Unlike Q4_K/Q6_K -- which additionally have the fused qwen.* projection matchers in
+// dispatch-qwen-matmul.cpp as a second chance -- Q8_0 is served only by
+// "llm.matmul.dense_q8_0_f16_wmma", so these guards mirror that matcher's exactly: 2D contiguous
+// weight/activation/result, f32 activation and result, a 256-aligned contraction width, and a token
+// count inside the kernel's token_capacity bound.
+static constexpr int64_t kHrxDenseMatmulMaxTokenCount = 2048;
+
+static bool hrx_dense_matmul_q8_0_shape_supported(const ggml_tensor * op) {
+    const ggml_tensor * weight = op->src[0];
+    const ggml_tensor * input  = op->src[1];
+    if (weight == nullptr || input == nullptr) {
+        return false;
+    }
+    const auto is_2d = [](const ggml_tensor * tensor) { return tensor->ne[2] == 1 && tensor->ne[3] == 1; };
+    if (!is_2d(weight) || !is_2d(input) || !is_2d(op) || !ggml_is_contiguous(weight) ||
+        !ggml_is_contiguous(input) || !ggml_is_contiguous(op) || input->type != GGML_TYPE_F32 ||
+        op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t input_size  = weight->ne[0];
+    const int64_t output_size = weight->ne[1];
+    const int64_t token_count = input->ne[1];
+    return input->ne[0] == input_size && op->ne[0] == output_size && op->ne[1] == token_count &&
+           input_size >= 256 && input_size <= 32768 && input_size % 256 == 0 && output_size >= 1 &&
+           output_size <= 262144 && token_count >= 1 && token_count <= kHrxDenseMatmulMaxTokenCount;
 }
 
 // qwen4exp (Q4_K_XL / Q3_K_XL GGUF quantizations) stores its MoE down-projection expert weights
@@ -921,10 +962,12 @@ static bool hrx_dense_matmul_weight_supported(enum ggml_type type) {
 // (op == MUL_MAT_ID, quant, contraction-width) triple.
 //
 // Crucially, Q8_0 is ALSO the quantization used for this model family's attention/lm_head projection
-// weights, which are plain (dense) GGML_OP_MUL_MAT nodes, not GGML_OP_MUL_MAT_ID, and have NO HRX
-// kernel. That is why this check must stay separate from hrx_weight_quant_supported() (which is
-// op-agnostic): folding Q5_1/Q8_0/IQ4_NL into hrx_weight_quant_supported() would make HRX also claim
-// attention's dense Q8_0 MUL_MAT and crash at runtime with no kernel able to run it. Instead this is
+// weights, which are plain (dense) GGML_OP_MUL_MAT nodes, not GGML_OP_MUL_MAT_ID. Those are now
+// covered by hrx_dense_matmul_weight_supported() above (@qwen3_moe_dense_linear_q8_0_f16_wmma), but
+// this check must still stay separate from hrx_weight_quant_supported() (which is op-agnostic):
+// folding Q5_1/Q8_0/IQ4_NL into hrx_weight_quant_supported() would make HRX also claim Q8_0
+// GET_ROWS (token_embd.weight) and unmatched MUL_MAT_ID nodes, and crash with no kernel able to run
+// them. Instead this is
 // consulted only from the GGML_OP_MUL_MAT_ID arm of device_supports_op(), and only for weights whose
 // shape matches the down-projection contraction width.
 static bool hrx_moe_down_quant_supported(enum ggml_type type) {
@@ -1436,15 +1479,26 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // disagreed with that choice, ggml-backend's scheduler would abort with "pre-allocated tensor
         // ... that cannot run the operation (NONE)" for a weight already placed on HRX0.
         case GGML_OP_NONE:
-            return hrx_weight_quant_supported(op->type) || hrx_moe_down_weight_supported(op);
+            return hrx_weight_quant_supported(op->type) || hrx_dense_matmul_weight_supported(op->type) ||
+                   hrx_moe_down_weight_supported(op);
         // Weight-consuming ops: the first source is the weight. Decline unsupported weight quantizations.
         case GGML_OP_GET_ROWS:
             return op->src[0] == nullptr ||
                    (!hrx_dispatch_group_disabled("embed") && hrx_weight_quant_supported(op->src[0]->type) &&
                     !hrx_non_leaf_gather_qwen4exp(op));
         case GGML_OP_MUL_MAT:
-            return op->src[0] == nullptr ||
-                   (!hrx_dispatch_group_disabled("matmul") && hrx_dense_matmul_weight_supported(op->src[0]->type));
+            if (op->src[0] == nullptr) {
+                return true;
+            }
+            if (hrx_dispatch_group_disabled("matmul")) {
+                return false;
+            }
+            // Q8_0 has exactly one dense matcher, so its shape guards must be replicated here to
+            // avoid stranding shapes that matcher declines. See hrx_dense_matmul_q8_0_shape_supported().
+            if (op->src[0]->type == GGML_TYPE_Q8_0) {
+                return hrx_dense_matmul_q8_0_shape_supported(op);
+            }
+            return hrx_dense_matmul_weight_supported(op->src[0]->type);
         case GGML_OP_MUL_MAT_ID:
             if (op->src[0] == nullptr) {
                 return true;
