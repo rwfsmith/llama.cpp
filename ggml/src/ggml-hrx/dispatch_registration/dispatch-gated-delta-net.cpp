@@ -62,7 +62,7 @@ static std::string to_config_value(int64_t value) {
 // ---------------------------------------------------------------------------------------------
 // qwen4exp.gdn_conv_prepare_decode
 //
-// Matches: SSM_CONV -> UNARY(SILU) -> { VIEW(q), VIEW(k), VIEW(v) } -> { L2_NORM(q), L2_NORM(k) }
+// Matches: SSM_CONV -> UNARY(SILU)
 //
 // This is qwen4exp.cpp's build_layer_attn_linear()'s conv+silu+per-head L2-norm prelude, fed by
 // build_conv_state_at()'s CONCAT. The root is SSM_CONV, *not* CONCAT, even though CONCAT is
@@ -92,28 +92,27 @@ static std::string to_config_value(int64_t value) {
 // consumed as one already-assembled external value, there is nothing left to trace -- TRANSPOSE
 // auto-elides on its own turn same as any other alias op, entirely outside this match.
 //
-// The kernel never materializes L2_NORM(q)/L2_NORM(k)'s literal "normalized q/k" output: normalization
-// is deferred and folded into a small `qk_inverse_norm` reciprocal-scale buffer applied at point of use
-// inside qwen38_gdn_recurrent_decode. So L2_NORM(q)/L2_NORM(k) must be swept into *this* match (they
-// never get a written value of their own) and `qkv_silu` is bound to the shared, un-sliced SILU output
-// -- the kernel does its own q/k/v slicing internally via fixed channel-offset constants.
+// This match covers exactly two nodes -- SSM_CONV and its SILU -- and writes exactly one value, the
+// shared `qkv_silu` output. The q/k/v VIEWs and the per-head L2_NORM(q)/L2_NORM(k) are NOT part of it.
+// They used to be: the kernel folds q/k normalization into a small `qk_inverse_norm` reciprocal-scale
+// transient applied at point of use inside qwen38_gdn_recurrent_decode, so the literal L2_NORM outputs
+// were never materialized and the nodes were swept in here to hide that. That is only sound while
+// qwen38_gdn_recurrent_decode runs in the SAME split, and GGML_SCHED_DEBUG=2 shows it never does --
+// ggml always orders the CPU-resident beta/gate chain between the two, forcing a split boundary. The
+// swept-in L2_NORMs therefore left q_conv_predelta/k_conv_predelta unwritten for their real consumer,
+// which is precisely the "conv-prepare computes garbage" symptom. Leaving them out makes this dispatch
+// self-contained and correct. The kernel still writes its `qk_inverse_norm` binding; nothing reads it
+// while the recurrent step is CPU-side (see hrx_gdn_group_disabled("gdncore") in ggml-hrx.cpp).
 struct ConvPrepareMatch {
     const GraphNode * ssm_conv_node = nullptr;
     const GraphNode * silu_node     = nullptr;
-    const GraphNode * view_q_node   = nullptr;
-    const GraphNode * view_k_node   = nullptr;
-    const GraphNode * view_v_node   = nullptr;
-    const GraphNode * l2norm_q_node = nullptr;
-    const GraphNode * l2norm_k_node = nullptr;
     const Value *      conv_input   = nullptr;  // CONCAT's own output (external to this split), [4,10240,1,1]
     const Value *      conv_weight  = nullptr;  // ssm_conv1d weight, [4,10240,1,1]
     const Value *      qkv_silu     = nullptr;  // shared SILU output, [10240,1,1,1]
 
     bool matched() const {
-        return ssm_conv_node != nullptr && silu_node != nullptr && view_q_node != nullptr &&
-               view_k_node != nullptr && view_v_node != nullptr && l2norm_q_node != nullptr &&
-               l2norm_k_node != nullptr && conv_input != nullptr && conv_weight != nullptr &&
-               qkv_silu != nullptr;
+        return ssm_conv_node != nullptr && silu_node != nullptr && conv_input != nullptr &&
+               conv_weight != nullptr && qkv_silu != nullptr;
     }
 };
 
@@ -152,72 +151,16 @@ static ConvPrepareMatch match_qwen4exp_gdn_conv_prepare(const Graph & graph, con
         return {};
     }
 
-    // SILU's output feeds q/k/v as three VIEW slices; q and k are further L2-normalized (per-head,
-    // head_k_dim=128 over num_k_heads=16), v is not (it stays raw post-SiLU, per the kernel's own
-    // internal slicing). Identify the pattern structurally (shape + which views feed an L2_NORM)
-    // rather than by hardcoding byte offsets, since the kernel's own binding is to the whole,
-    // unsliced qkv_silu value regardless of exactly how ggml chose to lay the three views out.
-    const std::vector<const GraphNode *> views =
-        layout_alias_consumers_with_op(graph, silu_node->output, GGML_OP_VIEW);
-    if (views.size() != 3) {
-        return {};
-    }
-    const std::vector<const GraphNode *> l2norms =
-        consumers_with_op_through_layout_aliases(graph, silu_node->output, GGML_OP_L2_NORM);
-    if (l2norms.size() != 2) {
-        return {};
-    }
-
-    const GraphNode * l2norm_q = l2norms[0];
-    const GraphNode * l2norm_k = l2norms[1];
-    const GraphNode * view_q   = nullptr;
-    const GraphNode * view_k   = nullptr;
-    const GraphNode * view_v   = nullptr;
-    for (const GraphNode * l2norm : { l2norm_q, l2norm_k }) {
-        if (l2norm->op != GGML_OP_L2_NORM || l2norm->inputs.size() != 1) {
-            return {};
-        }
-        const L2NormParams * params = op_params_as<L2NormParams>(l2norm->params);
-        if (params == nullptr || !is_qwen4exp_rms_norm_epsilon(params->eps)) {
-            return {};
-        }
-        const Value * l2norm_output = graph_value(graph, l2norm->output);
-        if (l2norm_output == nullptr || !is_shape(*l2norm_output, kGdnHeadDim, kGdnKeyHeadCount, 1, 1)) {
-            return {};
-        }
-        const GraphNode * source_view = graph.index().producer(l2norm->inputs[0]);
-        if (source_view == nullptr || source_view->op != GGML_OP_VIEW) {
-            return {};
-        }
-        if (l2norm == l2norm_q) {
-            view_q = source_view;
-        } else {
-            view_k = source_view;
-        }
-    }
-    for (const GraphNode * view : views) {
-        if (view != view_q && view != view_k) {
-            if (view_v != nullptr) {
-                return {};  // more than one leftover view -- not the expected 2-normalized + 1-raw pattern
-            }
-            view_v = view;
-        }
-    }
-    if (view_q == nullptr || view_k == nullptr || view_v == nullptr) {
-        return {};
-    }
-    const Value * view_v_output = graph_value(graph, view_v->output);
-    if (view_v_output == nullptr || !is_shape(*view_v_output, kGdnHeadDim, kGdnValueHeadCount, 1, 1)) {
-        return {};
-    }
+    // The q/k/v VIEW slices and the two L2_NORMs that this matcher used to identify are deliberately
+    // no longer part of the match. They are not covered (see the dispatch function below for why),
+    // and now that device_supports_op() declines GGML_OP_L2_NORM they are not even present in this
+    // split's Graph -- so requiring them here would make the match fail outright, leaving SSM_CONV
+    // itself unclaimed and stranding the split. The shape checks above are specific enough on their
+    // own: a [4,10240] conv window against a [4,10240] kernel feeding a [10240] SILU is qwen4exp's
+    // decode-time GDN prelude and nothing else.
 
     match.ssm_conv_node = node;
     match.silu_node     = silu_node;
-    match.view_q_node   = view_q;
-    match.view_k_node   = view_k;
-    match.view_v_node   = view_v;
-    match.l2norm_q_node = l2norm_q;
-    match.l2norm_k_node = l2norm_k;
     match.conv_input    = conv_input;
     match.conv_weight   = conv_weight;
     match.qkv_silu      = qkv_silu;
@@ -360,13 +303,24 @@ static bool match_qwen4exp_gdn_conv_prepare_decode_dispatch(const DispatchMatchC
         return false;
     }
 
+    // Cover ONLY the two nodes this kernel actually writes: SSM_CONV (whose conv_output_raw is a
+    // pure intermediate, use=1, consumed solely by the SILU below) and the SILU itself, whose
+    // output IS the `qkv_silu` binding above.
+    //
+    // The q/k/v VIEWs and the two L2_NORMs are deliberately NOT covered any more, even though
+    // match_qwen4exp_gdn_conv_prepare() still identifies them as a structural guard. Covering them
+    // was only sound while qwen4exp.gdn_recurrent_decode ran in the SAME split, because this kernel
+    // never materializes the L2_NORM outputs -- it folds normalization into the split-local
+    // `qk_inverse_norm` transient instead. GGML_SCHED_DEBUG=2 shows that precondition can never hold
+    // for this model: ggml topologically orders the CPU-resident beta/gate chain (MUL_MAT(ssm_alpha)
+    // -> ADD(ssm_dt) -> SOFTPLUS -> MUL(ssm_a) -> MUL_MAT(ssm_beta) -> SIGMOID) between the conv
+    // prelude and GATED_DELTA_NET, forcing a split boundary between them. Claiming the L2_NORMs
+    // therefore left q_conv_predelta/k_conv_predelta permanently unwritten for their real (CPU)
+    // consumer -- the actual cause of the long-standing "conv-prepare computes garbage" note.
+    // Leaving them uncovered lets L2_NORM run normally and keeps this dispatch numerically correct
+    // on its own; see hrx_gdn_group_disabled() in ggml-hrx.cpp for the matching capability change.
     if (!append_covered_node(context, conv_match.ssm_conv_node, match) ||
-        !append_covered_node(context, conv_match.silu_node, match) ||
-        !append_covered_node(context, conv_match.view_q_node, match) ||
-        !append_covered_node(context, conv_match.view_k_node, match) ||
-        !append_covered_node(context, conv_match.view_v_node, match) ||
-        !append_covered_node(context, conv_match.l2norm_q_node, match) ||
-        !append_covered_node(context, conv_match.l2norm_k_node, match)) {
+        !append_covered_node(context, conv_match.silu_node, match)) {
         return false;
     }
 

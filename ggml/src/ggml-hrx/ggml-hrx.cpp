@@ -652,7 +652,20 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     const ggml::hrx::GraphExecutor        executor = ggml::hrx::GraphExecutor(*context);
     const ggml::hrx::GraphExecutionResult result   = executor.execute(*graph);
     if (!result.success()) {
-        GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(result.status));
+        // HRX_SURVEY_UNSUPPORTED exists so that one run enumerates every node missing a dispatch, but the
+        // scheduler can only report that list through the status it returns here. Printing just the first
+        // message would throw the survey away and put us back to one run per missing kernel.
+        static const bool survey = [] {
+            const char * value = std::getenv("HRX_SURVEY_UNSUPPORTED");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (survey) {
+            for (const std::string & error : result.status.errors()) {
+                GGML_LOG_ERROR("%s: %s\n", __func__, error.c_str());
+            }
+        } else {
+            GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(result.status));
+        }
     }
     // Dispatches are recorded on the backend stream, but the buffer interface moves tensor data on the
     // device's separate buffer_stream (see buffer_submit_and_wait). Nothing orders those two streams, so
@@ -773,18 +786,40 @@ static bool hrx_dispatch_group_disabled(const char * group) {
     return false;
 }
 
-// qwen4exp.gdn_conv_prepare_decode is numerically wrong, and measurably so: generating with it
-// enabled emits garbage ("[Start thinking] V边容量2..."), while declining just this one prelude --
-// leaving the recurrent GATED_DELTA_NET step, flash-attention, the dense matmuls and the embedding
-// gather on HRX -- reproduces the CPU reference token for token. The fault is inside the fused
-// conv+SiLU+L2-norm kernel or its bindings, not in the surrounding graph; it has never had a
-// numerical check-case (the corpus is linked with --strip-check), and it only started executing at
-// all once the matcher was re-rooted from CONCAT to SSM_CONV, so it has no history of being right.
-// Default to the CPU fallback until it is fixed; set HRX_ENABLE_GDN_CONV_PREPARE=1 to force it back
-// on for debugging.
+// qwen4exp.gdn_conv_prepare_decode used to be numerically wrong, and measurably so: generating with
+// it enabled emitted garbage ("[Start thinking] V边容量2..."), while declining just this one prelude
+// reproduced the CPU reference token for token. The root cause is now understood and fixed on the
+// dispatch side: the matcher covered the q/k/v VIEWs and both L2_NORMs while the kernel only ever
+// wrote `qkv_silu` plus a split-local `qk_inverse_norm` transient, so q_conv_predelta and
+// k_conv_predelta were left permanently unwritten. That is only sound if
+// qwen4exp.gdn_recurrent_decode consumes the transient in the SAME split, and GGML_SCHED_DEBUG=2
+// proves it never can here: ggml orders the CPU beta/gate chain (MUL_MAT(ssm_alpha) -> ADD(ssm_dt)
+// -> SOFTPLUS -> MUL(ssm_a) -> MUL_MAT(ssm_beta) -> SIGMOID) between the two, forcing a split
+// boundary. The dispatch now covers only SSM_CONV and its SILU -- the two nodes it actually writes --
+// so the prelude is self-contained and correct, with L2_NORM left to run normally.
+// Still gated behind HRX_ENABLE_GDN_CONV_PREPARE=1 until the corrected form is verified end to end.
 static bool hrx_gdn_conv_prepare_enabled() {
     const char * enabled = std::getenv("HRX_ENABLE_GDN_CONV_PREPARE");
     return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+// Mirrors dispatch-copy.cpp: HRX has kernels for the same-length contiguous f32 copy and for the 2D
+// row-strided f32 copy (rows element-contiguous). Keeping the two in sync matters more than usual here,
+// because a CPY on a pre-allocated cache tensor that this declines aborts ggml_backend_sched outright.
+static bool hrx_copy_f32_supported(const ggml_tensor * op) {
+    const ggml_tensor * source = op == nullptr ? nullptr : op->src[0];
+    if (source == nullptr || op->type != GGML_TYPE_F32 || source->type != GGML_TYPE_F32 ||
+        ggml_nelements(op) != ggml_nelements(source) || ggml_nelements(op) <= 0) {
+        return false;
+    }
+    if (ggml_is_contiguous(op) && ggml_is_contiguous(source)) {
+        return true;
+    }
+    const auto rows_copyable = [](const ggml_tensor * t) {
+        return t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0 &&
+               static_cast<int64_t>(t->nb[1] / sizeof(float)) >= t->ne[0];
+    };
+    return rows_copyable(op) && rows_copyable(source) && op->ne[0] == source->ne[0] && op->ne[1] == source->ne[1];
 }
 
 static bool eager_capability_declared(enum ggml_op op) {
@@ -797,7 +832,14 @@ static bool eager_capability_declared(enum ggml_op op) {
         case GGML_OP_ADD:
         case GGML_OP_ARGSORT:
         case GGML_OP_CLAMP:
-        case GGML_OP_CONCAT:
+        // GGML_OP_CONCAT is deliberately NOT declared. HRX has no CONCAT kernel and no dispatch
+        // matcher roots at one: qwen4exp.gdn_conv_prepare_decode roots at SSM_CONV and binds the
+        // CONCAT's output as an already-materialized external value (see the header comment on
+        // ConvPrepareMatch in dispatch_registration/dispatch-gated-delta-net.cpp). Declaring CONCAT
+        // would let the scheduler place a node on HRX that nothing can execute, stranding the split
+        // it lands in with "unsupported HRX node ... CONCAT".
+        case GGML_OP_CONT:
+        case GGML_OP_CPY:
         case GGML_OP_DIV:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_GATED_DELTA_NET:
@@ -811,6 +853,7 @@ static bool eager_capability_declared(enum ggml_op op) {
         case GGML_OP_RESHAPE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_ROPE:
+        case GGML_OP_SCALE:
         case GGML_OP_SET_ROWS:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_SSM_CONV:
@@ -977,42 +1020,28 @@ static constexpr int64_t kHrxGdnConvChannelsQwen4Exp =
     kHrxGdnHeadDimQwen4Exp * kHrxGdnKeyHeadCountQwen4Exp * 2 + kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp;
 static constexpr int64_t kHrxGdnConvKernelSizeQwen4Exp = 4;  // hparams.ssm_d_conv
 
-// GGML_OP_GATED_DELTA_NET, GGML_OP_SSM_CONV, GGML_OP_L2_NORM, GGML_OP_CONCAT, and GGML_OP_UNARY are
-// all real compute ops used by many models beyond qwen4exp -- e.g. every other delta-net-family model
-// built on delta-net-base.cpp (qwen3next, kimi-linear, ...) also emits GATED_DELTA_NET/L2_NORM/
-// SSM_CONV with their own, different head-dim/head-count profiles; GGML_OP_CONCAT is used pervasively
-// across nearly every model in src/models/ for unrelated purposes; and GGML_OP_UNARY is how virtually
-// every model's SiLU/sigmoid activations are represented (there is no separate GGML_OP_SILU/
-// GGML_OP_SIGMOID -- both are GGML_OP_UNARY with a different ggml_unary_op sub-code). Unlike
-// VIEW/RESHAPE/PERMUTE/TRANSPOSE (pure layout-alias ops with zero real-compute risk, handled by the
-// `default: return true;` fallthrough below), declaring these five in eager_capability_declared()
-// without narrowing them here would make HRX unconditionally claim every model's use of these ops
-// regardless of shape -- the same "wall #3" over-claim risk documented above
-// hrx_moe_down_quant_supported(). So each is checked below against qwen4exp's exact decode profile and
-// declined for anything else.
-static bool hrx_gdn_conv_concat_decode_supported(const ggml_tensor * op) {
-    // qwen4exp.cpp's build_conv_state_at(): CONCAT(conv_history[3,conv_channels,1,1],
-    // transpose(qkv_mixed)[1,conv_channels,1,1], dim=0) -> [4,conv_channels,1,1].
-    //
-    // In practice, ggml's own cross-backend scheduler always assigns qwen4exp's real GDN CONCAT to
-    // CPU regardless of what this function returns (its source chain roots through build_rs()'s
-    // ggml_get_rows gather of the persistent recurrent conv-state buffer, and ggml prefers to run an
-    // op on the same backend as its inputs) -- see qwen4exp.gdn_conv_prepare_decode's dispatch-side
-    // comment in dispatch-gated-delta-net.cpp for the full trace. This function is therefore dead in
-    // that specific case, but is kept (and still checked precisely) as a defensive gate should ggml's
-    // scheduler ever route a CONCAT of this shape through the normal per-op classification path.
-    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr) {
-        return false;
-    }
-    const ggml_tensor * conv_history = op->src[0];
-    const ggml_tensor * new_column   = op->src[1];
-    return conv_history->ne[0] == kHrxGdnConvKernelSizeQwen4Exp - 1 &&
-           conv_history->ne[1] == kHrxGdnConvChannelsQwen4Exp && conv_history->ne[2] == 1 &&
-           conv_history->ne[3] == 1 && new_column->ne[0] == 1 && new_column->ne[1] == kHrxGdnConvChannelsQwen4Exp &&
-           new_column->ne[2] == 1 && new_column->ne[3] == 1 && op->ne[0] == kHrxGdnConvKernelSizeQwen4Exp &&
-           op->ne[1] == kHrxGdnConvChannelsQwen4Exp && op->ne[2] == 1 && op->ne[3] == 1;
-}
-
+// GGML_OP_GATED_DELTA_NET, GGML_OP_SSM_CONV, GGML_OP_L2_NORM, and GGML_OP_UNARY are all real compute
+// ops used by many models beyond qwen4exp -- e.g. every other delta-net-family model built on
+// delta-net-base.cpp (qwen3next, kimi-linear, ...) also emits GATED_DELTA_NET/L2_NORM/SSM_CONV with
+// their own, different head-dim/head-count profiles; and GGML_OP_UNARY is how virtually every model's
+// SiLU/sigmoid activations are represented (there is no separate GGML_OP_SILU/GGML_OP_SIGMOID -- both
+// are GGML_OP_UNARY with a different ggml_unary_op sub-code). Unlike VIEW/RESHAPE/PERMUTE/TRANSPOSE
+// (pure layout-alias ops with zero real-compute risk, handled by the `default: return true;`
+// fallthrough below), declaring these four in eager_capability_declared() without narrowing them here
+// would make HRX unconditionally claim every model's use of these ops regardless of shape -- the same
+// "wall #3" over-claim risk documented above hrx_moe_down_quant_supported(). So each is checked below
+// against qwen4exp's exact decode profile and declined for anything else.
+//
+// GGML_OP_CONCAT used to be narrowed here too, by a hrx_gdn_conv_concat_decode_supported() that
+// matched build_conv_state_at()'s CONCAT(conv_history[3,C,1,1], transpose(qkv_mixed)[1,C,1,1]) ->
+// [4,C,1,1] and returned true for it. That was always unsafe and is now removed along with the
+// GGML_OP_CONCAT entry in eager_capability_declared(): no HRX kernel or dispatch matcher covers a
+// CONCAT node, so *claiming* one can only ever strand a split. It went unnoticed because ggml's
+// cross-backend scheduler happened to assign this CONCAT to CPU anyway (it prefers to run an op on
+// the same backend as its inputs, and the CONCAT's sources root through build_rs()'s ggml_get_rows
+// gather of the recurrent conv-state buffer, which was CPU-resident). Once the recurrent-state
+// SCALE/CPY/CONT ops became HRX-supported that input locality flipped, ggml routed the CONCAT to HRX,
+// and the claim turned into a hard "unsupported HRX node 0: CONCAT" failure.
 static bool hrx_gdn_ssm_conv_decode_supported(const ggml_tensor * op) {
     if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr) {
         return false;
@@ -1022,13 +1051,6 @@ static bool hrx_gdn_ssm_conv_decode_supported(const ggml_tensor * op) {
     return sx->ne[0] == kHrxGdnConvKernelSizeQwen4Exp && sx->ne[1] == kHrxGdnConvChannelsQwen4Exp && sx->ne[2] == 1 &&
            c->ne[0] == kHrxGdnConvKernelSizeQwen4Exp && c->ne[1] == kHrxGdnConvChannelsQwen4Exp &&
            op->ne[0] == kHrxGdnConvChannelsQwen4Exp && op->ne[1] == 1 && op->ne[2] == 1;
-}
-
-static bool hrx_gdn_l2_norm_decode_supported(const ggml_tensor * op) {
-    // Only q/k get L2-normalized in qwen4exp's GDN prelude (per-head, head_k_dim=128 over
-    // num_k_heads=16); v is not. n_seq_tokens (ne[2]) == 1 additionally scopes this to decode.
-    return op != nullptr && op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnKeyHeadCountQwen4Exp &&
-           op->ne[2] == 1 && op->ne[3] == 1;
 }
 
 static bool hrx_gdn_gated_delta_net_decode_supported(const ggml_tensor * op) {
@@ -1145,7 +1167,19 @@ static bool hrx_qsa_indexer_row_qwen4exp(const ggml_tensor * op) {
 // step). "gdn" remains an umbrella that disables both, so existing invocations keep working.
 static bool hrx_gdn_group_disabled(const char * half) {
     if (std::strcmp(half, "gdnconv") == 0 && !hrx_gdn_conv_prepare_enabled()) {
-        return true;  // see hrx_gdn_conv_prepare_enabled(): declined by default, it computes garbage
+        return true;  // see hrx_gdn_conv_prepare_enabled()
+    }
+    // "gdncore" (qwen4exp.gdn_recurrent_decode) is unconditionally disabled. Its matcher binds the
+    // shared `qkv_silu` value plus the `qk_inverse_norm` transient published by
+    // qwen4exp.gdn_conv_prepare_decode, and additionally requires that dispatch's L2_NORM/VIEW nodes
+    // to be covered in the *same* split. Now that conv-prepare correctly covers only SSM_CONV+SILU
+    // (and no longer hides unwritten L2_NORM outputs), that precondition can never be satisfied --
+    // and GGML_SCHED_DEBUG=2 shows ggml always separates the two with the CPU beta/gate chain
+    // anyway. Claiming GATED_DELTA_NET while the matcher cannot fire would strand its split, so the
+    // recurrent step stays on the CPU reference implementation until the kernel is decoupled from
+    // the fused conv prelude (needs a variant taking pre-normalized q/k/v as separate buffers).
+    if (std::strcmp(half, "gdncore") == 0) {
+        return true;
     }
     return hrx_dispatch_group_disabled("gdn") || hrx_dispatch_group_disabled(half);
 }
@@ -1318,11 +1352,14 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         return false;
     }
     // Zero-token graphs are real: llama.cpp builds worst-case reserve graphs and, for qwen4exp, an MTP
-    // draft layer whose ubatch can carry no tokens, which reaches here as e.g. f32[2560,4,0,1]. Every
-    // dispatch matcher requires a positive token count, so an empty node would be claimed and then
-    // strand its split. Nothing is lost by declining: an empty op is a no-op wherever it runs.
+    // draft layer whose ubatch can carry no tokens, which reaches here as e.g. f32[2560,4,0,1]. The
+    // recurrent-state clear in build_rs() is likewise a zero-sized view whenever no sequence slot needs
+    // resetting. These must be claimed rather than declined: ggml_backend_sched aborts outright when a
+    // pre-allocated tensor -- the recurrent state cache is one -- lands in a buffer whose backend
+    // refuses its op, so declining is not a fallback but a crash. The dispatch scheduler elides empty
+    // nodes instead of matching them, so claiming one costs nothing and strands no split.
     if (ggml_is_empty(op)) {
-        return false;
+        return true;
     }
     // The "misc" bisect group covers every op HRX claims by default rather than through one of the
     // named subsystem groups below -- the elementwise, normalisation, layout and residual ops.
@@ -1336,7 +1373,6 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_GET_ROWS:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_CONCAT:
         case GGML_OP_SSM_CONV:
         case GGML_OP_L2_NORM:
         case GGML_OP_GATED_DELTA_NET:
@@ -1438,25 +1474,47 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             // over-claim in the `default: return true;` case below (RMS_NORM/ADD/ROPE/etc.), just
             // narrower in scope since it is gated to one specific weight quant+shape combination.
             return hrx_moe_down_weight_supported(op->src[0]);
-        // qwen4exp GDN (Gated DeltaNet): all five of these are real compute ops with the over-claim
-        // risk described in the comment above hrx_gdn_conv_concat_decode_supported(), so each is
+        // qwen4exp GDN (Gated DeltaNet): all four of these are real compute ops with the over-claim
+        // risk described in the comment above hrx_gdn_ssm_conv_decode_supported(), so each is
         // scoped to the exact qwen4exp decode-time shape profile and declined otherwise (falls back to
         // CPU, which still implements the general-shape/prefill case correctly).
-        // "gdnconv" (the CONCAT/SSM_CONV/SILU/L2_NORM conv-prepare prelude) and "gdncore" (the
+        // "gdnconv" (the SSM_CONV/SILU conv-prepare prelude) and "gdncore" (the
         // recurrent GATED_DELTA_NET step itself) are separately disableable so a numerical bisection
         // can tell the two halves of the GDN pipeline apart; "gdn" disables both.
-        case GGML_OP_CONCAT:
-            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_conv_concat_decode_supported(op);
+        // The prelude's feeding CONCAT stays on CPU by design -- see eager_capability_declared().
         case GGML_OP_SSM_CONV:
             return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_ssm_conv_decode_supported(op);
+        // L2_NORM is never a registered dispatch root: it only ever executed as part of the fused
+        // qwen4exp.gdn_conv_prepare_decode match, which deliberately no longer covers it (covering it
+        // left q_conv_predelta/k_conv_predelta unwritten -- see that matcher's comment). With no
+        // matcher able to claim an L2_NORM node, claiming one here would strand its split, so the
+        // per-head q/k normalization runs on the CPU. These are [128,16] tensors; the cost is noise.
         case GGML_OP_L2_NORM:
-            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_l2_norm_decode_supported(op);
+            return false;
         case GGML_OP_GATED_DELTA_NET:
             return !hrx_gdn_group_disabled("gdncore") && hrx_gdn_gated_delta_net_decode_supported(op);
         case GGML_OP_UNARY:
             return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_unary_decode_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
             return !hrx_dispatch_group_disabled("attn");
+        // llama.cpp clears a recurrent state slot with ggml_scale_inplace(s, 0) and carries surviving
+        // slots forward with ggml_cpy(), both writing straight into the pre-allocated recurrent state
+        // cache. ggml_backend_sched aborts instead of falling back when a pre-allocated tensor sits in a
+        // buffer whose backend declines its op, so these two arms are what allow the GDN state to stay
+        // resident on HRX at all. Each is scoped to the forms that actually have a kernel: the zero-fill
+        // scale (common.zero_f32), the same-length contiguous f32 copy (common.copy_f32), and the 2D
+        // row-strided f32 copy (common.copy_rows_f32) that the GDN conv-state writeback needs. Any other
+        // scale factor, or a type-converting or permuted copy, is declined and runs on the CPU.
+        case GGML_OP_SCALE:
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                   ggml_get_op_params_f32(op, 0) == 0.0f && ggml_get_op_params_f32(op, 1) == 0.0f;
+        case GGML_OP_CPY:
+        // GGML_OP_CONT is the same copy with an implicit contiguous destination. qwen4exp's GDN
+        // conv-state writeback is ggml_cpy(ggml_cont(tail), dst), and that CONT sits between the CONCAT
+        // and the SSM_CONV, so leaving it on the CPU splits the conv-prepare chain across backends and
+        // strands the CONCAT in a split of its own where no matcher can root at it.
+        case GGML_OP_CONT:
+            return hrx_copy_f32_supported(op);
         // See hrx_gdn_per_head_scalar_decode_op(): qwen4exp's GDN alpha/gate prelude emits a 48-element
         // ADD and MUL that no matcher roots at. Everything else keeps the permissive default.
         case GGML_OP_ADD:
@@ -1470,8 +1528,12 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_RMS_NORM:
             return !hrx_gdn_norm_gate_row(op) && !hrx_attention_head_major_qwen4exp(op) &&
                    !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op);
+        // VIEW is deliberately absent from these shape guards. It is a pure layout alias that the
+        // dispatch scheduler elides rather than dispatching, so HRX can always "run" one -- declining it
+        // states a capability HRX does have. It also cannot be declined safely: the KV and QSA caches are
+        // pre-allocated in HRX buffers, and ggml_backend_sched aborts instead of falling back when a
+        // pre-allocated tensor's backend refuses its op, so refusing a view of cache_k_l* is fatal.
         case GGML_OP_ROPE:
-        case GGML_OP_VIEW:
             return !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
                    !hrx_hc_grouped_norm_row_qwen4exp(op);
         case GGML_OP_CLAMP:
