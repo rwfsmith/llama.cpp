@@ -61,6 +61,11 @@ struct GatedDeltaNetParams {
     int32_t k = 0;
 };
 
+struct ScaleParams {
+    float scale = 0.0f;
+    float bias  = 0.0f;
+};
+
 // clang-format off
 using OpParams = std::variant<
     std::monostate,
@@ -73,7 +78,8 @@ using OpParams = std::variant<
     RopeParams,
     L2NormParams,
     UnaryParams,
-    GatedDeltaNetParams>;
+    GatedDeltaNetParams,
+    ScaleParams>;
 // clang-format on
 
 template <typename T> const T * op_params_as(const OpParams & params) {

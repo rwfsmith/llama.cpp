@@ -48,6 +48,13 @@ static bool clamp_params_equivalent(const OpParams & lhs, const OpParams & rhs) 
            nearly_equal(lhs_params->max, rhs_params->max);
 }
 
+static bool scale_params_equivalent(const OpParams & lhs, const OpParams & rhs) {
+    const ScaleParams * lhs_params = op_params_as<ScaleParams>(lhs);
+    const ScaleParams * rhs_params = op_params_as<ScaleParams>(rhs);
+    return lhs_params != nullptr && rhs_params != nullptr && nearly_equal(lhs_params->scale, rhs_params->scale) &&
+           nearly_equal(lhs_params->bias, rhs_params->bias);
+}
+
 static bool glu_params_equivalent(const OpParams & lhs, const OpParams & rhs) {
     const GluParams * lhs_params = op_params_as<GluParams>(lhs);
     const GluParams * rhs_params = op_params_as<GluParams>(rhs);
@@ -112,6 +119,11 @@ OpParams import_op_params(const ggml_tensor & tensor) {
             };
         case GGML_OP_GLU:
             return GluParams{ ggml_get_glu_op(&tensor) };
+        case GGML_OP_SCALE:
+            return ScaleParams{
+                ggml_get_op_params_f32(&tensor, 0),
+                ggml_get_op_params_f32(&tensor, 1),
+            };
         case GGML_OP_ROPE:
             return RopeParams{
                 ggml_get_op_params_i32(&tensor, 1),  ggml_get_op_params_i32(&tensor, 2),
@@ -145,6 +157,8 @@ bool op_params_equivalent(ggml_op op, const OpParams & lhs, const OpParams & rhs
             return clamp_params_equivalent(lhs, rhs);
         case GGML_OP_GLU:
             return glu_params_equivalent(lhs, rhs);
+        case GGML_OP_SCALE:
+            return scale_params_equivalent(lhs, rhs);
         case GGML_OP_ROPE:
             return rope_params_equivalent(lhs, rhs);
         case GGML_OP_L2_NORM:

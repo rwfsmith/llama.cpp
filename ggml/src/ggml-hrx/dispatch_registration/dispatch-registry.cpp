@@ -1,6 +1,7 @@
 #include "dispatch-registry.h"
 
 #include "dispatch-add.h"
+#include "dispatch-copy.h"
 #include "dispatch-gated-delta-net.h"
 #include "dispatch-gather-add.h"
 #include "dispatch-llm-matmul.h"
@@ -12,6 +13,7 @@
 #include "dispatch-qwen4exp-flash-attention.h"
 #include "dispatch-rmsnorm.h"
 #include "dispatch-routed-ffn.h"
+#include "dispatch-scale.h"
 
 #include <algorithm>
 #include <utility>
@@ -50,6 +52,8 @@ static DispatchRegistry build_llm_registry() {
     DispatchRegistryBuilder builder;
     register_add_dispatch(builder);
     register_gather_add_dispatch(builder);
+    register_scale_dispatch(builder);
+    register_copy_dispatch(builder);
     register_llm_dispatches(builder);
     return builder.build();
 }

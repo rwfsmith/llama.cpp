@@ -165,6 +165,17 @@ static bool can_elide_layout_alias_node(const Graph &             graph,
     return is_layout_alias_node(graph, node) && value_is_available(graph, node.inputs[0], covered_nodes);
 }
 
+// A node whose output holds no elements computes nothing, so it can be covered without a dispatch.
+// llama.cpp emits these deliberately: build_rs() clears a recurrent state slot through a view that is
+// zero-sized whenever no slot needs resetting, and worst-case reserve graphs carry zero-token nodes.
+// The backend cannot simply decline them, because ggml_backend_sched aborts outright -- rather than
+// falling back to the CPU -- when a pre-allocated tensor such as the recurrent state cache lands in a
+// buffer whose backend refuses the op. Eliding them here is what makes claiming them safe.
+static bool node_output_is_empty(const Graph & graph, const GraphNode & node) {
+    const Value * output = graph.values().find(node.output);
+    return output != nullptr && output->element_count == 0;
+}
+
 static bool apply_value_aliases(Graph & graph, const DispatchMatch & match, Status & status) {
     for (const DispatchValueAliasRequest & alias : match.value_aliases) {
         Status alias_status = graph.values().alias_storage(alias.target_value, alias.source_value);
@@ -221,7 +232,7 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
         DispatchMatchDiagnostics match_diagnostics;
         if (!try_match_registration(graph, node, i, covered_nodes, plan_, *registry, next_plan_value, match,
                                     &match_diagnostics)) {
-            if (can_elide_layout_alias_node(graph, *node, covered_nodes)) {
+            if (can_elide_layout_alias_node(graph, *node, covered_nodes) || node_output_is_empty(graph, *node)) {
                 pending_diagnostics.append(match.status);
                 covered_nodes[i] = true;
                 continue;

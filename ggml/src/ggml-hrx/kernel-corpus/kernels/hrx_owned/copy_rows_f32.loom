@@ -1,0 +1,63 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_copy_rows_gfx11_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_copy_rows_gfx11_wave64) export("ggml_copy_rows_f32") @ggml_copy_rows_f32(%element_count: index, %row_length: index, %source_row_stride: index, %output_row_stride: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %row_length: index, %source_row_stride: index, %output_row_stride: index, %source: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %length = index.assume %row_length [range(%row_length, 1, 134217728)] : index
+  %source_stride = index.assume %source_row_stride [range(%source_row_stride, 1, 134217728)] : index
+  %output_stride = index.assume %output_row_stride [range(%output_row_stride, 1, 134217728)] : index
+  %row_count = index.div %count, %length : index
+  %one = index.constant 1 : index
+  %rows_minus_one = index.sub %row_count, %one : index
+  %source_span = index.mul %rows_minus_one, %source_stride : index
+  %source_extent = index.add %source_span, %length : index
+  %output_span = index.mul %rows_minus_one, %output_stride : index
+  %output_extent = index.add %output_span, %length : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %source_noalias, %output_noalias = buffer.assume.noalias %source, %output : buffer, buffer
+  %source_view = buffer.view %source_noalias[%zero_offset] : buffer -> view<[%source_extent]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%output_extent]xf32>
+  scf.if %in_bounds {
+    %row = index.div %linear, %length : index
+    %column = index.rem %linear, %length : index
+    %source_base = index.mul %row, %source_stride : index
+    %source_index = index.add %source_base, %column : index
+    %output_base = index.mul %row, %output_stride : index
+    %output_index = index.add %output_base, %column : index
+    %value = view.load %source_view[%source_index] : view<[%source_extent]xf32> -> f32
+    view.store %value, %output_view[%output_index] : f32, view<[%output_extent]xf32>
+  }
+  kernel.return
+}
+
+// Gathers every other element of a 6-element source into a dense 3-element output, which is exactly
+// the strided read the conv-state writeback performs: row_length 1, source stride 2, output stride 1.
+check.case public @ggml_copy_rows_f32_strided_case {
+  %three = check.literal value(3) : index
+  %one = check.literal value(1) : index
+  %two = check.literal value(2) : index
+  %source = check.generate.iota offset(1) step(1) : tensor<6xf32>
+  %output = check.generate.fill value(0) : tensor<3xf32>
+  %expected = check.generate.iota offset(1) step(2) : tensor<3xf32>
+  func.call @ggml_copy_rows_f32(%three, %one, %two, %one, %source, %output) : (index, index, index, index, tensor<6xf32>, tensor<3xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<3xf32>
+  check.return
+}
+
+check.benchmark<@ggml_copy_rows_f32_strided_case> @ggml_copy_rows_f32_strided

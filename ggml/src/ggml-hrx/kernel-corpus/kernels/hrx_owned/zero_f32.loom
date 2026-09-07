@@ -1,0 +1,41 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_zero_gfx11_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_zero_gfx11_wave64) export("ggml_zero_f32") @ggml_zero_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %output_noalias = buffer.assume.noalias %output : buffer
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %zero = scalar.constant 0.0 : f32
+    view.store %zero, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+check.case public @ggml_zero_f32_small_case {
+  %four = check.literal value(4) : index
+  %output = check.generate.iota offset(1) step(1) : tensor<4xf32>
+  %expected = check.generate.fill value(0) : tensor<4xf32>
+  func.call @ggml_zero_f32(%four, %output) : (index, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0) rtol(0.0) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@ggml_zero_f32_small_case> @ggml_zero_f32_small

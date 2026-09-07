@@ -212,6 +212,24 @@
       "owner": "ggml-hrx"
     },
     {
+      "path": "../hrx_owned/zero_f32.loom",
+      "sha256": "25f62bc58fdbd228246a9a0952d2f3e6cadc3677de1d42987f2d84357e0ff51d",
+      "size": 1918,
+      "owner": "ggml-hrx"
+    },
+    {
+      "path": "../hrx_owned/copy_f32.loom",
+      "sha256": "a696714beea3313d018b532fe4907421f4c1ac96442353583c372a9efd77deb1",
+      "size": 2185,
+      "owner": "ggml-hrx"
+    },
+    {
+      "path": "../hrx_owned/copy_rows_f32.loom",
+      "sha256": "fc5a72ce83f9a2e5c54171afb90200e54a1f86826008624e236ce5da596f6390",
+      "size": 3751,
+      "owner": "ggml-hrx"
+    },
+    {
       "path": "qwen4exp/attention_common.loom",
       "sha256": "9e45d592d237ea95d69a37821b6767594cde1873068f51812a3a241c55424274",
       "size": 2360
@@ -248,6 +266,130 @@
     }
   ],
   "exports": [
+    {
+      "name": "ggml_copy_f32",
+      "symbol": "ggml_copy_f32",
+      "source": "../hrx_owned/copy_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "source",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/copy_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_copy_rows_f32",
+      "symbol": "ggml_copy_rows_f32",
+      "source": "../hrx_owned/copy_rows_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        },
+        {
+          "name": "row_length",
+          "type": "index"
+        },
+        {
+          "name": "source_row_stride",
+          "type": "index"
+        },
+        {
+          "name": "output_row_stride",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        },
+        {
+          "name": "row_length",
+          "type": "index"
+        },
+        {
+          "name": "source_row_stride",
+          "type": "index"
+        },
+        {
+          "name": "output_row_stride",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "source",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/copy_rows_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_zero_f32",
+      "symbol": "ggml_zero_f32",
+      "source": "../hrx_owned/zero_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "output"
+      ],
+      "binding_access": [
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/zero_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
     {
       "name": "ggml_add_f32",
       "symbol": "ggml_add_f32",

@@ -161,6 +161,8 @@ ggml_add_backend_library(ggml-hrx
     dispatch/transient-allocator.h
     dispatch_registration/dispatch-add.cpp
     dispatch_registration/dispatch-add.h
+    dispatch_registration/dispatch-copy.cpp
+    dispatch_registration/dispatch-copy.h
     dispatch_registration/dispatch-gated-delta-net.cpp
     dispatch_registration/dispatch-gated-delta-net.h
     dispatch_registration/dispatch-gather-add.cpp
@@ -187,6 +189,8 @@ ggml_add_backend_library(ggml-hrx
     dispatch_registration/dispatch-rmsnorm.h
     dispatch_registration/dispatch-routed-ffn.cpp
     dispatch_registration/dispatch-routed-ffn.h
+    dispatch_registration/dispatch-scale.cpp
+    dispatch_registration/dispatch-scale.h
     status.h
     graph/graph.cpp
     graph/graph-diagnostics.cpp
