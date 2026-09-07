@@ -1041,13 +1041,18 @@ static bool hrx_moe_gate_up_weight_qwen4exp(const ggml_tensor * weight) {
 
 // The SwiGLU between qwen4exp's routed gate/up and down projections. HRX only ever runs this
 // activation *inside* the fused "llm.routed_ffn.*gate_up_swiglu*" dispatches -- there is no matcher
-// rooted at a standalone GGML_OP_GLU. Since hrx_moe_gate_up_weight_qwen4exp() above keeps qwen4exp's
-// gate/up on the CPU, that fused dispatch never forms here and the GLU is left exposed, so it has to
-// follow its producers to the CPU. Scoped to the routed-expert decode shape
-// [expert_hidden_size=640, route_count=10] so other models' GLU nodes keep the permissive default.
+// rooted at a standalone GGML_OP_GLU anywhere in the corpus. Since hrx_moe_gate_up_weight_qwen4exp()
+// above keeps qwen4exp's gate/up on the CPU, that fused dispatch never forms here and the GLU is left
+// exposed, so it has to follow its producers to the CPU.
+//
+// Keyed on the expert_hidden_size=640 row alone, so it covers both the routed decode shape
+// [640, route_count=10] and the shared-expert shape [640, 1]. The latter only became reachable once
+// the Q8_0 dense matmul route let its gate/up projections run on HRX: that pulled the GLU onto HRX
+// behind them, where it stranded its split with "unsupported HRX node 8: GLU f32[640]". Other models
+// keep the permissive default -- qwen30b's expert_hidden_size is 768.
 static bool hrx_moe_glu_qwen4exp_decode(const ggml_tensor * op) {
     return op != nullptr && op->type == GGML_TYPE_F32 && op->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
-           op->ne[1] == kHrxMoeRouteCountQwen4Exp && op->ne[2] == 1 && op->ne[3] == 1;
+           op->ne[2] == 1 && op->ne[3] == 1;
 }
 
 // qwen4exp GDN (Gated DeltaNet) decode-only shape profile: head_k_dim == head_v_dim == 128
@@ -1244,11 +1249,29 @@ static bool hrx_misc_group_disabled(const char * op_class) {
 // CONCAT/SSM_CONV/GATED_DELTA_NET arms do not cover it, so it needs its own decline hook to be
 // separable from the rest of GDN. Only the RMS_NORM root and the MUL shapes are keyed here; the
 // SIGMOID rides along on the UNARY arm.
+//
+// The decline is now UNCONDITIONAL rather than scoped to the "gdngate" bisect group. No registered
+// matcher roots at a [head_dim, value_head_count] MUL -- the only GGML_OP_MUL registration in the
+// whole corpus is llm.routed_ffn.down_weighted_reduce -- so such a MUL is reachable only as a
+// non-root node of the RMS_NORM-rooted fusion above. ggml is free to cut a split between the
+// RMS_NORM and the gated MUL, and when it does the MUL lands as node 0 of a split nothing can root
+// at, which is a hard "unsupported HRX node 0: MUL f32[128,48]" abort rather than a CPU fallback.
+// That is exactly what enabling the Q8_0 dense weights did: relocating those weights into HRX
+// buffers perturbed ggml's input-locality placement and cut the pair apart. These are [128,48]
+// tensors (6144 elements); running the whole gate norm on the CPU is noise, and it removes a latent
+// abort that any future placement change could re-trigger. Same reasoning as the L2_NORM arm.
 static bool hrx_gdn_norm_gate_row(const ggml_tensor * op) {
-    if (op == nullptr || !hrx_gdn_group_disabled("gdngate")) {
+    if (op == nullptr) {
         return false;
     }
-    return op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnValueHeadCountQwen4Exp;
+    if (op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnValueHeadCountQwen4Exp) {
+        return true;
+    }
+    // Same gate, flattened. llama.cpp reshapes the gated value stream to [head_dim*value_head_count, T]
+    // before the out projection, so the identical MUL also shows up as a plain 6144-wide row feeding a
+    // MUL_MAT. It has no root matcher either.
+    return op->ne[0] == kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp && op->ne[1] == 1 &&
+           op->ne[2] == 1 && op->ne[3] == 1;
 }
 
 // The "hc" bisect group: the grouped RMS_NORM registered in dispatch-rmsnorm.cpp roots at the
@@ -1317,7 +1340,40 @@ static bool hrx_cache_publish_unmatched_qwen4exp(const ggml_tensor * op) {
     if (hrx_layout_chain_has_row_width(source, kHrxAttentionHeadSizeQwen4Exp)) {
         return true;
     }
-    return source->ne[0] == kHrxIndexerKeyLengthQwen4Exp && source->ne[1] == 1;
+    if (source->ne[0] == kHrxIndexerKeyLengthQwen4Exp && source->ne[1] == 1) {
+        return true;
+    }
+    // Scalar-per-position caches (row width 1): qwen4exp publishes these alongside the indexer keys.
+    // Every cache-publish matcher in the corpus keys on a head-size-wide row, so a 1-wide row can never
+    // be rooted at -- claiming it strands the SET_ROWS as node 0 of its own split. No head size is 1, so
+    // this cannot capture a real qwen30b K/V publish.
+    return source->ne[0] == 1;
+}
+
+// HRX's attention kernels (attention_decode*.loom / attention_prefill*.loom) are all written against
+// kQwenAttentionHeadSize == 128 -- the head size is baked into their tiling, so every attention matcher
+// rejects anything else. qwen4exp's build_attn_qsa() runs 256-wide heads, which no matcher can root at.
+//
+// This used to be masked by input locality: the QSA mask is a non-f32 ADD that now correctly stays on
+// the CPU, which pulled the FLASH_ATTN_EXT to the head of its own split and turned the over-claim into
+// "unsupported HRX node 0: FLASH_ATTN_EXT f32[256,24]". Scoped to the 256-wide head so qwen30b, whose
+// heads are 128 wide and do have kernels, is untouched.
+static bool hrx_attention_head_size_unsupported(const ggml_tensor * op) {
+    const ggml_tensor * query = op == nullptr ? nullptr : op->src[0];
+    return query != nullptr && query->ne[0] == kHrxAttentionHeadSizeQwen4Exp;
+}
+
+// The only matcher rooted at a bare GGML_OP_ADD is "common.add_f32" (dispatch-add.cpp:66), and it
+// requires f32 on all three operands. No fused dispatch covers a non-f32 ADD either -- the other ADD
+// references in the corpus are the f32 projection-bias fold (dispatch-qwen-matmul.cpp) and the f32
+// routed-FFN reduce (dispatch-routed-ffn.cpp). So a non-f32 ADD can never be dispatched, and claiming
+// one strands it the moment the scheduler makes it the first node of a split.
+//
+// qwen4exp hits this with the QSA attention mask: build_qsa_top_k() adds the sparse top-k mask to the
+// causal mask, giving f16[n_kv, n_tokens] feeding FLASH_ATTN_EXT. It only became reachable once the
+// Q8_0 dense matmul route moved its producers onto HRX ("unsupported HRX node 0: ADD f16[256]").
+static bool hrx_add_non_f32(const ggml_tensor * op) {
+    return op != nullptr && op->type != GGML_TYPE_F32;
 }
 
 // HRX's only hc_dim-wide MUL kernel is the gamma scale fused into the grouped RMS_NORM registered in
@@ -1550,7 +1606,7 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_UNARY:
             return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_unary_decode_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
-            return !hrx_dispatch_group_disabled("attn");
+            return !hrx_dispatch_group_disabled("attn") && !hrx_attention_head_size_unsupported(op);
         // llama.cpp clears a recurrent state slot with ggml_scale_inplace(s, 0) and carries surviving
         // slots forward with ggml_cpy(), both writing straight into the pre-allocated recurrent state
         // cache. ggml_backend_sched aborts instead of falling back when a pre-allocated tensor sits in a
@@ -1572,7 +1628,8 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // See hrx_gdn_per_head_scalar_decode_op(): qwen4exp's GDN alpha/gate prelude emits a 48-element
         // ADD and MUL that no matcher roots at. Everything else keeps the permissive default.
         case GGML_OP_ADD:
-            return !hrx_gdn_per_head_scalar_decode_op(op) && !hrx_qsa_indexer_row_qwen4exp(op);
+            return !hrx_add_non_f32(op) && !hrx_gdn_per_head_scalar_decode_op(op) &&
+                   !hrx_qsa_indexer_row_qwen4exp(op);
         case GGML_OP_MUL:
             return !hrx_gdn_norm_gate_row(op) && !hrx_gdn_per_head_scalar_decode_op(op) &&
                    !hrx_stream_major_mul_qwen4exp(op) &&
