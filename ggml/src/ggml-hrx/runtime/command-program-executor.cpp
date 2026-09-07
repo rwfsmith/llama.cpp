@@ -8,11 +8,17 @@
 #include "runtime/transient-arena.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
 
 namespace ggml::hrx {
+
+static bool hrx_environment_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 PreparedProgramConstantBuffer::~PreparedProgramConstantBuffer() {
     if (buffer != nullptr) {
@@ -571,6 +577,91 @@ static Status rebind_prepared_host_staging(const CommandProgramBindings & bindin
     return status;
 }
 
+// Prepared programs are cached per command-program shape, so a single prepared program is replayed for every
+// split that shares that shape -- for example the residual ADD of all 48 layers. Host staging and transient
+// arena bindings are refreshed per call, but GraphValue bindings point straight at ggml tensor memory, whose
+// address differs for every one of those splits. Without this refresh the program keeps the addresses captured
+// the first time it ran, so every later split reads and writes the first split's tensors and leaves its own
+// destination untouched. Returns true through `changed` when any address moved, so a recorded graph that baked
+// these references in can be re-recorded.
+static Status rebind_prepared_graph_value_list(const CommandProgramBindings & bindings,
+                                               std::vector<PreparedCommand> & commands,
+                                               bool &                         changed) {
+    Status status;
+    for (PreparedCommand & command : commands) {
+        for (PreparedCommandBinding & binding : command.kernel.bindings) {
+            if (binding.binding.origin != CommandBindingOrigin::GraphValue) {
+                continue;
+            }
+            const CommandProgramBinding * concrete = bindings.find(binding.binding.value);
+            // Host-staged and resident-weight values were materialized onto runtime-owned buffers at prepare
+            // time and are refreshed by their own rebind paths; only true device bindings are refreshed here.
+            if (concrete == nullptr || concrete->buffer == nullptr) {
+                continue;
+            }
+            if (binding.binding.offset > concrete->length ||
+                binding.binding.length > concrete->length - binding.binding.offset) {
+                status.log("live graph binding for value %d is outside runtime binding length %zu",
+                           binding.binding.value.value, concrete->length);
+                continue;
+            }
+            const ResolvedBufferRef ref = {
+                concrete->buffer,
+                concrete->offset + binding.binding.offset,
+                binding.binding.length,
+            };
+            if (ref.buffer != binding.ref.buffer || ref.offset != binding.ref.offset ||
+                ref.length != binding.ref.length) {
+                binding.ref = ref;
+                changed     = true;
+            }
+        }
+    }
+    return status;
+}
+
+static Status rebind_prepared_graph_values(const CommandProgramBindings & bindings,
+                                           PreparedCommandProgram &       prepared,
+                                           bool &                         changed) {
+    Status status;
+    status.append(rebind_prepared_graph_value_list(bindings, prepared.initialization_commands, changed));
+    status.append(rebind_prepared_graph_value_list(bindings, prepared.commands, changed));
+    return status;
+}
+
+// HRX_TRACE_PROGRAM=1: dump the fully materialized command program right before launch -- every kernel
+// binding with its origin, access, resolved buffer/offset, plus each host staging buffer. This is the only
+// view that shows what the GPU is actually given, after value mapping, host materialization and transient
+// arena assignment have all been applied.
+static void trace_prepared_program(const char * label, const PreparedCommandProgram & prepared) {
+    static const bool enabled  = hrx_environment_flag("HRX_TRACE_PROGRAM");
+    static int        remaining = 6;
+    if (!enabled || remaining <= 0) {
+        return;
+    }
+    --remaining;
+    GGML_LOG_ERROR("HRX program %s: init_commands=%zu commands=%zu staging=%zu weights=%zu\n", label,
+                   prepared.initialization_commands.size(), prepared.commands.size(), prepared.host_staging.size(),
+                   prepared.resident_host_weights.size());
+    for (const PreparedCommand & command : prepared.commands) {
+        GGML_LOG_ERROR("HRX program   command ord=%u kind=%d bindings=%zu exec=%p\n", command.ordinal,
+                       static_cast<int>(command.kind), command.kernel.bindings.size(),
+                       static_cast<const void *>(command.kernel.executable.get()));
+        for (const PreparedCommandBinding & binding : command.kernel.bindings) {
+            GGML_LOG_ERROR("HRX program     bind name=%s value=%d origin=%d access=%d buffer=%p offset=%zu len=%zu\n",
+                           binding.binding.name.c_str(), binding.binding.value.value,
+                           static_cast<int>(binding.binding.origin), static_cast<int>(binding.binding.access),
+                           static_cast<const void *>(binding.ref.buffer), binding.ref.offset, binding.ref.length);
+        }
+    }
+    for (const HostStagingBuffer & staging : prepared.host_staging) {
+        GGML_LOG_ERROR("HRX program   staging value=%d upload=%d download=%d buffer=%p host=%p len=%zu\n", staging.value,
+                       static_cast<int>(staging.upload), static_cast<int>(staging.download),
+                       static_cast<const void *>(staging.buffer), static_cast<const void *>(staging.host_data),
+                       staging.length);
+    }
+}
+
 static Status upload_prepared_host_staging(const CommandProgramExecutionContext & context,
                                            const PreparedCommandProgram &         prepared) {
     Status status;
@@ -1027,6 +1118,12 @@ bool bind_and_execute_prepared_command_program(const CommandProgramExecutionCont
         GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(rebind_status));
         return false;
     }
+    bool   graph_values_changed = false;
+    Status graph_value_status   = rebind_prepared_graph_values(bindings, prepared, graph_values_changed);
+    if (!graph_value_status.success()) {
+        GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(graph_value_status));
+        return false;
+    }
     if (commands.transients.arena_size == 0) {
         Status status = initialize_command_program_constants(context, commands, {}, prepared);
         if (!status.success()) {
@@ -1099,6 +1196,14 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
         return result;
     }
 
+    bool   graph_values_changed = false;
+    Status graph_value_status   = rebind_prepared_graph_values(bindings, prepared, graph_values_changed);
+    if (!graph_value_status.success()) {
+        result.status.append(graph_value_status);
+        result.event = HrxGraphReplayEvent::BuildFailed;
+        return result;
+    }
+
     TransientArenaAllocationRef transient_allocation;
     TransientArena::AllocationLease lease;
     if (commands.transients.arena_size == 0) {
@@ -1132,7 +1237,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     const bool had_recorded = recorded.valid();
     result.transient_allocation_changed =
         had_recorded && recorded.bound_transient_arena_allocation_id != prepared.bound_transient_arena_allocation_id;
-    if (!had_recorded || result.transient_allocation_changed) {
+    if (!had_recorded || result.transient_allocation_changed || graph_values_changed) {
         result.event =
             result.transient_allocation_changed ? HrxGraphReplayEvent::RebuildTransient : HrxGraphReplayEvent::MissBuild;
         const uint64_t build_start_ns = hrx_graph_replay_now_ns();
@@ -1149,6 +1254,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     }
 
     const uint64_t launch_start_ns = hrx_graph_replay_now_ns();
+    trace_prepared_program("replay", prepared);
     Status upload_status = upload_prepared_host_staging(context, prepared);
     if (!upload_status.success()) {
         result.launch_ns = hrx_graph_replay_now_ns() - launch_start_ns;
@@ -1184,6 +1290,7 @@ bool execute_prepared_command_program(const CommandProgramExecutionContext & con
     if (!prepared_execution_context_valid(context)) {
         return false;
     }
+    trace_prepared_program("direct", commands);
     Status upload_status = upload_prepared_host_staging(context, commands);
     if (!upload_status.success()) {
         GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(upload_status));
