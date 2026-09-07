@@ -23,9 +23,13 @@ struct GraphProgramExternalBinding {
     const ggml_tensor * tensor = nullptr;
 };
 
+// A view's root allocation is bound as an external value (ValueMap::get_or_add_tensor_value) but is
+// usually not itself a node or a node source, so it can only be located through the view that names it.
 enum class GraphProgramExternalSlotKind {
     Node,
     Source,
+    NodeViewRoot,
+    SourceViewRoot,
 };
 
 struct GraphProgramExternalSlot {

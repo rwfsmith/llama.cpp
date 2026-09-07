@@ -23,6 +23,17 @@ ValueId ValueMap::get_or_add_tensor_value(const ggml_tensor * tensor, ValueKind 
         return value.id;
     }
 
+    // ggml points a view at the *root* allocation rather than the tensor it was derived from, and
+    // accumulates view_offs so that it stays absolute against that root (ggml_new_tensor_impl). A
+    // view-of-a-view therefore names a tensor that may never appear as a node in this split, so
+    // find_alias_source() below would miss it and hand the view its own storage. same_storage() would
+    // then report false for a pure layout alias, the dispatch scheduler could no longer elide it, and
+    // the whole split would fail as unsupported. Materialize the root first so every view of one
+    // allocation shares one storage.
+    if (tensor->view_src != nullptr) {
+        get_or_add_tensor_value(tensor->view_src, ValueKind::External);
+    }
+
     const ValueId  id(static_cast<int32_t>(values_.size()));
     const Value *  alias_source = find_alias_source(tensor);
     ValueStorageId storage;

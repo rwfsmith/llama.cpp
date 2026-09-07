@@ -145,6 +145,16 @@ static Status bind_current_value(const ValueMap &                               
 
     tensor_by_value[static_cast<size_t>(expected.value)] = tensor;
     value_by_tensor.emplace(tensor, expected.value);
+
+    // import_ggml_graph() materializes the root allocation behind every view (see
+    // ValueMap::get_or_add_tensor_value), and that root is normally neither a node nor a node input in
+    // the ggml graph. Walking nodes alone would therefore leave its external value unbound and fail the
+    // replay with "external value N is missing from the current graph". ggml collapses view_src to the
+    // root, so this recurses at most once.
+    if (tensor->view_src != nullptr && value->alias_source.value >= 0) {
+        return bind_current_value(values, value->alias_source, tensor->view_src, tensor_by_value, value_by_tensor,
+                                  "view root", node_index);
+    }
     return status;
 }
 
@@ -216,6 +226,14 @@ const ggml_tensor * GraphProgram::resolve_external_slot(const ggml_cgraph &     
     if (slot.kind == GraphProgramExternalSlotKind::Node) {
         return node;
     }
+    if (slot.kind == GraphProgramExternalSlotKind::NodeViewRoot) {
+        if (node->view_src == nullptr) {
+            status.log("external value %d references the view root of node slot %zu, which is not a view",
+                       slot.value.value, slot.node_index);
+            return nullptr;
+        }
+        return node->view_src;
+    }
     if (slot.source_index < 0 || slot.source_index >= GGML_MAX_SRC) {
         status.log("external value %d references invalid source slot %d", slot.value.value, slot.source_index);
         return nullptr;
@@ -225,6 +243,14 @@ const ggml_tensor * GraphProgram::resolve_external_slot(const ggml_cgraph &     
         status.log("external value %d references null source slot %zu:%d", slot.value.value, slot.node_index,
                    slot.source_index);
         return nullptr;
+    }
+    if (slot.kind == GraphProgramExternalSlotKind::SourceViewRoot) {
+        if (source->view_src == nullptr) {
+            status.log("external value %d references the view root of source slot %zu:%d, which is not a view",
+                       slot.value.value, slot.node_index, slot.source_index);
+            return nullptr;
+        }
+        return source->view_src;
     }
     return source;
 }
@@ -317,6 +343,31 @@ Status GraphProgram::capture_external_slots(const ggml_cgraph & graph, const Gra
                     slot.source_index = j;
                     found             = true;
                     break;
+                }
+            }
+        }
+        if (!found) {
+            // The root allocation behind a view is bound as an external value but is rarely a node or a
+            // node source itself, so fall back to locating it through a view that names it.
+            for (int i = 0; i < graph.n_nodes && !found; ++i) {
+                const ggml_tensor * node = graph.nodes[i];
+                if (node == nullptr) {
+                    continue;
+                }
+                if (node->view_src == binding.tensor) {
+                    slot.kind       = GraphProgramExternalSlotKind::NodeViewRoot;
+                    slot.node_index = static_cast<size_t>(i);
+                    found           = true;
+                    break;
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j] != nullptr && node->src[j]->view_src == binding.tensor) {
+                        slot.kind         = GraphProgramExternalSlotKind::SourceViewRoot;
+                        slot.node_index   = static_cast<size_t>(i);
+                        slot.source_index = j;
+                        found             = true;
+                        break;
+                    }
                 }
             }
         }

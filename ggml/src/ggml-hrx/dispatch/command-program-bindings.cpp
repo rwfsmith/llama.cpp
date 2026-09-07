@@ -1,5 +1,6 @@
 #include "command-program-bindings.h"
 
+#include <algorithm>
 #include <sstream>
 #include <utility>
 
@@ -37,13 +38,17 @@ CommandProgramBindings CommandProgramBindings::from_bindings(std::vector<Command
                                                              const Status &                     errors) {
     CommandProgramBindings result;
     result.status.append(errors);
+    // A zero-sized tensor has nothing to bind. llama.cpp emits them deliberately -- build_rs() clears a
+    // recurrent state slot through a view that is empty whenever no slot needs resetting -- and the
+    // dispatch scheduler elides the nodes that produce them, so no command can reference one. Dropping
+    // them here keeps every binding producer from having to special-case an empty tensor.
+    bindings.erase(std::remove_if(bindings.begin(), bindings.end(),
+                                  [](const CommandProgramBinding & binding) { return binding.length == 0; }),
+                   bindings.end());
     result.bindings_ = std::move(bindings);
     for (const CommandProgramBinding & binding : result.bindings_) {
         if (binding.buffer == nullptr && binding.host_data == nullptr) {
             result.status.log("external value %d has a null binding", binding.value.value);
-        }
-        if (binding.length == 0) {
-            result.status.log("external value %d has an empty binding", binding.value.value);
         }
     }
     return result;
