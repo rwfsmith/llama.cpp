@@ -251,8 +251,8 @@
     },
     {
       "path": "qwen4exp/gdn_decode.loom",
-      "sha256": "3acd2521fb7cf0f5826dba0e0ba0b4295251a7d675118e2518ec0b307d7ed86a",
-      "size": 40757
+      "sha256": "cd6369aeb2e06db2976bd641edc2449d1be16fd47e09e8ac94167ce83af9be8c",
+      "size": 49276
     },
     {
       "path": "qwen4exp/hc_norm.loom",
@@ -5061,6 +5061,50 @@
         "qk_inverse_norm"
       ],
       "binding_access": [
+        "read",
+        "read",
+        "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "qwen38_gdn_recurrent_decode_split",
+      "symbol": "qwen38_gdn_recurrent_decode_split",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [],
+      "launch_parameters": [],
+      "bindings": [
+        "q",
+        "k",
+        "v",
+        "gate",
+        "beta",
+        "state",
+        "new_state",
+        "raw_output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
         "read",
         "read",
         "write",

@@ -1217,18 +1217,19 @@ static bool hrx_gdn_group_disabled(const char * half) {
     if (std::strcmp(half, "gdnconv") == 0 && !hrx_gdn_conv_prepare_enabled()) {
         return true;  // see hrx_gdn_conv_prepare_enabled()
     }
-    // "gdncore" (qwen4exp.gdn_recurrent_decode) is unconditionally disabled. Its matcher binds the
-    // shared `qkv_silu` value plus the `qk_inverse_norm` transient published by
-    // qwen4exp.gdn_conv_prepare_decode, and additionally requires that dispatch's L2_NORM/VIEW nodes
-    // to be covered in the *same* split. Now that conv-prepare correctly covers only SSM_CONV+SILU
-    // (and no longer hides unwritten L2_NORM outputs), that precondition can never be satisfied --
-    // and GGML_SCHED_DEBUG=2 shows ggml always separates the two with the CPU beta/gate chain
-    // anyway. Claiming GATED_DELTA_NET while the matcher cannot fire would strand its split, so the
-    // recurrent step stays on the CPU reference implementation until the kernel is decoupled from
-    // the fused conv prelude (needs a variant taking pre-normalized q/k/v as separate buffers).
-    if (std::strcmp(half, "gdncore") == 0) {
-        return true;
-    }
+    // "gdncore" is the recurrent GATED_DELTA_NET step. It used to be unconditionally disabled: the only
+    // matcher then available (qwen4exp.gdn_recurrent_decode) binds the shared `qkv_silu` value plus the
+    // `qk_inverse_norm` transient published by qwen4exp.gdn_conv_prepare_decode, and additionally
+    // requires that dispatch's L2_NORM/VIEW nodes to be covered in the *same* split. Once conv-prepare
+    // was narrowed to cover only SSM_CONV+SILU (so it no longer hid unwritten L2_NORM outputs) that
+    // precondition became unsatisfiable -- GGML_SCHED_DEBUG=2 shows ggml always separates the two with
+    // the CPU-resident beta/gate chain -- so claiming GATED_DELTA_NET would have stranded its split.
+    //
+    // qwen4exp.gdn_recurrent_decode_split now provides a conv-prelude-independent variant that binds
+    // q/k/v straight from the op's own src[0..2] and has no covered-node or transient preconditions, so
+    // a matcher can always root here and the group follows the normal bisect rules again. Without this
+    // the entire GDN recurrence ran on the CPU reference implementation for all 36 linear-attention
+    // layers, which is what kept the HRX GDN kernels unreachable.
     return hrx_dispatch_group_disabled("gdn") || hrx_dispatch_group_disabled(half);
 }
 

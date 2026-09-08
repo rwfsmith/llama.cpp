@@ -20,6 +20,8 @@ static constexpr KernelCatalogRef kQwenGdnConvPrepareDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_conv_prepare_decode");
 static constexpr KernelCatalogRef kQwenGdnRecurrentDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_recurrent_decode");
+static constexpr KernelCatalogRef kQwenGdnRecurrentDecodeSplitKernel =
+    GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_recurrent_decode_split");
 static constexpr KernelCatalogRef kQwenGdnNormGateDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_norm_gate_decode");
 
@@ -452,6 +454,84 @@ static bool match_qwen4exp_gdn_recurrent_decode_dispatch(const DispatchMatchCont
     return true;
 }
 
+// qwen4exp.gdn_recurrent_decode_split: the conv-prelude-independent form of the matcher above, and the
+// one that actually fires for this model. Same root op and same shape gate, but q/k/v bind directly to
+// ggml_gated_delta_net's own src[0]/src[1]/src[2] -- the materialized L2_NORM(q), L2_NORM(k) and the v
+// VIEW -- instead of being backward-traced to conv-prepare's packed `qkv_silu` value and its
+// `qk_inverse_norm` transient.
+//
+// The packed variant additionally requires those L2_NORM/VIEW producer nodes to be *covered in the same
+// split*, because qwen38_gdn_conv_prepare_decode never materializes normalized q/k. GGML_SCHED_DEBUG=2
+// shows ggml always orders the CPU-resident beta/gate chain (MUL_MAT(ssm_alpha) -> ADD(ssm_dt) ->
+// SOFTPLUS -> MUL(ssm_a) -> MUL_MAT(ssm_beta) -> SIGMOID) between the conv prelude and
+// GATED_DELTA_NET, so that precondition can never hold and GATED_DELTA_NET was left on the CPU
+// reference implementation for every layer. Because this variant reads only real graph values, it has
+// no covered-node or alternate-value preconditions at all and ggml_backend_sched transparently stages
+// whichever of its inputs happen to live on the other backend.
+//
+// The dst-tail state contract is identical to the packed variant -- see its comment above: `state`
+// (src[5]) binds READ-ONLY and a second binding aliases dst at byte offset kGdnRawOutputByteCount to
+// give the kernel the write-only `new_state` region that the graph's own VIEW + ggml_cpy reads back
+// into ssm_states_all.
+static bool match_qwen4exp_gdn_recurrent_decode_split_dispatch(const DispatchMatchContext & context,
+                                                                DispatchMatch &              match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_GATED_DELTA_NET || node->inputs.size() != 6) {
+        return false;
+    }
+
+    const Value * q      = graph_value(context.graph, node->inputs[0]);
+    const Value * k      = graph_value(context.graph, node->inputs[1]);
+    const Value * v      = graph_value(context.graph, node->inputs[2]);
+    const Value * gate   = graph_value(context.graph, node->inputs[3]);
+    const Value * beta   = graph_value(context.graph, node->inputs[4]);
+    const Value * state  = graph_value(context.graph, node->inputs[5]);
+    const Value * output = graph_value(context.graph, node->output);
+    if (q == nullptr || k == nullptr || v == nullptr || gate == nullptr || beta == nullptr ||
+        state == nullptr || output == nullptr) {
+        return false;
+    }
+
+    // Decode-only (K=1) shape gate, matching hrx_gdn_gated_delta_net_decode_supported() in ggml-hrx.cpp.
+    // This also excludes the other delta-net-family models built on delta-net-base.cpp (qwen3next,
+    // kimi-linear, ...), which use different head-dim/head-count profiles than qwen4exp's 128/16/48.
+    if (!is_shape(*q, kGdnHeadDim, kGdnKeyHeadCount, 1, 1) ||
+        !is_shape(*k, kGdnHeadDim, kGdnKeyHeadCount, 1, 1) ||
+        !is_shape(*v, kGdnHeadDim, kGdnValueHeadCount, 1, 1) ||
+        !is_shape(*gate, 1, kGdnValueHeadCount, 1, 1) || !is_shape(*beta, 1, kGdnValueHeadCount, 1, 1) ||
+        !is_shape(*state, kGdnHeadDim, kGdnHeadDim, kGdnValueHeadCount, 1) ||
+        !is_shape(*output, kGdnValueHeadCount * kGdnHeadDim, 1 + kGdnHeadDim, 1, 1)) {
+        return false;
+    }
+    const GatedDeltaNetParams * gdn_params = op_params_as<GatedDeltaNetParams>(node->params);
+    if (gdn_params == nullptr || gdn_params->k != 1) {
+        return false;  // K>1 is chunked/prefill; intentionally left CPU-fallback.
+    }
+
+    // The kernel indexes q/k/v as flat, tightly packed f32 rows, so a permuted or gappy view would be
+    // read incorrectly rather than declined. q and k are L2_NORM outputs (always freshly materialized
+    // and contiguous); v is a VIEW into the conv output whose rows are tight for n_seq_tokens == 1.
+    if (!q->contiguous || !k->contiguous || !v->contiguous || !gate->contiguous || !beta->contiguous ||
+        !state->contiguous) {
+        return false;
+    }
+
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kQwenGdnRecurrentDecodeSplitKernel);
+    dispatch.bindings.push_back({ q->id, 0, q->byte_count });
+    dispatch.bindings.push_back({ k->id, 0, k->byte_count });
+    dispatch.bindings.push_back({ v->id, 0, v->byte_count });
+    dispatch.bindings.push_back({ gate->id, 0, gate->byte_count });
+    dispatch.bindings.push_back({ beta->id, 0, beta->byte_count });
+    dispatch.bindings.push_back({ state->id, 0, state->byte_count });
+    dispatch.bindings.push_back({ output->id, kGdnRawOutputByteCount, state->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, kGdnRawOutputByteCount });
+
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
 static bool match_qwen4exp_gdn_norm_gate_decode_dispatch(const DispatchMatchContext & context,
                                                           DispatchMatch &              match) {
     const NormGateMatch norm_match = match_qwen4exp_gdn_norm_gate(context.graph, context.root_node);
@@ -493,6 +573,17 @@ void register_gdn_dispatches(DispatchRegistryBuilder & registry) {
         100,
         DispatchSource::Qwen,
         match_qwen4exp_gdn_recurrent_decode_dispatch,
+    });
+    registry.add({
+        // Lower priority than the packed variant above, so that if conv-prepare ever does land in the
+        // same split (which would let the fused form skip re-reading q/k and reuse its transient), that
+        // one still wins. In practice ggml always separates them and this is the variant that fires.
+        "qwen4exp.gdn_recurrent_decode_split",
+        GGML_OP_GATED_DELTA_NET,
+        DispatchMatchKind::SingleOp,
+        50,
+        DispatchSource::Qwen,
+        match_qwen4exp_gdn_recurrent_decode_split_dispatch,
     });
     registry.add({
         // Priority 1300 (above dispatch-rmsnorm.cpp's highest, 1200) is deliberate: this shares

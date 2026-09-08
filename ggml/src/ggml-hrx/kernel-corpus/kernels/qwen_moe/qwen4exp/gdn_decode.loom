@@ -292,6 +292,132 @@ kernel.def export("qwen38_gdn_recurrent_decode") @qwen38_gdn_recurrent_decode() 
   kernel.return
 }
 
+// Conv-prelude-independent variant of the recurrence above. Identical math, but q/k/v arrive as three
+// separate, already-L2-normalized buffers (ggml_gated_delta_net's own src[0]/src[1]/src[2]) instead of
+// the packed 10240-wide `qkv_silu` value plus the `qk_inverse_norm` reciprocal-scale transient that
+// qwen38_gdn_conv_prepare_decode publishes.
+//
+// The packed form can only be used when qwen4exp.gdn_conv_prepare_decode covered the L2_NORM/VIEW nodes
+// in the SAME split, because it never materializes the normalized q/k. GGML_SCHED_DEBUG=2 shows ggml
+// always orders the CPU-resident beta/gate chain (MUL_MAT(ssm_alpha) -> ADD(ssm_dt) -> SOFTPLUS ->
+// MUL(ssm_a) -> MUL_MAT(ssm_beta) -> SIGMOID) between the conv prelude and GATED_DELTA_NET, so that
+// precondition can never hold for this model and the recurrent step was stranded on the CPU reference
+// implementation. Binding the real, materialized L2_NORM outputs removes the coupling entirely: this
+// variant is self-contained and does not care which backend produced any of its inputs.
+//
+// Channel layout differs from the packed variant only in the base offsets. There, q/k/v were three
+// regions of one 10240 buffer (q at 0, k at 2048, v at 4096); here each has its own view, so the
+// %q_channel_count / %v_channel_base biases are gone and the %qk_inverse_norm rescale disappears
+// because the inputs are already normalized.
+kernel.def export("qwen38_gdn_recurrent_decode_split") @qwen38_gdn_recurrent_decode_split() {
+  %unit = index.constant 1 : index
+  %value_head_count = index.constant 48 : index
+  %head_size = index.constant 128 : index
+  %workgroup_size = index.constant 32 : index
+  kernel.launch.config workgroups(%value_head_count, %head_size, %unit) workgroup_size(%workgroup_size, %unit, %unit) : index
+} launch(%q: buffer, %k: buffer, %v: buffer, %gate: buffer, %beta: buffer, %state: buffer, %new_state: buffer, %raw_output: buffer) {
+  // %gate and %beta arrive pre-activated, and %state is READ-ONLY with the update written to the
+  // separate %new_state buffer (bound to dst's tail by the dispatch layer) -- exactly the same
+  // contracts as qwen38_gdn_recurrent_decode; see its comment for the full rationale.
+  %value_head0 = kernel.workgroup.id<x> : index
+  %value_head = index.assume %value_head0 [range(%value_head0, 0, 47)] : index
+  %column0 = kernel.workgroup.id<y> : index
+  %column = index.assume %column0 [range(%column0, 0, 127)] : index
+  %lane0 = kernel.workitem.id<x> : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 31)] : index
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c96 = index.constant 96 : index
+  %c128 = index.constant 128 : index
+  %c0_offset = index.constant 0 : offset
+  %q_view = buffer.view %q[%c0_offset] : buffer -> view<2048xf32>
+  %k_view = buffer.view %k[%c0_offset] : buffer -> view<2048xf32>
+  %v_view = buffer.view %v[%c0_offset] : buffer -> view<6144xf32>
+  %gate_view = buffer.view %gate[%c0_offset] : buffer -> view<48xf32>
+  %beta_view = buffer.view %beta[%c0_offset] : buffer -> view<48xf32>
+  %state_view = buffer.view %state[%c0_offset] : buffer -> view<786432xf32>
+  %new_state_view = buffer.view %new_state[%c0_offset] : buffer -> view<786432xf32>
+  %output_view = buffer.view %raw_output[%c0_offset] : buffer -> view<6144xf32>
+
+  %key_head = func.call @qwen38_gdn_key_head_for_value_head(%value_head) : (index) -> (index)
+  %key_head_channel_base = index.mul %key_head, %c128 : index
+  %qk_row0 = index.add %key_head_channel_base, %lane : index
+  %qk_row1 = index.add %qk_row0, %c32 : index
+  %qk_row2 = index.add %qk_row0, %c64 : index
+  %qk_row3 = index.add %qk_row0, %c96 : index
+  %value_head_channel_base = index.mul %value_head, %c128 : index
+  %value_channel = index.add %value_head_channel_base, %column : index
+  %q0 = view.load %q_view[%qk_row0] : view<2048xf32> -> f32
+  %q1 = view.load %q_view[%qk_row1] : view<2048xf32> -> f32
+  %q2 = view.load %q_view[%qk_row2] : view<2048xf32> -> f32
+  %q3 = view.load %q_view[%qk_row3] : view<2048xf32> -> f32
+  %k0 = view.load %k_view[%qk_row0] : view<2048xf32> -> f32
+  %k1 = view.load %k_view[%qk_row1] : view<2048xf32> -> f32
+  %k2 = view.load %k_view[%qk_row2] : view<2048xf32> -> f32
+  %k3 = view.load %k_view[%qk_row3] : view<2048xf32> -> f32
+
+  %state_head_base = index.mul %value_head, %c128 : index
+  %state_column = index.add %state_head_base, %column : index
+  %state_column_base = index.mul %state_column, %c128 : index
+  %state_index0 = index.add %state_column_base, %lane : index
+  %state_index1 = index.add %state_index0, %c32 : index
+  %state_index2 = index.add %state_index0, %c64 : index
+  %state_index3 = index.add %state_index0, %c96 : index
+  %state0 = view.load %state_view[%state_index0] : view<786432xf32> -> f32
+  %state1 = view.load %state_view[%state_index1] : view<786432xf32> -> f32
+  %state2 = view.load %state_view[%state_index2] : view<786432xf32> -> f32
+  %state3 = view.load %state_view[%state_index3] : view<786432xf32> -> f32
+
+  %gate_value = view.load %gate_view[%value_head] : view<48xf32> -> f32
+  %decay = scalar.expf<afn> %gate_value : f32
+  %decayed0 = scalar.mulf<nnan|ninf|nsz> %state0, %decay : f32
+  %decayed1 = scalar.mulf<nnan|ninf|nsz> %state1, %decay : f32
+  %decayed2 = scalar.mulf<nnan|ninf|nsz> %state2, %decay : f32
+  %decayed3 = scalar.mulf<nnan|ninf|nsz> %state3, %decay : f32
+  %prediction0 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %decayed0, %k0 : f32
+  %prediction1 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %decayed1, %k1 : f32
+  %prediction2 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %decayed2, %k2 : f32
+  %prediction3 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %decayed3, %k3 : f32
+  %prediction01 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %prediction0, %prediction1 : f32
+  %prediction23 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %prediction2, %prediction3 : f32
+  %prediction_partial = scalar.addf<reassoc|nnan|ninf|nsz|contract> %prediction01, %prediction23 : f32
+  %prediction = kernel.workgroup.reduce<addf> %prediction_partial : f32
+  %value = view.load %v_view[%value_channel] : view<6144xf32> -> f32
+  %residual = scalar.subf %value, %prediction : f32
+  %beta_value = view.load %beta_view[%value_head] : view<48xf32> -> f32
+  %delta = scalar.mulf %residual, %beta_value : f32
+  %update0 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %k0, %delta : f32
+  %update1 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %k1, %delta : f32
+  %update2 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %k2, %delta : f32
+  %update3 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %k3, %delta : f32
+  %new_state0 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %decayed0, %update0 : f32
+  %new_state1 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %decayed1, %update1 : f32
+  %new_state2 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %decayed2, %update2 : f32
+  %new_state3 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %decayed3, %update3 : f32
+  view.store %new_state0, %new_state_view[%state_index0] : f32, view<786432xf32>
+  view.store %new_state1, %new_state_view[%state_index1] : f32, view<786432xf32>
+  view.store %new_state2, %new_state_view[%state_index2] : f32, view<786432xf32>
+  view.store %new_state3, %new_state_view[%state_index3] : f32, view<786432xf32>
+  %output0 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %new_state0, %q0 : f32
+  %output1 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %new_state1, %q1 : f32
+  %output2 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %new_state2, %q2 : f32
+  %output3 = scalar.mulf<reassoc|nnan|ninf|nsz|contract> %new_state3, %q3 : f32
+  %output01 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %output0, %output1 : f32
+  %output23 = scalar.addf<reassoc|nnan|ninf|nsz|contract> %output2, %output3 : f32
+  %output_partial = scalar.addf<reassoc|nnan|ninf|nsz|contract> %output01, %output23 : f32
+  %output = kernel.workgroup.reduce<addf> %output_partial : f32
+  %is_leader = index.cmp eq, %lane, %c0 : index
+  scf.if %is_leader {
+    %head_output_base = index.mul %value_head, %c128 : index
+    %output_index = index.add %head_output_base, %column : index
+    %attention_scale = scalar.constant 0.08838834764831845 : f32
+    %scaled_output = scalar.mulf<nnan|ninf|nsz> %output, %attention_scale : f32
+    view.store %scaled_output, %output_view[%output_index] : f32, view<6144xf32>
+  }
+  kernel.return
+}
+
 // Four-column schedule for the same recurrence. Each lane carries four state
 // values for each of its four row stripes, amortizing Q/K and gate loads while
 // retaining coalesced state transactions. Vector workgroup reductions keep the
