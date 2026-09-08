@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -739,12 +740,34 @@ static void hrx_verify_after(ggml_backend_hrx_context * context, const std::vect
     }
 }
 
+// Wall-clock accounting for the HRX half of a token. graph_compute() already blocks on the compute stream
+// before it returns, so the interval around executor.execute() is the host cost of matching, building and
+// submitting dispatches, while the interval around hrx_stream_synchronize() is time the GPU is genuinely
+// busy. Separating those two is what distinguishes "the kernels are slow" from "the submission path is
+// slow" -- they look identical in end-to-end tokens/sec but are fixed in completely different places.
+// Totals are reported cumulatively every kHrxTimeReportInterval calls, because llama-cli deadlocks in
+// teardown and gets killed, so anything printed only at backend_free() would never appear. Diff two
+// consecutive reports to recover a steady-state rate.
+static bool hrx_time_compute_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TIME_COMPUTE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static constexpr uint64_t kHrxTimeReportInterval = 1000;
+
 static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto * context = static_cast<ggml_backend_hrx_context *>(backend->context);
+    const bool timing = hrx_time_compute_enabled();
+    using clock = std::chrono::steady_clock;
+    const clock::time_point t_entry = timing ? clock::now() : clock::time_point{};
     hrx_trace_split(*graph);
     const std::vector<hrx_verify_capture> captures = hrx_verify_before(context, *graph);
     const ggml::hrx::GraphExecutor        executor = ggml::hrx::GraphExecutor(*context);
     const ggml::hrx::GraphExecutionResult result   = executor.execute(*graph);
+    const clock::time_point t_submitted = timing ? clock::now() : clock::time_point{};
     if (!result.success()) {
         // HRX_SURVEY_UNSUPPORTED exists so that one run enumerates every node missing a dispatch, but the
         // scheduler can only report that list through the status it returns here. Printing just the first
@@ -770,6 +793,24 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     // calls ggml_backend_synchronize() itself. Retire the compute stream here so the buffer interface and
     // any host readback are guaranteed to see completed work.
     HRX_CHECK(hrx_stream_synchronize(context->stream));
+    if (timing) {
+        const clock::time_point t_synced = clock::now();
+        const auto              elapsed  = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        static uint64_t splits    = 0;
+        static uint64_t nodes     = 0;
+        static double   submit_ms = 0.0;
+        static double   gpu_ms    = 0.0;
+        splits += 1;
+        nodes += static_cast<uint64_t>(graph->n_nodes);
+        submit_ms += elapsed(t_entry, t_submitted);
+        gpu_ms += elapsed(t_submitted, t_synced);
+        if (splits % kHrxTimeReportInterval == 0) {
+            GGML_LOG_INFO("HRX time: splits=%" PRIu64 " nodes=%" PRIu64 " submit=%.1fms gpu=%.1fms total=%.1fms\n",
+                          splits, nodes, submit_ms, gpu_ms, submit_ms + gpu_ms);
+        }
+    }
     hrx_verify_after(context, captures);
     hrx_dump_router_tensors(context, *graph);
     return result.code;
