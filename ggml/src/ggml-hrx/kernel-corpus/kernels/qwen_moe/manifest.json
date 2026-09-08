@@ -236,6 +236,12 @@
       "owner": "ggml-hrx"
     },
     {
+      "path": "../hrx_owned/repeat_f32.loom",
+      "sha256": "8b67ce436ef9ecb3c06219c0ba72a10c527ad2c5513714d188426b3fd2252573",
+      "size": 6780,
+      "owner": "ggml-hrx"
+    },
+    {
       "path": "../hrx_owned/dense_f32.loom",
       "sha256": "5e85733baf75cc27b83187caec9c2e14281a67e64b2f59ec9b5b0b07a116626c",
       "size": 6463,
@@ -547,6 +553,56 @@
         "mode": "direct",
         "primary_sources": [
           "../hrx_owned/mul_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_repeat_f32",
+      "symbol": "ggml_repeat_f32",
+      "source": "../hrx_owned/mul_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "period",
+          "type": "index"
+        },
+        {
+          "name": "mid_count",
+          "type": "index"
+        },
+        {
+          "name": "outer_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "period",
+          "type": "index"
+        },
+        {
+          "name": "mid_count",
+          "type": "index"
+        },
+        {
+          "name": "outer_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/repeat_f32.loom"
         ],
         "library_sources": []
       },

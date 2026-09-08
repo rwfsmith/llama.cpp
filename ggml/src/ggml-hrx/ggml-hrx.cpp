@@ -855,6 +855,7 @@ static bool eager_capability_declared(enum ggml_op op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_PERMUTE:
+        case GGML_OP_REPEAT:
         case GGML_OP_RESHAPE:
         case GGML_OP_RMS_NORM:
         case GGML_OP_ROPE:
@@ -1168,6 +1169,23 @@ static bool hrx_dense_matmul_f32_supported(const ggml_tensor * op) {
            token_count >= 1 && token_count <= kHrxDenseMatmulMaxTokenCount;
 }
 
+// Bisect switches, mirrored in dispatch_registration/dispatch-elementwise.cpp. The two copies must
+// agree: a node claimed here that the matcher there declines aborts its whole split.
+static bool hrx_mul_generic_claim_enabled() {
+    const char * enabled = std::getenv("HRX_MUL_CLAIM_GENERIC");
+    return enabled == nullptr || enabled[0] != '0';
+}
+
+static bool hrx_mul_outer_broadcast_enabled() {
+    const char * enabled = std::getenv("HRX_MUL_OUTER");
+    return enabled == nullptr || enabled[0] != '0';
+}
+
+static bool hrx_repeat_dispatch_enabled() {
+    const char * enabled = std::getenv("HRX_ENABLE_REPEAT");
+    return enabled != nullptr && enabled[0] != '0';
+}
+
 // Mirrors match_mul_f32_dispatch() in dispatch-elementwise.cpp. hrx_owned/mul_f32.loom exports two
 // broadcast directions: src1 indexed by column (src1 agrees with src0 on a leading dimension run) and
 // src1 indexed by outer (src1 is 1 on that run and agrees above it). Between them they cover every
@@ -1232,8 +1250,8 @@ static bool hrx_mul_f32_generic_supported(const ggml_tensor * op) {
     int64_t period = 0;
     if (inner_ok && inner == rhs_size && elements % inner == 0) {
         period = inner;
-    } else if (outer_ok && outer_period > 0 && elements % outer_period == 0 &&
-               elements / outer_period == rhs_size) {
+    } else if (hrx_mul_outer_broadcast_enabled() && outer_ok && outer_period > 0 &&
+               elements % outer_period == 0 && elements / outer_period == rhs_size) {
         period = outer_period;
     } else {
         return false;
@@ -1241,6 +1259,49 @@ static bool hrx_mul_f32_generic_supported(const ggml_tensor * op) {
 
     const int64_t outer_count = elements / period;
     return period <= 1048576 && outer_count <= 1048576;
+}
+
+// Mirrors repeat_f32_geometry() / match_repeat_f32_dispatch() in dispatch-elementwise.cpp. The two
+// must agree: a REPEAT this claims but no matcher roots at aborts its whole split.
+static bool hrx_repeat_f32_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[0] == nullptr ||
+        op->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * src = op->src[0];
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    int repeat_axis = -1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (src->ne[i] == op->ne[i]) {
+            continue;
+        }
+        if (src->ne[i] != 1 || op->ne[i] <= 1 || repeat_axis >= 0) {
+            return false;
+        }
+        repeat_axis = i;
+    }
+
+    const int     axis   = repeat_axis < 0 ? GGML_MAX_DIMS : repeat_axis;
+    const int64_t mid    = repeat_axis < 0 ? 1 : op->ne[repeat_axis];
+    int64_t       period = 1;
+    int64_t       outer  = 1;
+    for (int i = 0; i < axis; ++i) {
+        period *= op->ne[i];
+    }
+    for (int i = axis + 1; i < GGML_MAX_DIMS; ++i) {
+        outer *= op->ne[i];
+    }
+
+    if (period <= 0 || mid <= 0 || outer <= 0) {
+        return false;
+    }
+    if (period * mid * outer != ggml_nelements(op) || period * outer != ggml_nelements(src)) {
+        return false;
+    }
+    return period <= 1048576 && mid <= 65536 && outer <= 65536;
 }
 
 static bool hrx_unary_f32_supported(const ggml_tensor * op) {
@@ -1606,6 +1667,97 @@ static bool hrx_ple_stream_reduce_qwen4exp(const ggml_tensor * op) {
     return op != nullptr && op->src[0] != nullptr && op->src[0]->ne[0] == kHrxHiddenSizeQwen4Exp;
 }
 
+// Per-guard bitmask for the generic MUL claim, one bit per shape guard below, in declaration order.
+// Each guard was written for a reason, and a bitmask is what makes a numerical regression here
+// bisectable in a single build instead of one build per guard.
+//
+// The default is 0 -- the generic kernel serves every MUL the guards already allow, and overrides
+// none of their declines. Claiming more than that corrupts the model's output. Bisecting
+// HRX_MUL_CLAIM_MASK against a "capital of France" decode gave:
+//
+//   0x7F  all seven                                       -> garbage
+//   0x70  head_major|qsa_indexer|hc_grouped               -> coherent
+//   0x0C  ple_sqrt_gate|hc_activation                     -> garbage
+//   0x04  ple_sqrt_gate                                   -> coherent  => bit 3 is bad
+//   0x77  all but hc_activation                           -> garbage   => bit 0 or 1 is bad too
+//   0x76  all but hc_activation|gdn_norm_gate             -> garbage   => bit 1 is bad
+//   0x74  ple_sqrt_gate|head_major|qsa_indexer|hc_grouped -> coherent
+//
+// The arithmetic is not the problem: hrx_owned/mul_f32.loom's check cases cover both broadcast
+// directions, test-backend-ops passes same-shape f32 MUL, and the three bad guards select ordinary
+// contiguous elementwise multiplies. HRX_TRACE_DISPATCH=1 shows what actually goes wrong -- claiming
+// them re-partitions the graph enough that four dispatches which fire at 0x00 stop firing at 0x7F:
+//
+//   common.copy_rows_f32           CONT     f32[1,10240,1,1]
+//   common.unary_f32               UNARY    f32[10240,1,1,1]
+//   llm.matmul.dense_q8_0_f16_wmma MUL_MAT  f32[248320,1,1,1]
+//   llm.matmul.dense_q8_0_f16_wmma MUL_MAT  f32[512,1,1,1]
+//
+// Losing a q8_0 weight matmul off the GPU mid-graph explains the corruption on its own.
+//
+// 0x74 is the largest coherent mask, but it is not worth shipping either: a decode census puts it at
+// 1438 splits / 3087 HRX nodes against 1330 / 3050 at 0x00. The 37 MULs it adds are scattered rather
+// than clustered, so each one cuts an otherwise contiguous CPU run in two and costs more in split
+// boundaries than it wins in offloaded work -- the same effect that made an earlier round of
+// scattered coverage 30% slower. Set HRX_MUL_CLAIM_MASK=0x7F to reproduce the corruption.
+static constexpr unsigned kHrxMulClaimMaskDefault = 0x00u;
+
+static unsigned hrx_mul_claim_mask() {
+    const char * mask = std::getenv("HRX_MUL_CLAIM_MASK");
+    if (mask == nullptr) {
+        return kHrxMulClaimMaskDefault;
+    }
+    return static_cast<unsigned>(std::strtoul(mask, nullptr, 0));
+}
+
+// GGML_OP_MUL. Additive over the original guards: every MUL they already allowed stays allowed, and
+// hrx_owned/mul_f32.loom picks up ones they declined. Those guards were written when the only MUL
+// kernel was the one fused into the routed-FFN dispatch, and each node they pushed to the CPU sat as
+// a lone single-node split inside an otherwise contiguous HRX run, costing two split boundaries to
+// run one multiply.
+static bool hrx_mul_supported(const ggml_tensor * op) {
+    const bool declined_by_gdn_norm_gate  = hrx_gdn_norm_gate_row(op);
+    const bool declined_by_stream_major   = hrx_stream_major_mul_qwen4exp(op);
+    const bool declined_by_ple_sqrt_gate  = hrx_ple_signed_sqrt_gate_qwen4exp(op);
+    const bool declined_by_hc_activation  = hrx_hc_dim_activation_mul_qwen4exp(op);
+    const bool declined_by_head_major     = hrx_attention_head_major_qwen4exp(op);
+    const bool declined_by_qsa_indexer    = hrx_qsa_indexer_row_qwen4exp(op);
+    const bool declined_by_hc_grouped     = hrx_hc_grouped_norm_row_qwen4exp(op);
+
+    if (!declined_by_gdn_norm_gate && !declined_by_stream_major && !declined_by_ple_sqrt_gate &&
+        !declined_by_hc_activation && !declined_by_head_major && !declined_by_qsa_indexer &&
+        !declined_by_hc_grouped) {
+        return true;
+    }
+    if (!hrx_mul_generic_claim_enabled() || !hrx_mul_f32_generic_supported(op)) {
+        return false;
+    }
+
+    const unsigned mask = hrx_mul_claim_mask();
+    if (declined_by_gdn_norm_gate && (mask & 0x01u) == 0) {
+        return false;
+    }
+    if (declined_by_stream_major && (mask & 0x02u) == 0) {
+        return false;
+    }
+    if (declined_by_ple_sqrt_gate && (mask & 0x04u) == 0) {
+        return false;
+    }
+    if (declined_by_hc_activation && (mask & 0x08u) == 0) {
+        return false;
+    }
+    if (declined_by_head_major && (mask & 0x10u) == 0) {
+        return false;
+    }
+    if (declined_by_qsa_indexer && (mask & 0x20u) == 0) {
+        return false;
+    }
+    if (declined_by_hc_grouped && (mask & 0x40u) == 0) {
+        return false;
+    }
+    return true;
+}
+
 static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op) {
     GGML_UNUSED(device);
     if (op == nullptr || !eager_capability_declared(op->op)) {
@@ -1812,20 +1964,12 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_ADD:
             return !hrx_add_non_f32(op) && !hrx_qsa_indexer_row_qwen4exp(op);
         case GGML_OP_MUL:
-            // Additive: every MUL the shape guards already allowed stays allowed, and the generic
-            // kernel picks up the ones they declined. Those declines were written when the only MUL
-            // kernel was the one fused into the routed-FFN dispatch; hrx_owned/mul_f32.loom now covers
-            // both broadcast directions, and each of these nodes was sitting as a lone single-node CPU
-            // split inside an otherwise contiguous HRX run, costing two split boundaries apiece.
-            return hrx_mul_f32_generic_supported(op) ||
-                   (!hrx_gdn_norm_gate_row(op) &&
-                    !hrx_stream_major_mul_qwen4exp(op) &&
-                    !hrx_ple_signed_sqrt_gate_qwen4exp(op) && !hrx_hc_dim_activation_mul_qwen4exp(op) &&
-                    !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
-                    !hrx_hc_grouped_norm_row_qwen4exp(op));
+            return hrx_mul_supported(op);
         case GGML_OP_RMS_NORM:
             return !hrx_gdn_norm_gate_row(op) && !hrx_attention_head_major_qwen4exp(op) &&
                    !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op);
+        case GGML_OP_REPEAT:
+            return hrx_repeat_dispatch_enabled() && hrx_repeat_f32_supported(op);
         // VIEW is deliberately absent from these shape guards. It is a pure layout alias that the
         // dispatch scheduler elides rather than dispatching, so HRX can always "run" one -- declining it
         // states a capability HRX does have. It also cannot be declined safely: the KV and QSA caches are

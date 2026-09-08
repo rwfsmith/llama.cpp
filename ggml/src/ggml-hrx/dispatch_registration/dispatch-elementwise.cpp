@@ -25,10 +25,24 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
 namespace ggml::hrx {
+
+// Bisect switches. These mirror identically-named helpers in ggml-hrx.cpp and must stay in lockstep
+// with them: if a capability predicate claims a node the matcher here then declines, the whole split
+// aborts with "unsupported HRX node" rather than falling back for that one node.
+static bool mul_outer_broadcast_enabled() {
+    const char * enabled = std::getenv("HRX_MUL_OUTER");
+    return enabled == nullptr || enabled[0] != '0';
+}
+
+static bool repeat_dispatch_enabled() {
+    const char * enabled = std::getenv("HRX_ENABLE_REPEAT");
+    return enabled != nullptr && enabled[0] != '0';
+}
 
 static constexpr KernelCatalogRef kSigmoidF32Kernel  = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_sigmoid_f32");
 static constexpr KernelCatalogRef kSiluF32Kernel     = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_silu_f32");
@@ -55,6 +69,10 @@ static constexpr int64_t kDenseMatmulF32MaxOutputSize  = 256;
 static constexpr KernelCatalogRef kMulF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_mul_f32");
 static constexpr KernelCatalogRef kMulOuterF32Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_mul_outer_f32");
+static constexpr KernelCatalogRef kRepeatF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_repeat_f32");
+// Matches the index.assume ranges in hrx_owned/repeat_f32.loom.
+static constexpr int64_t kRepeatF32MaxPeriod = 1048576;
+static constexpr int64_t kRepeatF32MaxTile   = 65536;
 // Matches the index.assume ranges in hrx_owned/mul_f32.loom.
 static constexpr int64_t kMulF32MaxExtent = 1048576;
 
@@ -272,6 +290,9 @@ static bool match_mul_f32_dispatch(const DispatchMatchContext & context, Dispatc
         output->element_count % period == 0) {
         outer_count = output->element_count / period;
     } else {
+        if (!mul_outer_broadcast_enabled()) {
+            return false;
+        }
         period = mul_outer_broadcast_period(*lhs, *rhs);
         if (period <= 0 || output->element_count <= 0 || output->element_count % period != 0) {
             return false;
@@ -292,6 +313,98 @@ static bool match_mul_f32_dispatch(const DispatchMatchContext & context, Dispatc
     dispatch.kernel.integer_parameters.emplace("outer_count", outer_count);
     dispatch.bindings.push_back({ lhs->id, 0, lhs->byte_count });
     dispatch.bindings.push_back({ rhs->id, 0, rhs->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
+// Decomposes a GGML_OP_REPEAT into the one form hrx_owned/repeat_f32.loom implements: dst is src
+// tiled along exactly one axis, so dst[outer][mid][i] = src[outer][i]. Returns false for anything
+// else (a repeat along two axes, or a partial tile), which leaves the node on the CPU.
+static bool repeat_f32_geometry(const Value & src,
+                                const Value & dst,
+                                int64_t *     period_out,
+                                int64_t *     mid_out,
+                                int64_t *     outer_out) {
+    int repeat_axis = -1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (src.ne[i] == dst.ne[i]) {
+            continue;
+        }
+        if (src.ne[i] != 1 || dst.ne[i] <= 1 || repeat_axis >= 0) {
+            return false;
+        }
+        repeat_axis = i;
+    }
+
+    // No repeat axis at all is a plain copy; treating it as a single tile keeps the geometry valid.
+    const int     axis   = repeat_axis < 0 ? GGML_MAX_DIMS : repeat_axis;
+    const int64_t mid    = repeat_axis < 0 ? 1 : dst.ne[repeat_axis];
+    int64_t       period = 1;
+    int64_t       outer  = 1;
+    for (int i = 0; i < axis; ++i) {
+        period *= dst.ne[i];
+    }
+    for (int i = axis + 1; i < GGML_MAX_DIMS; ++i) {
+        outer *= dst.ne[i];
+    }
+
+    if (period <= 0 || mid <= 0 || outer <= 0) {
+        return false;
+    }
+    if (period * mid * outer != dst.element_count || period * outer != src.element_count) {
+        return false;
+    }
+    if (period > kRepeatF32MaxPeriod || mid > kRepeatF32MaxTile || outer > kRepeatF32MaxTile) {
+        return false;
+    }
+
+    *period_out = period;
+    *mid_out    = mid;
+    *outer_out  = outer;
+    return true;
+}
+
+// GGML_OP_REPEAT. qwen4exp materialises [n_embd, 1, T] -> [n_embd, hc, T] three times per
+// hyper-connected block; a decode census leaves all 98 of them on the CPU, 96 as lone single-node
+// splits between two HRX runs, which is two split boundaries spent to run one broadcast copy.
+static bool match_repeat_f32_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_REPEAT || node->inputs.size() != 1) {
+        return false;
+    }
+    if (!repeat_dispatch_enabled()) {
+        return false;
+    }
+    const Graph & graph  = context.graph;
+    const Value * input  = elementwise_graph_value(graph, node->inputs[0]);
+    const Value * output = elementwise_graph_value(graph, node->output);
+    if (input == nullptr || output == nullptr) {
+        return false;
+    }
+    if (input->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!input->contiguous || !output->contiguous || input->element_count <= 0 ||
+        output->element_count <= 0) {
+        return false;
+    }
+
+    int64_t period = 0;
+    int64_t mid    = 0;
+    int64_t outer  = 0;
+    if (!repeat_f32_geometry(*input, *output, &period, &mid, &outer)) {
+        return false;
+    }
+
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kRepeatF32Kernel);
+    dispatch.kernel.integer_parameters.emplace("period", period);
+    dispatch.kernel.integer_parameters.emplace("mid_count", mid);
+    dispatch.kernel.integer_parameters.emplace("outer_count", outer);
+    dispatch.bindings.push_back({ input->id, 0, input->byte_count });
     dispatch.bindings.push_back({ output->id, 0, output->byte_count });
 
     match.covered_nodes.push_back(context.root_index);
@@ -434,6 +547,14 @@ void register_elementwise_dispatches(DispatchRegistryBuilder & registry) {
         0,
         DispatchSource::Common,
         match_mul_f32_dispatch,
+    });
+    registry.add({
+        "common.repeat_f32",
+        GGML_OP_REPEAT,
+        DispatchMatchKind::SingleOp,
+        0,
+        DispatchSource::Common,
+        match_repeat_f32_dispatch,
     });
     registry.add({
         // Priority 0 for the same reason as the activations: the quantized dense routes and the fused
