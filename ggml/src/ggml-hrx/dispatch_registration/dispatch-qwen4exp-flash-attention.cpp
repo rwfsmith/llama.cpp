@@ -6,7 +6,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -171,12 +174,32 @@ struct Qwen4ExpFlashAttentionGateMatch {
     }
 };
 
+static bool trace_qsa_attention_enabled() {
+    const char * value = std::getenv("HRX_TRACE_QSA_ATTN");
+    return value != nullptr && value[0] != '0';
+}
+
+// Reports the first predicate that rejected a FLASH_ATTN_EXT, once per distinct stage. The abort
+// message for an unmatched node only names the node, which is not enough to tell which of the dozen
+// shape/layout/topology conditions below actually failed.
+static Qwen4ExpFlashAttentionGateMatch qsa_attention_decline(const char * stage) {
+    if (trace_qsa_attention_enabled()) {
+        static std::set<std::string> seen;
+        if (seen.insert(stage).second) {
+            std::fprintf(stderr, "HRX qsa_attn decline: %s\n", stage);
+        }
+    }
+    return {};
+}
+
 static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const Graph &     graph,
                                                                            const GraphNode * node) {
     Qwen4ExpFlashAttentionGateMatch match;
-    if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT || node->inputs.size() != 4 ||
-        !has_qwen4exp_flash_attention_params(*node)) {
+    if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT || node->inputs.size() != 4) {
         return match;
+    }
+    if (!has_qwen4exp_flash_attention_params(*node)) {
+        return qsa_attention_decline("flash_attention_params");
     }
 
     const Value * query        = graph_value(graph, node->inputs[0]);
@@ -185,19 +208,19 @@ static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const
     const Value * mask         = graph_value(graph, node->inputs[3]);
     const Value * flash_output = graph_value(graph, node->output);
     if (query == nullptr || key == nullptr || value == nullptr || mask == nullptr || flash_output == nullptr) {
-        return {};
+        return qsa_attention_decline("missing_operand");
     }
     if (query->type != GGML_TYPE_F32 || key->type != GGML_TYPE_F16 || value->type != GGML_TYPE_F16 ||
         mask->type != GGML_TYPE_F16 || flash_output->type != GGML_TYPE_F32) {
-        return {};
+        return qsa_attention_decline("operand_types");
     }
     if (query->ne[0] != kQwen4ExpAttentionHeadSize || key->ne[0] != kQwen4ExpAttentionHeadSize ||
         value->ne[0] != kQwen4ExpAttentionHeadSize || flash_output->ne[0] != kQwen4ExpAttentionHeadSize) {
-        return {};
+        return qsa_attention_decline("head_size");
     }
     if (query->ne[3] != 1 || key->ne[3] != 1 || value->ne[3] != 1 || flash_output->ne[3] != 1 || mask->ne[2] != 1 ||
         mask->ne[3] != 1) {
-        return {};
+        return qsa_attention_decline("trailing_dims");
     }
 
     const int64_t query_token_count     = query->ne[1];
@@ -211,12 +234,12 @@ static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const
         key_value_capacity < key_value_token_count || value->ne[1] != key_value_capacity ||
         value->ne[2] != key_value_head_count || mask->ne[1] != query_token_count ||
         flash_output->ne[1] != query_head_count || flash_output->ne[2] != query_token_count) {
-        return {};
+        return qsa_attention_decline("counts");
     }
     if (!has_query_layout(*query, query_head_count) || !has_key_value_layout(*key, key_value_head_count) ||
         !has_key_value_layout(*value, key_value_head_count) || !has_mask_layout(*mask, key_value_token_count) ||
         !has_output_layout(*flash_output, query_head_count)) {
-        return {};
+        return qsa_attention_decline("operand_layout");
     }
 
     // qwen4exp.cpp's build_layer_attn is the only consumer of build_attn_mha's raw output (it is
@@ -224,13 +247,13 @@ static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const
     // consumer so this fused dispatch can never silently drop some other reader of the raw,
     // pre-gate attention value.
     if (graph.index().consumers(flash_output->id).size() != 1) {
-        return {};
+        return qsa_attention_decline("flash_output_consumer_count");
     }
     const GraphNode * output_layout = find_single_layout_alias_consumer(graph, flash_output->id);
     const GraphNode * mul_node =
         find_single_consumer_with_op_through_layout_aliases(graph, flash_output->id, GGML_OP_MUL);
     if (output_layout == nullptr || mul_node == nullptr || mul_node->inputs.size() != 2) {
-        return {};
+        return qsa_attention_decline(output_layout == nullptr ? "no_output_layout_alias" : "no_gate_mul");
     }
 
     const ValueId reshaped_output = output_layout->output;
@@ -240,7 +263,7 @@ static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const
     } else if (mul_node->inputs[1] == reshaped_output) {
         gate_id = mul_node->inputs[0];
     } else {
-        return {};
+        return qsa_attention_decline("gate_operand_position");
     }
 
     const Value * gate         = graph_value(graph, gate_id);
@@ -252,7 +275,7 @@ static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const
         gated_output->ne[2] != 1 || gated_output->ne[3] != 1 ||
         !has_flat_hidden_layout(*gate, kQwen4ExpHiddenSize) ||
         !has_flat_hidden_layout(*gated_output, kQwen4ExpHiddenSize)) {
-        return {};
+        return qsa_attention_decline("gate_or_output_layout");
     }
 
     // Defensive check confirming the gate operand really is a sigmoid (qwen4exp.cpp's
@@ -264,7 +287,7 @@ static Qwen4ExpFlashAttentionGateMatch match_qwen4exp_flash_attention_gate(const
                                                                      : nullptr;
     if (gate_producer == nullptr || gate_producer->op != GGML_OP_UNARY || gate_unary_params == nullptr ||
         gate_unary_params->op != GGML_UNARY_OP_SIGMOID) {
-        return {};
+        return qsa_attention_decline("gate_not_sigmoid");
     }
 
     match.query                 = query;

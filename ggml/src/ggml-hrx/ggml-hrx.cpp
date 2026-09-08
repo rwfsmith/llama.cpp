@@ -1622,6 +1622,13 @@ static bool hrx_gdn_unary_decode_supported(const ggml_tensor * op) {
 static constexpr int64_t kHrxAttentionHeadSizeQwen4Exp = 256;
 static constexpr int64_t kHrxIndexerKeyLengthQwen4Exp  = 128;
 
+// QSA's flat hidden width, n_head * n_embd_head_v == 24 * 256. Mirrors kQwen4ExpHiddenSize in
+// dispatch-qwen4exp-flash-attention.cpp. Numerically identical to the flattened GDN value stream
+// (kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp == 128 * 48), which is why the two gates
+// have to be told apart by provenance rather than by shape.
+static constexpr int64_t kQwen4ExpQueryHeadCount = 24;
+static constexpr int64_t kQwen4ExpQsaHiddenSize  = kQwen4ExpQueryHeadCount * kHrxAttentionHeadSizeQwen4Exp;
+
 // qwen4exp Hyper-Connections geometry: hparams.dsv4_hc_mult == 4 parallel [n_embd] residual streams,
 // so the flattened stream layout is hc_dim == 4*2560 == 10240 wide.
 static constexpr int64_t kHrxHcMultiplierQwen4Exp = 4;
@@ -1733,6 +1740,8 @@ static bool hrx_gdn_norm_gate_dispatch_enabled() {
     return enabled != nullptr && enabled[0] != '0';
 }
 
+static bool hrx_qsa_output_gate_mul_qwen4exp(const ggml_tensor * op);
+
 static bool hrx_gdn_norm_gate_row(const ggml_tensor * op) {
     if (op == nullptr) {
         return false;
@@ -1743,6 +1752,12 @@ static bool hrx_gdn_norm_gate_row(const ggml_tensor * op) {
     // Same gate, flattened. llama.cpp reshapes the gated value stream to [head_dim*value_head_count, T]
     // before the out projection, so the identical MUL also shows up as a plain 6144-wide row feeding a
     // MUL_MAT. qwen4exp.gdn_norm_gate_decode does not cover it.
+    //
+    // QSA's output gate is the same width by coincidence (24*256 == 128*48) but is a different tensor
+    // with a real dispatch, so exempt it -- see hrx_qsa_output_gate_mul_qwen4exp.
+    if (hrx_qsa_output_gate_mul_qwen4exp(op)) {
+        return false;
+    }
     return op->ne[0] == kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp && op->ne[1] == 1 &&
            op->ne[2] == 1 && op->ne[3] == 1;
 }
@@ -1767,6 +1782,62 @@ static bool hrx_hc_grouped_norm_row_qwen4exp(const ggml_tensor * op) {
 // preamble on the CPU costs one small transfer per attention layer and nothing else.
 static bool hrx_attention_head_major_qwen4exp(const ggml_tensor * op) {
     return op != nullptr && op->ne[0] == kHrxAttentionHeadSizeQwen4Exp;
+}
+
+// Set HRX_ENABLE_QSA_ATTN=1 to lift the FLASH_ATTN_EXT decline below and let the qwen4exp attention
+// fusion be attempted. Default off until the fusion is proven end to end.
+static bool hrx_qsa_attention_dispatch_enabled() {
+    const char * enabled = std::getenv("HRX_ENABLE_QSA_ATTN");
+    return enabled != nullptr && enabled[0] != '0';
+}
+
+// Walk back through pure-layout nodes looking for the op that actually produced a value. Layout
+// aliases (reshape/view/permute/transpose/cont) keep the producer in src[0], so a few hops are enough
+// to tell two same-shaped tensors apart by provenance.
+static bool hrx_layout_chain_produced_by(const ggml_tensor * t, ggml_op producer_op) {
+    for (int hop = 0; hop < 5 && t != nullptr; ++hop) {
+        if (t->op == producer_op) {
+            return true;
+        }
+        switch (t->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+                t = t->src[0];
+                break;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+// qwen4exp's QSA output gate, MUL(reshape_2d(FLASH_ATTN_EXT result), sigmoid(gate)). It collides
+// exactly with the flattened GDN gate declined above: QSA's hidden width is
+// kQwen4ExpQueryHeadCount * kHrxAttentionHeadSizeQwen4Exp = 24 * 256 = 6144, and GDN's flattened
+// value stream is kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp = 128 * 48 = 6144. The two
+// are only separable by provenance, so key on the FLASH_ATTN_EXT behind the reshape.
+//
+// This MUL has to stay claimable for the attention fusion to exist at all: the qwen4exp flash
+// attention match covers FLASH_ATTN_EXT + the reshape + this MUL (it binds the MUL's other operand as
+// the kernel's `gate`), and a node the CPU owns is never offered to HRX in the first place. Declining
+// it is what left match_qwen4exp_flash_attention_gate unable to find its mul_node.
+static bool hrx_qsa_output_gate_mul_qwen4exp(const ggml_tensor * op) {
+    if (!hrx_qsa_attention_dispatch_enabled()) {
+        return false;
+    }
+    if (op == nullptr || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (op->ne[1] != 1 || op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    if (op->ne[0] != kQwen4ExpQsaHiddenSize) {
+        return false;
+    }
+    return hrx_layout_chain_produced_by(op->src[0], GGML_OP_FLASH_ATTN_EXT);
 }
 
 // Walk back through pure-layout nodes looking for a tensor of the given row width. A cache publish
@@ -1823,15 +1894,47 @@ static bool hrx_cache_publish_unmatched_qwen4exp(const ggml_tensor * op) {
     return source->ne[0] == 1;
 }
 
-// HRX's attention kernels (attention_decode*.loom / attention_prefill*.loom) are all written against
-// kQwenAttentionHeadSize == 128 -- the head size is baked into their tiling, so every attention matcher
-// rejects anything else. qwen4exp's build_attn_qsa() runs 256-wide heads, which no matcher can root at.
+// HRX's qwen3_moe attention kernels (attention_decode*.loom / attention_prefill*.loom) are all
+// written against kQwenAttentionHeadSize == 128 -- the head size is baked into their tiling, so every
+// qwen3_moe attention matcher rejects anything else.
 //
-// This used to be masked by input locality: the QSA mask is a non-f32 ADD that now correctly stays on
-// the CPU, which pulled the FLASH_ATTN_EXT to the head of its own split and turned the over-claim into
-// "unsupported HRX node 0: FLASH_ATTN_EXT f32[256,24]". Scoped to the 256-wide head so qwen30b, whose
-// heads are 128 wide and do have kernels, is untouched.
+// qwen4exp's build_attn_qsa() runs 256-wide heads. Note that this is NOT simply "no kernel exists":
+// kernels/qwen_moe/qwen4exp/attention_decode*.loom are written for 256-wide heads with 24 query and 2
+// KV heads, and dispatch-qwen4exp-flash-attention.cpp registers matchers for them. The decline is
+// here because those matchers do not currently fire on this graph, and a FLASH_ATTN_EXT that HRX
+// claims but no matcher roots at is a hard "unsupported HRX node 0: FLASH_ATTN_EXT f32[256,24]"
+// abort rather than a CPU fallback.
+//
+// Measured blocker chain as of this change (HRX_ENABLE_QSA_ATTN=1 HRX_TRACE_QSA_ATTN=1):
+//
+//  1. [fixed] The gated MUL was declined by hrx_gdn_norm_gate_row's flattened arm, because QSA's
+//     hidden width collides exactly with the flattened GDN value stream (24*256 == 128*48 == 6144).
+//     hrx_qsa_output_gate_mul_qwen4exp now exempts it by provenance, and the scheduler does place
+//     attn_gated on HRX once it is claimed.
+//  2. [open] The match still declines at "no_gate_mul": ggml cuts the split immediately after the
+//     reshape, so HRX receives only "FLASH_ATTN_EXT[256,24,1,1] RESHAPE[6144,1,1,1] VIEW[256,24,1,1]"
+//     and the MUL is in the next split. The cut is forced by the gate operand. qwen4exp.cpp:798
+//     builds the gate as a strided ggml_view_3d of the interleaved wq projection (row 256, row stride
+//     512 floats) and then ggml_cont_2d's it to [6144,1]. hrx_copy_f32_supported accepts a
+//     row-strided copy only when the geometry matches on both sides
+//     ("op->ne[0] == source->ne[0] && op->ne[1] == source->ne[1]"), and this one flattens [256,24]
+//     to [6144,1], so the CONT stays on the CPU and a CPU->HRX copy has to land between the reshape
+//     and the MUL.
+//
+//     The bytes are actually identical -- a contiguous destination makes "24 rows of 256" and "one
+//     row of 6144" the same write -- so the fix is to let hrx_copy_f32_supported accept a
+//     row-copyable source flattened into a fully contiguous destination of equal element count. That
+//     must be done together with dispatch-copy.cpp, which derives the row geometry it binds from the
+//     op rather than the source; binding [6144,1] against a strided [256,24] source would read the
+//     wrong bytes. Do not relax the capability without changing the matcher to key on the source.
+//
+// Set HRX_ENABLE_QSA_ATTN=1 to lift the decline and reproduce the above; combine with
+// HRX_SURVEY_UNSUPPORTED=1 to collect diagnostics without aborting. Scoped to the 256-wide head so
+// qwen30b, whose heads are 128 wide, is untouched.
 static bool hrx_attention_head_size_unsupported(const ggml_tensor * op) {
+    if (hrx_qsa_attention_dispatch_enabled()) {
+        return false;
+    }
     const ggml_tensor * query = op == nullptr ? nullptr : op->src[0];
     return query != nullptr && query->ne[0] == kHrxAttentionHeadSizeQwen4Exp;
 }
