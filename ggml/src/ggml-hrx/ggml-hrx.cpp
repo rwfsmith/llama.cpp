@@ -14,6 +14,7 @@
 #include "runtime/transient-arena.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -569,6 +570,98 @@ struct hrx_verify_capture {
     int                 node_index    = 0;
 };
 
+// HRX_DUMP_ROUTER=<layer>: after a split runs, print the MoE routing tensors for that layer, whether
+// they were produced here or arrived as split inputs from the CPU. Running the same prompt with the
+// router claimed and declined and diffing these is the only direct way to tell "the fused router wrote
+// the wrong ids/weights" apart from "the ids/weights are right and something downstream regressed".
+static int hrx_dump_router_layer() {
+    static const int layer = [] {
+        const char * value = std::getenv("HRX_DUMP_ROUTER");
+        if (value == nullptr || value[0] == '\0') {
+            return -1;
+        }
+        return std::atoi(value);
+    }();
+    return layer;
+}
+
+static bool hrx_read_tensor_i32(ggml_backend_hrx_context * context,
+                                const ggml_tensor *        tensor,
+                                std::vector<int32_t> &     out) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    out.resize(bytes / sizeof(int32_t));
+    ggml_backend_hrx_buffer_context * tensor_context = nullptr;
+    size_t                            tensor_offset  = 0;
+    if (ggml_backend_hrx_tensor_binding(tensor, &tensor_context, &tensor_offset)) {
+        return HRX_CHECK(
+            hrx_synchronous_d2h(context->device->device, tensor_context->buffer, tensor_offset, out.data(), bytes));
+    }
+    ggml_backend_buffer_t buffer = tensor->view_src != nullptr ? tensor->view_src->buffer : tensor->buffer;
+    if (buffer == nullptr || !ggml_backend_buffer_is_host(buffer) || tensor->data == nullptr) {
+        return false;
+    }
+    std::memcpy(out.data(), tensor->data, bytes);
+    return true;
+}
+
+static void hrx_dump_router_tensors(ggml_backend_hrx_context * context, const ggml_cgraph & graph) {
+    const int layer = hrx_dump_router_layer();
+    if (layer < 0) {
+        return;
+    }
+    static std::set<std::string> reported;
+    char                         topk_name[64];
+    char                         norm_name[64];
+    char                         logits_name[64];
+    std::snprintf(topk_name, sizeof(topk_name), "ffn_moe_topk-%d", layer);
+    std::snprintf(norm_name, sizeof(norm_name), "ffn_moe_weights_norm-%d", layer);
+    std::snprintf(logits_name, sizeof(logits_name), "ffn_moe_logits-%d", layer);
+    for (int i = 0; i < graph.n_nodes; ++i) {
+        const ggml_tensor * node = graph.nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+        // Routing tensors reach a split either as a node it computes or as an input it only reads, so
+        // both have to be inspected -- with the router declined, ffn_moe_topk is purely an input here.
+        for (int s = -1; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * t = s < 0 ? node : node->src[s];
+            if (t == nullptr) {
+                continue;
+            }
+            const bool is_topk   = std::strcmp(t->name, topk_name) == 0;
+            const bool is_norm   = std::strcmp(t->name, norm_name) == 0;
+            const bool is_logits = std::strcmp(t->name, logits_name) == 0;
+            if ((!is_topk && !is_norm && !is_logits) || !reported.insert(t->name).second) {
+                continue;
+            }
+            if (is_topk) {
+                std::vector<int32_t> ids;
+                if (hrx_read_tensor_i32(context, t, ids)) {
+                    std::string text;
+                    for (size_t k = 0; k < ids.size() && k < 10; ++k) {
+                        text += " " + std::to_string(ids[k]);
+                    }
+                    GGML_LOG_ERROR("HRX router dump %s ids:%s\n", t->name, text.c_str());
+                }
+                continue;
+            }
+            std::vector<float> values;
+            if (hrx_read_tensor_f32(context, t, values)) {
+                std::string text;
+                char        item[32];
+                for (size_t k = 0; k < values.size() && k < 10; ++k) {
+                    std::snprintf(item, sizeof(item), " %.6f", values[k]);
+                    text += item;
+                }
+                GGML_LOG_ERROR("HRX router dump %s:%s\n", t->name, text.c_str());
+            }
+        }
+    }
+}
+
 static bool hrx_verify_enabled() {
     static const bool enabled = environment_flag_enabled("HRX_VERIFY_NODES");
     return enabled;
@@ -678,6 +771,7 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     // any host readback are guaranteed to see completed work.
     HRX_CHECK(hrx_stream_synchronize(context->stream));
     hrx_verify_after(context, captures);
+    hrx_dump_router_tensors(context, *graph);
     return result.code;
 }
 
@@ -1105,32 +1199,66 @@ static bool hrx_moe_down_chain_fusable_qwen4exp(const ggml_tensor * op) {
            hrx_moe_gate_up_weight_qwen4exp(gate->src[0]) && hrx_moe_gate_up_weight_qwen4exp(up->src[0]);
 }
 
-// qwen4exp's MoE router row: the [n_expert=512, T] gate logits/probabilities and their ARGSORT.
-// dispatch-moe-router.cpp's only matcher roots at the router SOFT_MAX and is written against the
-// qwen30b router profile (128 experts, top-8, ARGSORT + GET_ROWS of reshaped probabilities);
-// qwen4exp routes 10 of 512 through a different top-k topology, so that matcher rejects it --
-// "MoE router top-k matcher rejected node: missing GET_ROWS from reshaped probabilities and top-k
-// ids" -- leaving the node stranded and failing the whole graph with compute status -1.
+// qwen4exp's MoE router chain -- SOFT_MAX over the [n_expert=512, T] gate logits, its descending
+// ARGSORT, the GET_ROWS that selects the top-k probabilities, and the SUM_ROWS/CLAMP/DIV that
+// normalize them. dispatch-moe-router.cpp's matcher fuses all of these into one
+// "qwen3_moe_router_top8_f32" dispatch, and although it was written for qwen30b it is entirely
+// generic: expert_count and route_count are read off the graph and the kernel accepts 32..512 experts
+// and 1..32 routes, which covers qwen4exp's 10-of-512 exactly.
 //
-// This only became reachable once the routed FFN itself moved onto HRX. With the entire MoE block on
-// the CPU the scheduler left the router beside it; with gate/up/down claimed, the router gets pulled
-// across with them. n_expert=512 is qwen4exp-specific (qwen30b has 128), so other models are
-// untouched, and this restores the placement these nodes had before the routed FFN moved.
+// The catch is that the matcher can only see nodes in its own split, so the chain has to be claimed
+// all-or-nothing: claim only some and the matcher rejects the rest, strand them and the graph fails
+// outright. That is what happened on the first attempt here, where the router was pulled onto HRX by
+// the routed FFN moving but GET_ROWS stayed on the CPU -- "MoE router top-k matcher rejected node:
+// missing GET_ROWS from reshaped probabilities and top-k ids". So all six ops are gated together
+// behind one switch, and HRX_ENABLE_QWEN4EXP_ROUTER=0 sends the whole chain back to the CPU without a
+// rebuild if it ever regresses.
+//
+// Leaving it on the CPU is expensive well beyond the ops themselves: it puts a CPU island in the
+// middle of every one of the 48 layers, and each island costs two split boundaries plus the copies
+// across them.
+static bool hrx_qwen4exp_router_dispatch_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_ENABLE_QWEN4EXP_ROUTER");
+        return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
+}
+
+// Bisect knob: HRX_DECLINE_MUL_MAT_NE0 is a comma-separated list of MUL_MAT output widths to decline,
+// e.g. "512,640". Declining sends just those nodes to the CPU without disturbing anything else, which
+// is the only way to isolate a dense matmul that the scheduler pulled onto HRX as a side effect of a
+// neighbouring chain moving. Unset means decline nothing, so this costs nothing in a normal run.
+static bool hrx_mul_mat_ne0_declined(const ggml_tensor * op) {
+    static const std::vector<int64_t> declined = [] {
+        std::vector<int64_t> values;
+        const char *         list = std::getenv("HRX_DECLINE_MUL_MAT_NE0");
+        for (const char * cursor = list; cursor != nullptr && *cursor != '\0';) {
+            char *        end   = nullptr;
+            const int64_t value = std::strtoll(cursor, &end, 10);
+            if (end == cursor) {
+                break;
+            }
+            values.push_back(value);
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+        return values;
+    }();
+    if (declined.empty() || op == nullptr) {
+        return false;
+    }
+    return std::find(declined.begin(), declined.end(), op->ne[0]) != declined.end();
+}
+
+// The [n_expert=512, T] router row: the SOFT_MAX over the gate logits and its ARGSORT.
+// n_expert=512 is qwen4exp-specific (qwen30b has 128), so other models keep the permissive default.
 static bool hrx_moe_router_row_qwen4exp(const ggml_tensor * op) {
     return op != nullptr && op->ne[0] == kHrxMoeGateUpExpertCountQwen4Exp && op->ne[2] == 1 && op->ne[3] == 1;
 }
 
-// qwen4exp's routed-FFN route-weight normalization: SUM_ROWS reduces the [route_count, T] top-k
-// weights to [1, T], a CLAMP applies the epsilon floor to that sum, and a DIV normalizes the weights
-// by it. In qwen30b this trio is folded into the MoE router / routed-FFN dispatches; for qwen4exp the
-// router has no matcher at all, and match_routed_ffn_down_weighted_reduce_topology_qwen4exp() covers
-// only the *output* side of the reduce (the weighted MUL, its per-expert views, and the ADD tree), so
-// nothing roots at any of these. Claiming one strands it -- "unsupported HRX node 0: SUM_ROWS
-// output=f32[1,1,1,1] inputs=[f32[10,1,1,1]] consumers=[CLAMP]".
-//
-// Like the router row above, these only became reachable once the routed FFN moved onto HRX and the
-// scheduler began pulling their split across with it; route_count=10 is qwen4exp-specific (qwen30b
-// routes 8), so the qwen30b fusions that legitimately cover these nodes are untouched.
+// The route-weight normalization trio: SUM_ROWS reduces the [route_count, T] top-k weights to [1, T],
+// CLAMP applies the epsilon floor, and DIV normalizes the weights by it. route_count=10 is
+// qwen4exp-specific (qwen30b routes 8), so the qwen30b fusions that cover these are untouched.
 static bool hrx_moe_route_weight_norm_qwen4exp(const ggml_tensor * op) {
     const ggml_tensor * src = op == nullptr ? nullptr : op->src[0];
     if (src == nullptr || op->ne[2] != 1 || op->ne[3] != 1) {
@@ -1141,6 +1269,20 @@ static bool hrx_moe_route_weight_norm_qwen4exp(const ggml_tensor * op) {
     }
     return src->op == GGML_OP_SUM_ROWS && src->src[0] != nullptr &&
            src->src[0]->ne[0] == kHrxMoeRouteCountQwen4Exp;
+}
+
+// The GET_ROWS in the middle of the chain: it gathers the top-k probabilities out of the reshaped
+// [1, n_expert, T] softmax output using the [route_count, T] top-k ids. It is not an embedding lookup,
+// so hrx_non_leaf_gather_qwen4exp() declines it by default; carve it out by that exact shape triple.
+static bool hrx_moe_router_gather_qwen4exp(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * probs = op->src[0];
+    const ggml_tensor * ids   = op->src[1];
+    return op->ne[0] == 1 && op->ne[1] == kHrxMoeRouteCountQwen4Exp && probs->ne[0] == 1 &&
+           probs->ne[1] == kHrxMoeGateUpExpertCountQwen4Exp && ids->type == GGML_TYPE_I32 &&
+           ids->ne[0] == kHrxMoeRouteCountQwen4Exp;
 }
 
 // qwen4exp GDN (Gated DeltaNet) decode-only shape profile: head_k_dim == head_v_dim == 128
@@ -1944,12 +2086,13 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_GET_ROWS:
             return op->src[0] == nullptr ||
                    (!hrx_dispatch_group_disabled("embed") && hrx_weight_quant_supported(op->src[0]->type) &&
-                    !hrx_non_leaf_gather_qwen4exp(op));
+                    (!hrx_non_leaf_gather_qwen4exp(op) ||
+                     (hrx_qwen4exp_router_dispatch_enabled() && hrx_moe_router_gather_qwen4exp(op))));
         case GGML_OP_MUL_MAT:
             if (op->src[0] == nullptr) {
                 return true;
             }
-            if (hrx_dispatch_group_disabled("matmul")) {
+            if (hrx_dispatch_group_disabled("matmul") || hrx_mul_mat_ne0_declined(op)) {
                 return false;
             }
             // Q8_0 has exactly one dense matcher, so its shape guards must be replicated here to
@@ -2084,18 +2227,20 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             return !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
                    !hrx_hc_grouped_norm_row_qwen4exp(op);
         case GGML_OP_CLAMP:
-            return !hrx_ple_signed_sqrt_gate_qwen4exp(op) && !hrx_moe_route_weight_norm_qwen4exp(op);
+            return !hrx_ple_signed_sqrt_gate_qwen4exp(op) &&
+                   (hrx_qwen4exp_router_dispatch_enabled() || !hrx_moe_route_weight_norm_qwen4exp(op));
         case GGML_OP_SUM_ROWS:
-            return !hrx_ple_stream_reduce_qwen4exp(op) && !hrx_moe_route_weight_norm_qwen4exp(op);
+            return !hrx_ple_stream_reduce_qwen4exp(op) &&
+                   (hrx_qwen4exp_router_dispatch_enabled() || !hrx_moe_route_weight_norm_qwen4exp(op));
         case GGML_OP_DIV:
-            return !hrx_moe_route_weight_norm_qwen4exp(op);
+            return hrx_qwen4exp_router_dispatch_enabled() || !hrx_moe_route_weight_norm_qwen4exp(op);
         case GGML_OP_SET_ROWS:
             return !hrx_cache_publish_unmatched_qwen4exp(op);
         case GGML_OP_GLU:
             return !hrx_moe_glu_qwen4exp_decode(op);
         case GGML_OP_SOFT_MAX:
         case GGML_OP_ARGSORT:
-            return !hrx_moe_router_row_qwen4exp(op);
+            return hrx_qwen4exp_router_dispatch_enabled() || !hrx_moe_router_row_qwen4exp(op);
         default:
             return true;
     }

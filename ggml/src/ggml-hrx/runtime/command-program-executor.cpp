@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -18,6 +19,50 @@ namespace ggml::hrx {
 static bool hrx_environment_flag(const char * name) {
     const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool trace_launch_enabled() {
+    static const bool enabled = hrx_environment_flag("HRX_TRACE_LAUNCH");
+    return enabled;
+}
+
+static void trace_kernel_preparation(const KernelDefinition & definition, const Dispatch & dispatch) {
+    if (!trace_launch_enabled()) {
+        return;
+    }
+    std::ostringstream out;
+    out << "HRX launch prepare " << definition.family << '/' << definition.name << " id=" << dispatch.kernel.kernel_id;
+    for (const auto & entry : dispatch.kernel.integer_parameters) {
+        out << ' ' << entry.first << '=' << entry.second;
+    }
+    for (const auto & entry : dispatch.kernel.compile_parameters) {
+        out << ' ' << entry.first << '=' << entry.second;
+    }
+    for (const DispatchBinding & binding : dispatch.bindings) {
+        out << " bind[v" << binding.value.value << " +" << binding.offset << " " << binding.length << "B]";
+    }
+    GGML_LOG_ERROR("%s\n", out.str().c_str());
+}
+
+static void trace_kernel_record(const PreparedCommand & command, const std::vector<hrx_buffer_ref_t> & refs) {
+    if (!trace_launch_enabled() || command.kernel.executable == nullptr) {
+        return;
+    }
+    const ggml_hrx_loom_jit_launch_config & launch = command.kernel.executable->launch;
+    std::ostringstream                      out;
+    out << "HRX launch record ord=" << command.ordinal << " id=" << command.kernel.specialization.kernel_id << " grid="
+        << launch.workgroup_count[0] << 'x' << launch.workgroup_count[1] << 'x' << launch.workgroup_count[2]
+        << " wg=" << launch.workgroup_size[0] << 'x' << launch.workgroup_size[1] << 'x' << launch.workgroup_size[2]
+        << " sg=" << launch.subgroup_size << " constants=" << command.kernel.constants.size() << "B";
+    for (size_t i = 0; i + sizeof(uint32_t) <= command.kernel.constants.size(); i += sizeof(uint32_t)) {
+        uint32_t word = 0;
+        std::memcpy(&word, command.kernel.constants.data() + i, sizeof(word));
+        out << ' ' << word;
+    }
+    for (const hrx_buffer_ref_t & ref : refs) {
+        out << " ref[" << ref.buffer << " +" << ref.offset << " " << ref.length << "B]";
+    }
+    GGML_LOG_ERROR("%s\n", out.str().c_str());
 }
 
 PreparedProgramConstantBuffer::~PreparedProgramConstantBuffer() {
@@ -740,6 +785,7 @@ static Status prepare_kernel_command(const CommandProgramExecutionContext & cont
     }
 
     prepared       = make_prepared_command_shape(command);
+    trace_kernel_preparation(*resolved.definition, dispatch);
     executable_ref = context.kernel_executables->get_or_compile(
         { context.device, context.target }, *resolved.definition, dispatch, prepared.kernel.constants);
     if (!executable_ref.valid()) {
@@ -766,6 +812,8 @@ static bool execute_prepared_kernel_command(const CommandProgramExecutionContext
     for (const PreparedCommandBinding & binding : command.kernel.bindings) {
         refs.push_back({ binding.ref.buffer, binding.ref.offset, binding.ref.length });
     }
+
+    trace_kernel_record(command, refs);
 
     const KernelExecutable & executable = *command.kernel.executable;
     hrx_dispatch_config_t    config     = {
@@ -930,6 +978,7 @@ static Status record_prepared_kernel_command(hrx_graph_t                  graph,
     if (!status.success()) {
         return status;
     }
+    trace_kernel_record(command, refs);
 
     const KernelExecutable & executable = *command.kernel.executable;
     hrx_graph_kernel_node_attrs_t attrs = {

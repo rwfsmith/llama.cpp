@@ -78,6 +78,7 @@ static constexpr KernelCatalogRef kQwenRoutedDownIQ4NLKernel =
 static constexpr KernelCatalogRef kGgmlQuantizeQ8_1X4F32Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_quantize_q8_1_x4_f32");
 static constexpr KernelCatalogRef kZeroF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_zero_f32");
+static constexpr KernelCatalogRef kCopyF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_copy_f32");
 
 static constexpr const LlmMoeDispatchProfile & kRoutedFfnProfile                 = kActiveLlmMoeDispatchProfile;
 static constexpr int64_t                       kRoutedFfnInputSize               = kRoutedFfnProfile.hidden_size;
@@ -89,6 +90,27 @@ static constexpr const char *                  kRoutedFfnF16GateUpOutputName    
 static constexpr const char *                  kRoutedFfnF16RoutedDownOutputName = "qwen.moe.routed_down_f16";
 static constexpr const char *                  kRoutedFfnQ8GateUpOutputName      = "qwen.decode.moe.gate_up_swiglu_q8";
 static constexpr const char *                  kRoutedFfnQ8HiddenOutputName      = "qwen.decode.moe.hidden_q8";
+static constexpr const char * kRoutedFfnStagedDownOutputName = "qwen.moe.routed_down_staged_output";
+
+// ggml-alloc recycles a tensor's buffer as soon as its last *node-level* consumer has run, so a
+// fused dispatch that keeps one of its inputs live across several ggml nodes can find its own
+// destination sitting on top of that input. That is exactly what happens once the MoE router runs on
+// HRX: ffn_moe_argsort/ffn_moe_weights_norm die at the routed-down node, so the allocator lands
+// ffn_moe_out on their bytes, and the fused kernel then reads the route ids and weights out of the
+// same range it accumulates into (the zero-fill below wipes them outright). Detecting that needs the
+// ggml addresses rather than HRX storage roots: aliased tensors keep distinct roots in the ValueMap
+// but share one tensor->data.
+static bool ggml_storage_overlaps(const Value * lhs, size_t lhs_bytes, const Value * rhs, size_t rhs_bytes) {
+    if (lhs == nullptr || rhs == nullptr || lhs->tensor == nullptr || rhs->tensor == nullptr) {
+        return false;
+    }
+    if (lhs->tensor->buffer != rhs->tensor->buffer || lhs->tensor->data == nullptr || rhs->tensor->data == nullptr) {
+        return false;
+    }
+    const auto * lhs_begin = static_cast<const uint8_t *>(lhs->tensor->data);
+    const auto * rhs_begin = static_cast<const uint8_t *>(rhs->tensor->data);
+    return lhs_begin < rhs_begin + rhs_bytes && rhs_begin < lhs_begin + lhs_bytes;
+}
 
 // qwen4exp-scoped shape constants, deliberately kept distinct from the kRoutedFfn* aliases above
 // (which are derived from kActiveLlmMoeDispatchProfile == qwen30b) so the two model geometries can
@@ -1771,11 +1793,35 @@ static bool match_decode_routed_ffn_down_qwen4exp_dispatch(const DispatchMatchCo
     const size_t route_id_length =
         static_cast<size_t>((match.token_count - 1) * match.route_stride + kQwen4ExpRoutedFfnRouteCount) *
         sizeof(int32_t);
+
+    // See ggml_storage_overlaps(): with the router fused onto HRX the allocator can put `output` on
+    // top of the route ids/weights this kernel reads. Accumulating into a transient and copying it out
+    // afterwards keeps the routing arrays intact for as long as the kernel needs them. The residual
+    // path already accumulates onto `output` in place, so it cannot be redirected; decline instead of
+    // producing silently wrong routing.
+    const bool routing_overlaps_output =
+        ggml_storage_overlaps(match.output, match.output->byte_count, match.route_ids, route_id_length) ||
+        ggml_storage_overlaps(match.output, match.output->byte_count, match.reduce.route_weights,
+                              match.reduce.route_weights->byte_count);
+    if (routing_overlaps_output &&
+        (!match.reduce.residual_missing || match.output->type != GGML_TYPE_F32 || !match.output->contiguous)) {
+        trace_moe_down_reject("routing arrays alias an output that cannot be staged");
+        return false;
+    }
+
+    const ValueId staged_output = context.next_plan_value;
+    const ValueId output_binding = routing_overlaps_output ? staged_output : match.output->id;
+    if (routing_overlaps_output) {
+        dispatch_match.transients.push_back(
+            { staged_output, kRoutedFfnStagedDownOutputName, match.output->byte_count,
+              kRoutedFfnPlanTransientAlignment });
+    }
+
     dispatch.bindings.push_back({ match.input_alternate->alternate_value, 0, match.input_alternate->byte_count });
     dispatch.bindings.push_back({ match.route_ids->id, 0, route_id_length });
     dispatch.bindings.push_back({ match.reduce.route_weights->id, 0, match.reduce.route_weights->byte_count });
     dispatch.bindings.push_back({ match.weight->id, 0, match.weight->byte_count });
-    dispatch.bindings.push_back({ match.output->id, 0, match.output->byte_count });
+    dispatch.bindings.push_back({ output_binding, 0, match.output->byte_count });
 
     if (!match.reduce.residual_missing) {
         dispatch_match.value_aliases.push_back({ match.reduce.residual_input->id, match.output->id });
@@ -1806,10 +1852,18 @@ static bool match_decode_routed_ffn_down_qwen4exp_dispatch(const DispatchMatchCo
         Dispatch zero;
         zero.kernel = make_kernel_specialization(kZeroF32Kernel);
         zero.kernel.integer_parameters.emplace("element_count", match.output->element_count);
-        zero.bindings.push_back({ match.output->id, 0, match.output->byte_count });
+        zero.bindings.push_back({ output_binding, 0, match.output->byte_count });
         dispatch_match.dispatches.push_back(std::move(zero));
     }
     dispatch_match.dispatches.push_back(std::move(dispatch));
+    if (routing_overlaps_output) {
+        Dispatch copy_out;
+        copy_out.kernel = make_kernel_specialization(kCopyF32Kernel);
+        copy_out.kernel.integer_parameters.emplace("element_count", match.output->element_count);
+        copy_out.bindings.push_back({ staged_output, 0, match.output->byte_count });
+        copy_out.bindings.push_back({ match.output->id, 0, match.output->byte_count });
+        dispatch_match.dispatches.push_back(std::move(copy_out));
+    }
     return true;
 }
 

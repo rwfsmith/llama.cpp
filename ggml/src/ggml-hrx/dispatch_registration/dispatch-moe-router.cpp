@@ -6,7 +6,10 @@
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cmath>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -33,6 +36,43 @@ static constexpr size_t                        kMoeRouterPlanTransientAlignment 
 
 static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
+}
+
+// The router kernel declares logits/route_ids/route_weights mutually noalias, but ggml's graph
+// allocator is free to hand the ARGSORT output the block the (by then dead) router logits used to
+// occupy -- both are [n_expert, T] and identically sized. If it does, the kernel reads and writes one
+// buffer under a noalias contract it cannot honour. HRX_TRACE_MOE_ROUTER=1 prints the storage identity
+// and backing pointer of each so that can be confirmed rather than guessed at.
+static bool trace_moe_router_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TRACE_MOE_ROUTER");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void trace_router_value(const char * label, const Value * value) {
+    if (value == nullptr) {
+        std::fprintf(stderr, "HRX moe_router %-14s <null>\n", label);
+        return;
+    }
+    const ggml_tensor * tensor = value->tensor;
+    std::fprintf(stderr,
+                 "HRX moe_router %-14s id=%d storage=%d root=%d off=%zu bytes=%zu storage_bytes=%zu "
+                 "data=%p name=%s\n",
+                 label, value->id.value, value->storage.value, value->storage_root.value, value->storage_offset,
+                 value->byte_count, value->storage_byte_count, tensor == nullptr ? nullptr : tensor->data,
+                 tensor == nullptr ? "?" : tensor->name);
+}
+
+// True when two values touch any byte in common. Only meaningful for values that share a storage root.
+static bool values_overlap(const Value * lhs, const Value * rhs, size_t lhs_bytes, size_t rhs_bytes) {
+    if (lhs == nullptr || rhs == nullptr || lhs->storage_root.value != rhs->storage_root.value) {
+        return false;
+    }
+    const size_t lhs_end = lhs->storage_offset + lhs_bytes;
+    const size_t rhs_end = rhs->storage_offset + rhs_bytes;
+    return lhs->storage_offset < rhs_end && rhs->storage_offset < lhs_end;
 }
 
 static bool nearly_equal(float lhs, float rhs) {
@@ -81,6 +121,11 @@ static bool same_shape(const Value & lhs, const Value & rhs) {
 static bool is_supported_expert_count(int64_t expert_count) {
     return expert_count >= 32 && expert_count <= 512 && expert_count % 32 == 0;
 }
+
+// Both expert-table builders launch one workgroup of 256 lanes with one lane per expert and reduce
+// across it, so they cannot describe more experts than that regardless of specialization. Their Loom
+// bodies pin the bound tighter still, at the qwen30b expert count.
+static constexpr int64_t kMaxExpertTableExpertCount = 128;
 
 static bool is_supported_route_count(int64_t route_count, int64_t expert_count) {
     return route_count >= 1 && route_count <= 32 && route_count <= expert_count;
@@ -169,6 +214,10 @@ static bool append_covered_node(const DispatchMatchContext & context, const Grap
 struct RouterTop8Match {
     const Value * logits        = nullptr;
     const Value * route_ids     = nullptr;
+    // The buffer route_ids aliases at offset zero -- the full expert-wide argsort output. The kernel
+    // addresses route ids as route_ids[token * route_id_stride + route], so it needs the whole strided
+    // extent bound, which the narrow top-k view does not cover. See the binding site for why.
+    const Value * route_id_storage = nullptr;
     const Value * route_weights = nullptr;
     int64_t       token_count   = 0;
     int64_t       expert_count  = 0;
@@ -176,7 +225,8 @@ struct RouterTop8Match {
     int64_t       route_stride  = 0;
 
     bool matched() const {
-        return logits != nullptr && route_ids != nullptr && route_weights != nullptr && token_count > 0 &&
+        return logits != nullptr && route_ids != nullptr && route_id_storage != nullptr &&
+               route_weights != nullptr && token_count > 0 &&
                is_supported_expert_count(expert_count) && is_supported_route_count(route_count, expert_count) &&
                is_supported_route_stride(route_stride, route_count, expert_count);
     }
@@ -246,6 +296,17 @@ static RouterTop8Match match_moe_router_top8(const Graph & graph, const GraphNod
         log_router_reject(status, graph, softmax_node, "top-k route id stride is outside supported bounds");
         return {};
     }
+    // The kernel addresses route ids as route_ids[token * route_id_stride + route], so its view spans
+    // token_count * route_stride entries. The top-k view itself only owns route_count entries per token
+    // (10 of 512 for qwen4exp), and a GraphValue binding is clamped to the tensor's own extent, so
+    // binding the view fails validation with "range=[0, 2048) is outside runtime binding". Bind the
+    // argsort output it aliases instead: same buffer, same base, and exactly the strided extent.
+    if (route_ids->storage_root != argsort_output->storage_root ||
+        route_ids->storage_offset != argsort_output->storage_offset ||
+        argsort_output->byte_count < static_cast<size_t>(token_count * route_stride) * sizeof(int32_t)) {
+        log_router_reject(status, graph, softmax_node, "top-k route id view does not alias the argsort output base");
+        return {};
+    }
 
     const GraphNode * get_rows =
         find_consumer_with_op_and_input(graph, probs_reshape->output, GGML_OP_GET_ROWS, topk_view->output);
@@ -299,13 +360,30 @@ static RouterTop8Match match_moe_router_top8(const Graph & graph, const GraphNod
         return {};
     }
 
-    match.logits        = logits;
-    match.route_ids     = route_ids;
-    match.route_weights = route_weights;
-    match.token_count   = token_count;
-    match.expert_count  = expert_count;
-    match.route_count   = route_count;
-    match.route_stride  = route_stride;
+    match.logits           = logits;
+    match.route_ids        = route_ids;
+    match.route_id_storage = argsort_output;
+    match.route_weights    = route_weights;
+    match.token_count      = token_count;
+    match.expert_count     = expert_count;
+    match.route_count      = route_count;
+    match.route_stride     = route_stride;
+    if (trace_moe_router_enabled()) {
+        const size_t route_id_bytes = static_cast<size_t>(token_count * route_stride) * sizeof(int32_t);
+        std::fprintf(stderr, "HRX moe_router match experts=%" PRId64 " routes=%" PRId64 " stride=%" PRId64
+                             " tokens=%" PRId64 "\n",
+                     expert_count, route_count, route_stride, token_count);
+        trace_router_value("logits", logits);
+        trace_router_value("probs", probs);
+        trace_router_value("argsort", argsort_output);
+        trace_router_value("route_ids", route_ids);
+        trace_router_value("route_weights", route_weights);
+        std::fprintf(stderr,
+                     "HRX moe_router overlap logits/argsort=%d logits/route_weights=%d probs/argsort=%d\n",
+                     values_overlap(logits, argsort_output, logits->byte_count, route_id_bytes) ? 1 : 0,
+                     values_overlap(logits, route_weights, logits->byte_count, route_weights->byte_count) ? 1 : 0,
+                     values_overlap(probs, argsort_output, probs->byte_count, route_id_bytes) ? 1 : 0);
+    }
     return match;
 }
 
@@ -503,7 +581,7 @@ static bool match_moe_router_projection_top8_fused_decode_dispatch(const Dispatc
     dispatch.bindings.push_back({ match.weight->id, 0, match.weight->byte_count });
     dispatch.bindings.push_back({ match.logits->id, 0, match.logits->byte_count });
     dispatch.bindings.push_back({ completion_counter_value, 0, sizeof(int32_t) });
-    dispatch.bindings.push_back({ match.top8.route_ids->id, 0, route_id_length });
+    dispatch.bindings.push_back({ match.top8.route_id_storage->id, 0, route_id_length });
     dispatch.bindings.push_back({ match.top8.route_weights->id, 0, match.top8.route_weights->byte_count });
 
     dispatch_match.completion_counter_requests.push_back({
@@ -537,16 +615,35 @@ static bool match_moe_router_top8_dispatch(const DispatchMatchContext & context,
     dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity",
                                                to_config_value(router_match.token_count));
 
+    // The kernel's route-id view is declared as [token_count * route_id_stride] i32 and indexes it as
+    // route_ids[token * route_id_stride + route], so the whole strided extent has to be bound even
+    // though only route_count entries per token are written. The value is a view into the full
+    // expert-wide argsort output, so those bytes are always backed.
     const size_t route_id_length =
         static_cast<size_t>(router_match.token_count * router_match.route_stride) * sizeof(int32_t);
     dispatch.bindings.push_back({ router_match.logits->id, 0, router_match.logits->byte_count });
-    dispatch.bindings.push_back({ router_match.route_ids->id, 0, route_id_length });
+    dispatch.bindings.push_back({ router_match.route_id_storage->id, 0, route_id_length });
     dispatch.bindings.push_back({ router_match.route_weights->id, 0, router_match.route_weights->byte_count });
 
     if (!append_moe_router_top8_coverage(context, dispatch_match)) {
         return false;
     }
     dispatch_match.dispatches.push_back(std::move(dispatch));
+
+    // The expert/partition tables exist only so the qwen30b routed-FFN dispatches can walk experts in
+    // token-major order; the qwen4exp routed FFN binds route_ids/route_weights directly and never looks
+    // the bundle up. That matters because both table builders are hard-capped at 128 experts: they run a
+    // single 256-lane workgroup and use workgroup-wide scans over one lane per expert, and the Loom
+    // bodies assert it (`index.assume %expert_count [range(%expert_count, 128, 128)]`). Emitting them for
+    // qwen4exp's 512 experts fails at prepare time with "predicate 'range' on
+    // ggml_hrx_specialized_expert_count requires range [1, 128] but known facts prove range [512, 512]".
+    //
+    // So the top-k dispatch above -- which is genuinely generic over expert_count -- is emitted for every
+    // model, and only the table build is skipped when it would not fit and nothing needs it. Lifting the
+    // cap means re-deriving the partition scan across multiple workgroups, not widening a constant.
+    if (router_match.expert_count > kMaxExpertTableExpertCount) {
+        return true;
+    }
 
     const ValueId expert_table_value(context.next_plan_value.value);
     const ValueId partition_table_value(context.next_plan_value.value + 1);
@@ -616,7 +713,8 @@ static bool match_moe_router_top8_dispatch(const DispatchMatchContext & context,
         expert_table_partition_dispatch.kernel.integer_parameters.emplace("route_count", router_match.route_count);
         expert_table_partition_dispatch.kernel.integer_parameters.emplace("route_stride", router_match.route_stride);
         expert_table_partition_dispatch.kernel.integer_parameters.emplace("expert_count", router_match.expert_count);
-        expert_table_partition_dispatch.bindings.push_back({ router_match.route_ids->id, 0, route_id_length });
+        expert_table_partition_dispatch.bindings.push_back(
+            { router_match.route_id_storage->id, 0, route_id_length });
         expert_table_partition_dispatch.bindings.push_back({ expert_table_value, 0, expert_table_bytes });
         expert_table_partition_dispatch.bindings.push_back({ partition_table_value, 0, partition_table_bytes });
         expert_table_partition_dispatch.bindings.push_back({ completion_counter_value, 0, sizeof(int32_t) });
@@ -631,7 +729,7 @@ static bool match_moe_router_top8_dispatch(const DispatchMatchContext & context,
         expert_table_dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity",
                                                                 to_config_value(router_match.token_count));
         add_routed_gate_up_compile_parameters(expert_table_dispatch, router_match);
-        expert_table_dispatch.bindings.push_back({ router_match.route_ids->id, 0, route_id_length });
+        expert_table_dispatch.bindings.push_back({ router_match.route_id_storage->id, 0, route_id_length });
         expert_table_dispatch.bindings.push_back({ expert_table_value, 0, expert_table_bytes });
         dispatch_match.dispatches.push_back(std::move(expert_table_dispatch));
 
