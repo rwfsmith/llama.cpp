@@ -2,10 +2,12 @@
 
 #include "backend-buffer-binding.h"
 #include "ggml-impl.h"
+#include "runtime/graph-replay.h"
 #include "runtime/kernel-executable-cache.h"
 #include "runtime/prepared-command-program-cache.h"
 #include "runtime/transient-arena.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -34,6 +36,14 @@ static bool hrx_trace_bindings_enabled() {
 static bool hrx_prepared_fast_path_disabled() {
     static const bool disabled = hrx_environment_flag("HRX_DISABLE_PREPARED_FAST_PATH");
     return disabled;
+}
+
+// Companion to the HRX_TIME_COMPUTE accounting in graph_compute(): that shows submission dominates GPU
+// occupancy, this attributes the submission cost to the four phases it is actually made of, so the
+// expensive one can be identified instead of guessed at.
+static bool hrx_time_compute_enabled() {
+    static const bool enabled = hrx_environment_flag("HRX_TIME_COMPUTE");
+    return enabled;
 }
 
 GraphExecutor::GraphExecutor(ggml_backend_hrx_context & context) : context_(context) {}
@@ -113,6 +123,9 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
     }
 
     const KernelCorpus & corpus = get_qwen_kernel_corpus();
+    const bool           timing = hrx_time_compute_enabled();
+    using clock                 = std::chrono::steady_clock;
+    const clock::time_point t_begin = timing ? clock::now() : clock::time_point{};
     GraphProgramLookup   lookup = context_.graph_programs.get_or_build(graph, corpus, context_.device->architecture);
     if (!lookup.valid()) {
         result.status.append(lookup.status);
@@ -126,6 +139,7 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
     const bool use_graph_prepared = !hrx_prepared_fast_path_disabled() &&
                                     (!lookup.program->has_prepared_program() ||
                                      lookup.program->can_use_prepared_fast_path(graph));
+    const clock::time_point t_looked_up = timing ? clock::now() : clock::time_point{};
     GraphProgramMatch binding_match = std::move(lookup.match);
     if (use_graph_prepared && lookup.program->has_prepared_program()) {
         binding_match = lookup.program->match_host_staging_graph(graph);
@@ -134,12 +148,14 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
             return result;
         }
     }
+    const clock::time_point t_matched = timing ? clock::now() : clock::time_point{};
 
     CommandProgramBindings bindings = bind_external_value_buffers(binding_match);
     if (!bindings.valid()) {
         result.status.append(bindings.status);
         return result;
     }
+    const clock::time_point t_bound = timing ? clock::now() : clock::time_point{};
     const CommandProgramExecutionContext execution_context = {
         context_.device->device,
         context_.stream,
@@ -164,6 +180,37 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
     }
 
     result.code = GGML_STATUS_SUCCESS;
+    if (timing) {
+        const clock::time_point t_recorded = clock::now();
+        const auto              elapsed    = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        static uint64_t calls      = 0;
+        static double   lookup_ms  = 0.0;
+        static double   match_ms   = 0.0;
+        static double   bind_ms    = 0.0;
+        static double   record_ms  = 0.0;
+        calls += 1;
+        lookup_ms += elapsed(t_begin, t_looked_up);
+        match_ms += elapsed(t_looked_up, t_matched);
+        bind_ms += elapsed(t_matched, t_bound);
+        record_ms += elapsed(t_bound, t_recorded);
+        if (calls % 1000 == 0) {
+            const double total = lookup_ms + match_ms + bind_ms + record_ms;
+            GGML_LOG_INFO(
+                "HRX submit: calls=%llu lookup=%.1fms(%.0f%%) match=%.1fms(%.0f%%) bind=%.1fms(%.0f%%) "
+                "record=%.1fms(%.0f%%)\n",
+                static_cast<unsigned long long>(calls), lookup_ms, 100.0 * lookup_ms / total, match_ms,
+                100.0 * match_ms / total, bind_ms, 100.0 * bind_ms / total, record_ms, 100.0 * record_ms / total);
+            GGML_LOG_INFO("HRX replay: last=%s reason=%s dispatches=%zu build=%.3fms launch=%.3fms\n",
+                          hrx_graph_replay_event_name(execution.graph_replay_event),
+                          execution.graph_replay_ineligible_reason.empty() ?
+                              "-" :
+                              execution.graph_replay_ineligible_reason.c_str(),
+                          execution.graph_replay_dispatches, execution.graph_replay_build_ns / 1e6,
+                          execution.graph_replay_launch_ns / 1e6);
+        }
+    }
     return result;
 }
 

@@ -741,10 +741,15 @@ static void hrx_verify_after(ggml_backend_hrx_context * context, const std::vect
 }
 
 // Wall-clock accounting for the HRX half of a token. graph_compute() already blocks on the compute stream
-// before it returns, so the interval around executor.execute() is the host cost of matching, building and
-// submitting dispatches, while the interval around hrx_stream_synchronize() is time the GPU is genuinely
-// busy. Separating those two is what distinguishes "the kernels are slow" from "the submission path is
-// slow" -- they look identical in end-to-end tokens/sec but are fixed in completely different places.
+// before it returns, so the interval around executor.execute() is submission and the interval around
+// hrx_stream_synchronize() is GPU wait.
+//
+// Read the "submit" bucket with care: it is NOT all host-side cost. download_synchronous() calls
+// hrx_stream_synchronize() before every device-to-host readback, so any split that writes a value consumed
+// on the CPU drains the GPU from inside submission. Measured on qwen4exp decode that hidden wait is 89% of
+// the download time, which makes the raw submit/gpu split read as 73/27 when the true GPU-busy share is
+// about 85%. Always pair this with the "HRX download" breakdown before drawing a conclusion.
+//
 // Totals are reported cumulatively every kHrxTimeReportInterval calls, because llama-cli deadlocks in
 // teardown and gets killed, so anything printed only at backend_free() would never appear. Diff two
 // consecutive reports to recover a steady-state rate.

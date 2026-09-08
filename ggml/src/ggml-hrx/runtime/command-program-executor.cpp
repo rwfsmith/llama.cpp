@@ -8,6 +8,7 @@
 #include "runtime/transient-arena.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -23,6 +24,17 @@ static bool hrx_environment_flag(const char * name) {
 
 static bool trace_launch_enabled() {
     static const bool enabled = hrx_environment_flag("HRX_TRACE_LAUNCH");
+    return enabled;
+}
+
+// Third level of the HRX_TIME_COMPUTE breakdown. graph_compute() shows the submit/GPU split and
+// GraphExecutor::execute() shows nearly all submission is command recording; this last split attributes the
+// recording to the vendored hrx_stream_dispatch()/hrx_graph_exec_launch() entry points versus the
+// per-dispatch work this file does around them. Measured on qwen4exp decode the vendored launch is under 1%
+// and the cost is overwhelmingly download_prepared_host_staging(), whose blocking readback is where the GPU
+// wait actually hides.
+static bool hrx_time_compute_enabled() {
+    static const bool enabled = hrx_environment_flag("HRX_TIME_COMPUTE");
     return enabled;
 }
 
@@ -797,6 +809,9 @@ static Status prepare_kernel_command(const CommandProgramExecutionContext & cont
 
 static bool execute_prepared_kernel_command(const CommandProgramExecutionContext & context,
                                             const PreparedCommand &                command) {
+    const bool timing = hrx_time_compute_enabled();
+    using clock       = std::chrono::steady_clock;
+    const clock::time_point t_begin = timing ? clock::now() : clock::time_point{};
     const std::string command_context = format_prepared_command_context(command);
     if (command.kind != CommandKind::Kernel) {
         GGML_LOG_ERROR("%s: unsupported command kind in %s\n", __func__, command_context.c_str());
@@ -823,11 +838,30 @@ static bool execute_prepared_kernel_command(const CommandProgramExecutionContext
          executable.launch.workgroup_size[2]  },
         executable.launch.subgroup_size,
     };
+    const clock::time_point t_dispatch = timing ? clock::now() : clock::time_point{};
     if (ErrorResult error = take_status(hrx_stream_dispatch(
             context.stream, executable.executable, executable.export_ordinal, &config, command.kernel.constants.data(),
             command.kernel.constants.size(), refs.data(), refs.size(), 0))) {
         GGML_LOG_ERROR("%s: failed to execute %s: %s\n", __func__, command_context.c_str(), error->c_str());
         return false;
+    }
+    if (timing) {
+        const clock::time_point t_end   = clock::now();
+        const auto              elapsed = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        static uint64_t dispatches   = 0;
+        static double   glue_ms      = 0.0;
+        static double   dispatch_ms  = 0.0;
+        dispatches += 1;
+        glue_ms += elapsed(t_begin, t_dispatch);
+        dispatch_ms += elapsed(t_dispatch, t_end);
+        if (dispatches % 50000 == 0) {
+            const double total = glue_ms + dispatch_ms;
+            GGML_LOG_INFO("HRX record: dispatches=%llu glue=%.1fms(%.0f%%) hrx_stream_dispatch=%.1fms(%.0f%%)\n",
+                          static_cast<unsigned long long>(dispatches), glue_ms, 100.0 * glue_ms / total, dispatch_ms,
+                          100.0 * dispatch_ms / total);
+        }
     }
     return true;
 }
@@ -1224,6 +1258,9 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     RecordedCommandGraph &                 recorded) {
     RecordedCommandGraphExecutionResult result;
     result.event = HrxGraphReplayEvent::Ineligible;
+    const bool timing = hrx_time_compute_enabled();
+    using clock       = std::chrono::steady_clock;
+    const clock::time_point t_entry = timing ? clock::now() : clock::time_point{};
 
     if (!prepared.valid()) {
         result.status.append(prepared.status);
@@ -1255,6 +1292,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
 
     TransientArenaAllocationRef transient_allocation;
     TransientArena::AllocationLease lease;
+    const clock::time_point t_rebound = timing ? clock::now() : clock::time_point{};
     if (commands.transients.arena_size == 0) {
         if (!bind_prepared_command_program_transients(commands, {}, prepared)) {
             result.status.log("bind transient-free prepared command program failed");
@@ -1284,6 +1322,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     }
 
     const bool had_recorded = recorded.valid();
+    const clock::time_point t_transient = timing ? clock::now() : clock::time_point{};
     result.transient_allocation_changed =
         had_recorded && recorded.bound_transient_arena_allocation_id != prepared.bound_transient_arena_allocation_id;
     if (!had_recorded || result.transient_allocation_changed || graph_values_changed) {
@@ -1302,6 +1341,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
         result.event = HrxGraphReplayEvent::Hit;
     }
 
+    const clock::time_point t_built = timing ? clock::now() : clock::time_point{};
     const uint64_t launch_start_ns = hrx_graph_replay_now_ns();
     trace_prepared_program("replay", prepared);
     Status upload_status = upload_prepared_host_staging(context, prepared);
@@ -1311,12 +1351,14 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
         result.event = HrxGraphReplayEvent::LaunchFailed;
         return result;
     }
+    const clock::time_point t_uploaded = timing ? clock::now() : clock::time_point{};
     if (ErrorResult error = take_status(hrx_graph_exec_launch(recorded.exec, context.stream))) {
         result.launch_ns = hrx_graph_replay_now_ns() - launch_start_ns;
         result.status.log("launch HRX graph replay: %s", error->c_str());
         result.event = HrxGraphReplayEvent::LaunchFailed;
         return result;
     }
+    const clock::time_point t_launched = timing ? clock::now() : clock::time_point{};
     Status download_status = download_prepared_host_staging(context, prepared);
     if (!download_status.success()) {
         result.launch_ns = hrx_graph_replay_now_ns() - launch_start_ns;
@@ -1327,6 +1369,41 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     result.launch_ns      = hrx_graph_replay_now_ns() - launch_start_ns;
     result.dispatch_count = recorded.dispatch_count;
     result.success        = true;
+    if (timing) {
+        const clock::time_point t_end   = clock::now();
+        const auto              elapsed = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        static uint64_t calls        = 0;
+        static double   rebind_ms    = 0.0;
+        static double   transient_ms = 0.0;
+        static double   build_ms     = 0.0;
+        static double   launch_ms    = 0.0;
+        calls += 1;
+        rebind_ms += elapsed(t_entry, t_rebound);
+        transient_ms += elapsed(t_rebound, t_transient);
+        build_ms += elapsed(t_transient, t_built);
+        launch_ms += elapsed(t_built, t_end);
+        static double upload_ms   = 0.0;
+        static double execlaunch_ms = 0.0;
+        static double download_ms = 0.0;
+        upload_ms += elapsed(t_built, t_uploaded);
+        execlaunch_ms += elapsed(t_uploaded, t_launched);
+        download_ms += elapsed(t_launched, t_end);
+        if (calls % 5000 == 0) {
+            GGML_LOG_INFO("HRX launchphase: upload=%.1fms exec_launch=%.1fms download=%.1fms\n", upload_ms,
+                          execlaunch_ms, download_ms);
+        }
+        if (calls % 5000 == 0) {
+            const double total = rebind_ms + transient_ms + build_ms + launch_ms;
+            GGML_LOG_INFO(
+                "HRX replaypath: calls=%llu rebind=%.1fms(%.0f%%) transient=%.1fms(%.0f%%) build=%.1fms(%.0f%%) "
+                "launch=%.1fms(%.0f%%) total=%.1fms\n",
+                static_cast<unsigned long long>(calls), rebind_ms, 100.0 * rebind_ms / total, transient_ms,
+                100.0 * transient_ms / total, build_ms, 100.0 * build_ms / total, launch_ms, 100.0 * launch_ms / total,
+                total);
+        }
+    }
     return result;
 }
 

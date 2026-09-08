@@ -2,12 +2,27 @@
 
 #include "hrx-interop-utils.h"
 #include "hrx_runtime.h"
+#include "ggml-impl.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <sstream>
 #include <utility>
 
 namespace ggml::hrx {
 namespace {
+
+// The synchronous readback in download_synchronous() blocks on the compute stream before it copies, so its
+// wall time bundles together two very different costs: waiting for the split's kernels to finish, and the
+// device-to-host transfer itself. Only the first is real GPU work; the second is pure cost of crossing the
+// HRX/CPU boundary. Splitting them is what says whether eliminating CPU fallback would actually buy anything.
+static bool hrx_time_compute_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TIME_COMPUTE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 static constexpr size_t kMaxInlineUploadBytes = 63 * 1024;
 
@@ -119,13 +134,37 @@ Status HostTransferManager::download_synchronous(hrx_stream_t stream,
         status.log("query HRX download device failed: %s", error->c_str());
         return status;
     }
+    const bool timing = hrx_time_compute_enabled();
+    using clock       = std::chrono::steady_clock;
+    const clock::time_point t_entry = timing ? clock::now() : clock::time_point{};
     if (ErrorResult error = take_status(hrx_stream_synchronize(stream))) {
         status.log("synchronize before HRX host download failed: %s", error->c_str());
         return status;
     }
+    const clock::time_point t_synced = timing ? clock::now() : clock::time_point{};
     if (ErrorResult error = take_status(hrx_synchronous_d2h(device, source, offset, host_destination, size))) {
         status.log("synchronous HRX host download failed: %s", error->c_str());
         return status;
+    }
+    if (timing) {
+        const clock::time_point t_copied = clock::now();
+        const auto              elapsed  = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        static uint64_t downloads = 0;
+        static double   wait_ms   = 0.0;
+        static double   copy_ms   = 0.0;
+        static uint64_t bytes     = 0;
+        downloads += 1;
+        wait_ms += elapsed(t_entry, t_synced);
+        copy_ms += elapsed(t_synced, t_copied);
+        bytes += size;
+        if (downloads % 5000 == 0) {
+            const double total = wait_ms + copy_ms;
+            GGML_LOG_INFO("HRX download: n=%llu gpu_wait=%.1fms(%.0f%%) d2h_copy=%.1fms(%.0f%%) bytes=%.1fMB\n",
+                          static_cast<unsigned long long>(downloads), wait_ms, 100.0 * wait_ms / total, copy_ms,
+                          100.0 * copy_ms / total, bytes / 1048576.0);
+        }
     }
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.downloads;
