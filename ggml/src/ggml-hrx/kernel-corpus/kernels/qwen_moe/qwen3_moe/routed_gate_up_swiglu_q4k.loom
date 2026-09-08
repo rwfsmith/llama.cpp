@@ -17,7 +17,18 @@ config.decl @qwen3_moe.routed_gate_up.input_size : %value: index where [range(%v
 
 config.decl @qwen3_moe.routed_gate_up.expert_count : %value: index where [range(%value, 1, 512)]
 
-config.decl @qwen3_moe.routed_gate_up.route_count : %value: index where [range(%value, 1, 8)]
+// route_count's upper bound is 16 rather than qwen30b's 8 so qwen4exp
+// (Qwen3.8-Flash-Next, expert_used=10) can configure this kernel. route_count is
+// only ever a loop trip count and the Y workgroup-launch extent -- never a
+// fixed-size array dimension -- so raising the bound needs no other change, and
+// qwen30b's 8 still satisfies it. route_stride likewise moved 128 -> 512 to admit
+// a full [token][expert_count=512] argsort row.
+//
+// NOTE this only unblocks the *decode* schedule. The grouped schedule packs its
+// expert ordinal into 7 bits of the partition descriptor (see
+// @qwen3_moe_unpack_expert_partition_descriptor), so it stays capped at 128
+// experts and cannot serve qwen4exp's 512.
+config.decl @qwen3_moe.routed_gate_up.route_count : %value: index where [range(%value, 1, 16)]
 
 config.decl @qwen3_moe.routed_gate_up.output_size : %value: index where [range(%value, 1, 4096)]
 
@@ -571,7 +582,7 @@ kernel.def @qwen3_moe_build_expert_table(%token_count: index, %route_count: inde
 } launch(%token_count: index, %route_count: index, %route_stride: index, %expert_count: index, %route_ids: buffer, %expert_table: buffer) {
   %bounded_token_count = index.assume %token_count [range(%token_count, 1, 2048)] : index
   %configured_route_count0 = config.get @qwen3_moe.routed_gate_up.route_count : index
-  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 8), eq(%route_count, %configured_route_count0)] : index, index
+  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 16), eq(%route_count, %configured_route_count0)] : index, index
   %bounded_route_stride = index.assume %route_stride [range(%route_stride, 1, 512)] : index
   %configured_expert_count0 = config.get @qwen3_moe.routed_gate_up.expert_count : index
   %bounded_expert_count, %configured_expert_count = index.assume %expert_count, %configured_expert_count0 [range(%expert_count, 1, 512), eq(%expert_count, %configured_expert_count0)] : index, index
@@ -649,7 +660,7 @@ kernel.def @qwen3_moe_build_expert_partition_table(%token_count: index, %route_c
   kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%workgroup_size, %c1, %c1) : index
 } launch(%token_count: index, %route_count: index, %expert_count: index, %expert_table: buffer, %partition_table: buffer) {
   %bounded_token_count = index.assume %token_count [range(%token_count, 1, 2048)] : index
-  %bounded_route_count = index.assume %route_count [range(%route_count, 1, 8)] : index
+  %bounded_route_count = index.assume %route_count [range(%route_count, 1, 16)] : index
   %bounded_expert_count = index.assume %expert_count [range(%expert_count, 1, 128)] : index
   %lane = kernel.workitem.id<x> : index
   %c0 = index.constant 0 : index
@@ -732,7 +743,7 @@ kernel.def @qwen3_moe_build_expert_partition_table(%token_count: index, %route_c
 func.template<qwen3_moe.routed_gate_up.q4k_q8.body> device @qwen3_moe_routed_gate_up_swiglu_q4k_q8_body(%publish_output: i1, %token_count: index, %token: index, %route_count: index, %route: index, %route_stride: index, %expert_count: index, %output_size: index, %channel: index, %lane: index, %q8_input: buffer, %route_ids: buffer, %gate_weight: buffer, %up_weight: buffer, %output: buffer) {
   %input_size = config.get @qwen3_moe.routed_gate_up.input_size : index
   %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
-  %bounded_route_count, %bounded_route_stride = index.assume %route_count, %route_stride [range(%route_count, 1, 8), range(%route_stride, 1, 128), le(%route_count, %route_stride)] : index, index
+  %bounded_route_count, %bounded_route_stride = index.assume %route_count, %route_stride [range(%route_count, 1, 16), range(%route_stride, 1, 512), le(%route_count, %route_stride)] : index, index
   %bounded_expert_count = index.assume %expert_count [range(%expert_count, 1, 128)] : index
   %bounded_output_size = index.assume %output_size [range(%output_size, 1, 4096)] : index
   %bounded_token, %body_token_count = index.assume %token, %bounded_token_count [lt(%token, %bounded_token_count)] : index, index
@@ -882,8 +893,8 @@ kernel.def @qwen3_moe_routed_gate_up_swiglu_q4k_q8(%token_count: index, %route_c
   %configured_expert_count0 = config.get @qwen3_moe.routed_gate_up.expert_count : index
   %configured_output_size0 = config.get @qwen3_moe.routed_gate_up.output_size : index
   %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512)] : index
-  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 8), eq(%route_count, %configured_route_count0)] : index, index
-  %bounded_route_stride = index.assume %route_stride [range(%route_stride, 1, 128)] : index
+  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 16), eq(%route_count, %configured_route_count0)] : index, index
+  %bounded_route_stride = index.assume %route_stride [range(%route_stride, 1, 512)] : index
   %bounded_expert_count, %configured_expert_count = index.assume %expert_count, %configured_expert_count0 [range(%expert_count, 1, 128), eq(%expert_count, %configured_expert_count0)] : index, index
   %bounded_output_size, %configured_output_size = index.assume %output_size, %configured_output_size0 [range(%output_size, 1, 4096), eq(%output_size, %configured_output_size0)] : index, index
   %token0 = kernel.workgroup.id<z> : index
@@ -1001,8 +1012,8 @@ kernel.def @qwen3_moe_routed_gate_up_swiglu_q4k_q8_1_x4_next_q8(%token_count: in
   %configured_route_count0 = config.get @qwen3_moe.routed_gate_up.route_count : index
   %configured_expert_count0 = config.get @qwen3_moe.routed_gate_up.expert_count : index
   %configured_output_size0 = config.get @qwen3_moe.routed_gate_up.output_size : index
-  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 8), eq(%route_count, %configured_route_count0)] : index, index
-  %bounded_route_stride = index.assume %route_stride [range(%route_stride, 1, 128)] : index
+  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 16), eq(%route_count, %configured_route_count0)] : index, index
+  %bounded_route_stride = index.assume %route_stride [range(%route_stride, 1, 512)] : index
   %bounded_expert_count, %configured_expert_count = index.assume %expert_count, %configured_expert_count0 [range(%expert_count, 1, 128), eq(%expert_count, %configured_expert_count0)] : index, index
   %bounded_output_size, %configured_output_size = index.assume %output_size, %configured_output_size0 [range(%output_size, 128, 4096), mul(%output_size, 128), eq(%output_size, %configured_output_size0)] : index, index
   %q8_input_noalias, %route_ids_noalias, %gate_weight_noalias, %up_weight_noalias, %output_noalias, %completion_counters_noalias, %next_q8_output_noalias = buffer.assume.noalias %q8_input, %route_ids, %gate_weight, %up_weight, %output, %completion_counters, %next_q8_output : buffer, buffer, buffer, buffer, buffer, buffer, buffer
@@ -1094,7 +1105,7 @@ kernel.def @qwen3_moe_routed_gate_up_swiglu_q4k_q8_grouped(%token_count: index, 
   %configured_expert_count0 = config.get @qwen3_moe.routed_gate_up.expert_count : index
   %configured_output_size0 = config.get @qwen3_moe.routed_gate_up.output_size : index
   %bounded_token_count = index.assume %token_count [range(%token_count, 1, 512), le(%token_count, %token_capacity)] : index
-  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 8), eq(%route_count, %configured_route_count0)] : index, index
+  %bounded_route_count, %configured_route_count = index.assume %route_count, %configured_route_count0 [range(%route_count, 1, 16), eq(%route_count, %configured_route_count0)] : index, index
   %bounded_expert_count, %configured_expert_count = index.assume %expert_count, %configured_expert_count0 [range(%expert_count, 1, 128), eq(%expert_count, %configured_expert_count0)] : index, index
   %bounded_output_size, %configured_output_size = index.assume %output_size, %configured_output_size0 [range(%output_size, 1, 4096), eq(%output_size, %configured_output_size0)] : index, index
   %channel_tile = kernel.workgroup.id<x> : index

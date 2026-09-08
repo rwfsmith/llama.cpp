@@ -9120,6 +9120,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repeat(GGML_TYPE_BF16, {10, 5, 4, ne3}, {2, 1, 1, 1}));
     }
 
+    // Broadcast of a size-1 axis, the shape qwen4exp's hyper-connected residual uses. The cases
+    // above never exercise it because every ne dim is > 1 there, so a backend can pass all of them
+    // and still get [n_embd, 1, T] -> [n_embd, hc, T] wrong.
+    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2560, 1, 1, 1}, {1, 4, 1, 1}));
+    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2560, 1, 4, 1}, {1, 4, 1, 1}));
+    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {260, 1, 1, 1}, {1, 4, 1, 1}));
+    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {1, 4, 1, 1}, {2560, 1, 1, 1}));
+
     for (bool view : {false, true}) {
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 1}, view));
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {2, 1, 1, 1}, view));

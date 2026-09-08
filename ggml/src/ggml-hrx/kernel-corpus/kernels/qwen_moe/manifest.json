@@ -146,8 +146,8 @@
     },
     {
       "path": "qwen3_moe/routed_gate_up_swiglu_q4k.loom",
-      "sha256": "e5d5ed276070ae25e8f1d915e927716da519314d34319db4b722d30589233deb",
-      "size": 125922
+      "sha256": "ac62d746886e16683c9b8dc2f12b95875950dc9ecadbf7d050158a13a5269305",
+      "size": 126639
     },
     {
       "path": "qwen3_moe/routed_linear_q4k_f16_wmma.loom",
