@@ -1,0 +1,102 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Row-wise L2 normalization (GGML_OP_L2_NORM), f32 -> f32.
+//
+// ggml normalizes over ne[0] only: for each row, scale = 1/max(sqrt(sum(x^2)),
+// eps) and y = x*scale. eps floors the *norm*, it is not added under the root,
+// which is why this mirrors qwen38_gdn_conv_prepare_decode's maxnumf-then-
+// reciprocal sequence rather than RMSNorm's add-then-rsqrt.
+//
+// qwen4exp calls this twice per GDN layer (72 nodes) to normalize the
+// post-convolution q and k, and with no HRX kernel those 72 tiny [128,16] nodes
+// split every GDN layer's front end away from the GPU.
+//
+// One workgroup owns one row. The buffers are addressed through a 2D
+// [row_count]x[row_length] view rather than a flat one so that both indices are
+// individually bounded by values the launch geometry already proves -- a flat
+// row*row_length + element index cannot be shown in range against a dynamic
+// extent. This is the same construction hrx_owned/gather_add_f32.loom uses.
+//
+// The epsilon arrives as a compile-time config rather than a launch scalar
+// because KernelSpecialization carries no f32 channel; dispatch-elementwise.cpp
+// stringifies the node's own op_params eps into it.
+
+amdgpu.target<gfx11-generic> @ggml_l2_norm_gfx11_wave64 {subgroup_size = 64}
+
+config.decl @ggml.l2_norm_f32.epsilon : f32
+
+kernel.def target(@ggml_l2_norm_gfx11_wave64) export("ggml_l2_norm_f32") @ggml_l2_norm_f32(
+    %row_length: index, %row_count: index) {
+  %one = index.constant 1 : index
+  %workgroup_size = index.constant 256 : index
+  kernel.launch.config workgroups(%row_count, %one, %one) workgroup_size(%workgroup_size, %one, %one) : index
+} launch(%row_length: index, %row_count: index, %input: buffer, %output: buffer) {
+  %epsilon = config.get @ggml.l2_norm_f32.epsilon : f32
+  %length = index.assume %row_length [range(%row_length, 1, 262144)] : index
+  %rows = index.assume %row_count [range(%row_count, 1, 262144)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row, %launch_rows = index.assume %row0, %rows [lt(%row0, %rows)] : index, index
+  %lane = kernel.workitem.id<x> : index
+  %workgroup_size = index.constant 256 : index
+  %zero_offset = index.constant 0 : offset
+  %input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
+  %input_view = buffer.view %input_noalias[%zero_offset] : buffer -> view<[%launch_rows]x[%length]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%launch_rows]x[%length]xf32>
+  %zero_f32 = scalar.constant 0.0 : f32
+  %thread_sum = scf.for %element = [%lane to %length step %workgroup_size](%running_sum = %zero_f32 : f32) -> (f32) {
+    %safe_element = index.assume %element [lt(%element, %length)] : index
+    %value = view.load %input_view[%row, %safe_element] : view<[%launch_rows]x[%length]xf32> -> f32
+    %square = scalar.mulf<reassoc|nnan|ninf|nsz> %value, %value : f32
+    %next_sum = scalar.addf<reassoc|nnan|ninf|nsz> %running_sum, %square : f32
+    scf.yield %next_sum : f32
+  }
+  // Every lane participates: lanes past the row length simply contributed 0.0.
+  %sum = kernel.workgroup.reduce<addf> %thread_sum : f32
+  %norm = scalar.sqrtf<nnan|ninf|nsz|afn> %sum : f32
+  %safe_norm = scalar.maxnumf %norm, %epsilon : f32
+  %unit = scalar.constant 1.0 : f32
+  %scale = scalar.divf<nnan|ninf|nsz|arcp> %unit, %safe_norm : f32
+  scf.for %element = [%lane to %length step %workgroup_size] {
+    %safe_element = index.assume %element [lt(%element, %length)] : index
+    %value = view.load %input_view[%row, %safe_element] : view<[%launch_rows]x[%length]xf32> -> f32
+    %result = scalar.mulf<reassoc|nnan|ninf|nsz> %value, %scale : f32
+    view.store %result, %output_view[%row, %safe_element] : f32, view<[%launch_rows]x[%length]xf32>
+  }
+  kernel.return
+}
+
+// The corpus supplies @ggml.l2_norm_f32.epsilon to check runs through the
+// manifest's --config= arguments, the same way qwen3_moe.model.rms_epsilon is
+// supplied to the RMSNorm cases. Both cases below are written so their expected
+// values do not depend on it: every row norm here is many orders of magnitude
+// above any plausible eps, so maxnumf always selects the true norm.
+check.case public @ggml_l2_norm_f32_two_row_case {
+  %row_length = check.literal value(4) : index
+  %row_count = check.literal value(2) : index
+  // Both rows are (1,1,1,1) -> norm sqrt(4) == 2 -> every element 0.5. Running
+  // two rows proves the second workgroup indexes its own row rather than
+  // re-reducing row 0.
+  %input = check.generate.fill value(1.0) : tensor<2x4xf32>
+  %output = check.generate.fill value(0.0) : tensor<2x4xf32>
+  %expected = check.generate.fill value(0.5) : tensor<2x4xf32>
+  func.call @ggml_l2_norm_f32(%row_length, %row_count, %input, %output) : (index, index, tensor<2x4xf32>, tensor<2x4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<2x4xf32>
+  check.return
+}
+
+check.case public @ggml_l2_norm_f32_long_row_case {
+  %row_length = check.literal value(1024) : index
+  %row_count = check.literal value(1) : index
+  // 1024 elements of 0.5 -> sum 256 -> norm 16 -> 0.5/16 == 0.03125, exactly
+  // representable. The row is 4x the workgroup width, so this exercises the
+  // strided accumulation loop and the cross-wave reduction.
+  %input = check.generate.fill value(0.5) : tensor<1x1024xf32>
+  %output = check.generate.fill value(0.0) : tensor<1x1024xf32>
+  %expected = check.generate.fill value(0.03125) : tensor<1x1024xf32>
+  func.call @ggml_l2_norm_f32(%row_length, %row_count, %input, %output) : (index, index, tensor<1x1024xf32>, tensor<1x1024xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<1x1024xf32>
+  check.return
+}
+
+check.benchmark<@ggml_l2_norm_f32_long_row_case> @ggml_l2_norm_f32_row1024

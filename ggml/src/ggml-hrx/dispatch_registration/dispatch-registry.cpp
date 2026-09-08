@@ -2,6 +2,7 @@
 
 #include "dispatch-add.h"
 #include "dispatch-copy.h"
+#include "dispatch-elementwise.h"
 #include "dispatch-gated-delta-net.h"
 #include "dispatch-gather-add.h"
 #include "dispatch-llm-matmul.h"
@@ -54,6 +55,7 @@ static DispatchRegistry build_llm_registry() {
     register_gather_add_dispatch(builder);
     register_scale_dispatch(builder);
     register_copy_dispatch(builder);
+    register_elementwise_dispatches(builder);
     register_llm_dispatches(builder);
     return builder.build();
 }

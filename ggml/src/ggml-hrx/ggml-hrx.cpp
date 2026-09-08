@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -797,10 +798,14 @@ static bool hrx_dispatch_group_disabled(const char * group) {
 // -> SOFTPLUS -> MUL(ssm_a) -> MUL_MAT(ssm_beta) -> SIGMOID) between the two, forcing a split
 // boundary. The dispatch now covers only SSM_CONV and its SILU -- the two nodes it actually writes --
 // so the prelude is self-contained and correct, with L2_NORM left to run normally.
-// Still gated behind HRX_ENABLE_GDN_CONV_PREPARE=1 until the corrected form is verified end to end.
+//
+// Now verified end to end and enabled by default: with the corrected form a GGML_SCHED_DEBUG=2 census
+// moves SSM_CONV (36), SILU (36) and both L2_NORMs (72) onto HRX for zero additional splits -- the run
+// they head was already a CPU split, so the nodes join the neighbouring island instead of forming one --
+// and generation stays coherent. Set HRX_ENABLE_GDN_CONV_PREPARE=0 to fall back to the CPU prelude.
 static bool hrx_gdn_conv_prepare_enabled() {
     const char * enabled = std::getenv("HRX_ENABLE_GDN_CONV_PREPARE");
-    return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+    return enabled == nullptr || enabled[0] != '0';
 }
 
 // Mirrors dispatch-copy.cpp: HRX has kernels for the same-length contiguous f32 copy and for the 2D
@@ -1123,6 +1128,163 @@ static bool hrx_gdn_gated_delta_net_decode_supported(const ggml_tensor * op) {
            state->ne[2] == kHrxGdnValueHeadCountQwen4Exp && state->ne[3] == 1;
 }
 
+// Generic elementwise f32 activation coverage, mirroring dispatch-elementwise.cpp's
+// match_unary_f32_dispatch(). Kept exactly in sync with unary_kernel_for() there: an op listed here
+// with no kernel would be claimed with no matcher able to root at it, which strands the split.
+//
+// This supersedes the shape-scoped hrx_gdn_unary_decode_supported() below for these four ops. That
+// predicate had to be narrow because the *only* SILU/SIGMOID coverage was as a covered node inside a
+// larger fused GDN dispatch, so any node of the right shape that was not in the right topology (PLE's
+// depthwise-conv SILU, the GDN beta SIGMOID) had to be declined. common.unary_f32 roots at the node
+// itself with no topological precondition, so those exclusions no longer apply.
+// Mirrors match_dense_matmul_f32_dispatch() in dispatch-elementwise.cpp; the two must agree or a
+// claimed node with no matcher strands its split. F32 weights used to be declined outright as "too
+// small to be worth a kernel" (see the comment above hrx_dense_matmul_weight_supported()), which was
+// true on FLOPs and wrong on topology: qwen4exp's ssm_alpha/ssm_beta gates sit mid-chain in the GDN
+// prelude, so declining them also forced ADD/SOFTPLUS/MUL/SIGMOID downstream onto the CPU.
+//
+// The 256-output bound is a correctness guard, not a kernel limit -- it keeps the MoE router logits
+// projection (the only other F32 MUL_MAT here, n_expert = 512 wide) on the CPU where
+// dispatch-moe-router.cpp's SOFT_MAX-rooted match can still reach the GET_ROWS below it.
+static bool hrx_dense_matmul_f32_supported(const ggml_tensor * op) {
+    const ggml_tensor * weight = op->src[0];
+    const ggml_tensor * input  = op->src[1];
+    if (weight == nullptr || input == nullptr) {
+        return false;
+    }
+    if (weight->type != GGML_TYPE_F32 || input->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const auto is_2d = [](const ggml_tensor * tensor) { return tensor->ne[2] == 1 && tensor->ne[3] == 1; };
+    if (!is_2d(weight) || !is_2d(input) || !is_2d(op) || !ggml_is_contiguous(weight) ||
+        !ggml_is_contiguous(input) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    const int64_t input_size  = weight->ne[0];
+    const int64_t output_size = weight->ne[1];
+    const int64_t token_count = input->ne[1];
+    return input->ne[0] == input_size && op->ne[0] == output_size && op->ne[1] == token_count &&
+           input_size >= 1 && input_size <= 131072 && output_size >= 1 && output_size <= 256 &&
+           token_count >= 1 && token_count <= kHrxDenseMatmulMaxTokenCount;
+}
+
+// Mirrors match_mul_f32_dispatch() in dispatch-elementwise.cpp. hrx_owned/mul_f32.loom exports two
+// broadcast directions: src1 indexed by column (src1 agrees with src0 on a leading dimension run) and
+// src1 indexed by outer (src1 is 1 on that run and agrees above it). Between them they cover every
+// MUL qwen4exp emits except a genuine stride broadcast, which stays on the CPU.
+static bool hrx_mul_f32_generic_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * lhs = op->src[0];
+    const ggml_tensor * rhs = op->src[1];
+    if (lhs == nullptr || rhs == nullptr || lhs->type != GGML_TYPE_F32 || rhs->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(lhs) || !ggml_is_contiguous(rhs) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (lhs->ne[i] != op->ne[i]) {
+            return false;
+        }
+    }
+
+    const int64_t elements = ggml_nelements(op);
+    const int64_t rhs_size = ggml_nelements(rhs);
+    if (elements <= 0 || rhs_size <= 0) {
+        return false;
+    }
+
+    int64_t inner     = 1;
+    bool    seen_ones = false;
+    bool    inner_ok  = true;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (rhs->ne[i] == lhs->ne[i] && !seen_ones) {
+            inner *= lhs->ne[i];
+            continue;
+        }
+        if (rhs->ne[i] == 1) {
+            seen_ones = true;
+            continue;
+        }
+        inner_ok = false;
+        break;
+    }
+
+    int64_t outer_period = 1;
+    bool    matching     = false;
+    bool    outer_ok     = true;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (!matching && rhs->ne[i] == 1) {
+            if (lhs->ne[i] != 1) {
+                outer_period *= lhs->ne[i];
+            }
+            continue;
+        }
+        if (rhs->ne[i] != lhs->ne[i]) {
+            outer_ok = false;
+            break;
+        }
+        matching = true;
+    }
+
+    int64_t period = 0;
+    if (inner_ok && inner == rhs_size && elements % inner == 0) {
+        period = inner;
+    } else if (outer_ok && outer_period > 0 && elements % outer_period == 0 &&
+               elements / outer_period == rhs_size) {
+        period = outer_period;
+    } else {
+        return false;
+    }
+
+    const int64_t outer_count = elements / period;
+    return period <= 1048576 && outer_count <= 1048576;
+}
+
+static bool hrx_unary_f32_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[0] == nullptr ||
+        op->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0]) || !ggml_are_same_shape(op, op->src[0])) {
+        return false;
+    }
+    if (ggml_nelements(op) <= 0 ||
+        static_cast<uint64_t>(ggml_nelements(op)) > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    switch (ggml_get_unary_op(op)) {
+        case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_SILU:
+        case GGML_UNARY_OP_RELU:
+        case GGML_UNARY_OP_SOFTPLUS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Mirrors dispatch-elementwise.cpp's match_l2_norm_f32_dispatch(). ggml normalizes over ne[0] only, so
+// any contiguous f32 tensor works: the kernel treats ne[1]*ne[2]*ne[3] as an independent row count.
+static bool hrx_l2_norm_f32_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[0] == nullptr ||
+        op->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0]) || !ggml_are_same_shape(op, op->src[0])) {
+        return false;
+    }
+    if (ggml_nelements(op) <= 0 ||
+        static_cast<uint64_t>(ggml_nelements(op)) > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    float eps = 0.0f;
+    std::memcpy(&eps, op->op_params, sizeof(float));
+    return eps >= 0.0f;  // Also rejects NaN. ggml asserts the same.
+}
+
 static bool hrx_gdn_unary_decode_supported(const ggml_tensor * op) {
     if (op == nullptr) {
         return false;
@@ -1153,18 +1315,16 @@ static bool hrx_gdn_unary_decode_supported(const ggml_tensor * op) {
 // scalar vectors of length num_v_heads == 48 from the ssm_alpha/ssm_beta projections:
 //
 //     alpha_biased   = ADD(alpha, ssm_dt)              -> f32[48,1,1,1]
-//     alpha_softplus = SOFTPLUS(alpha_biased)          -> declined by hrx_gdn_unary_decode_supported()
+//     alpha_softplus = SOFTPLUS(alpha_biased)
 //     gate           = MUL(alpha_softplus, ssm_a)      -> f32[48,1,1,1]
 //
-// No dispatch matcher roots at either of these -- the GDN kernels take `gate` and `beta` as already
-// -computed inputs -- so, exactly like the sibling SIGMOID documented above, claiming them would
-// strand them with no dispatch and fail the whole split. Their projections already run on the CPU
-// (their ssm_alpha/ssm_beta weights are F32, declined by hrx_dense_matmul_weight_supported()), so
-// keeping these two 48-element elementwise ops there as well costs nothing and avoids a round trip.
-static bool hrx_gdn_per_head_scalar_decode_op(const ggml_tensor * op) {
-    return op != nullptr && op->type == GGML_TYPE_F32 && op->ne[0] == kHrxGdnValueHeadCountQwen4Exp &&
-           op->ne[1] == 1 && op->ne[2] == 1 && op->ne[3] == 1;
-}
+// All three used to be declined. Both reasons given for that have since stopped holding: there was no
+// matcher that would root at them, and their ssm_alpha/ssm_beta projections ran on the CPU anyway
+// (F32 weights), so declining cost nothing. Now common.add_f32 / common.mul_f32 / common.unary_f32
+// root at all three, and common.dense_matmul_f32 puts both projections on HRX. With the decline still
+// in place these formed a CPU island in the middle of the prelude -- and because ggml_backend_sched
+// will not fragment a contiguous run, that island also dragged the SOFTPLUS between them back to the
+// CPU even though it was independently claimed.
 
 // qwen4exp attention geometry, from the GGUF: n_embd_head_k == n_embd_head_v == 256, n_head_kv == 2,
 // plus a lightning-indexer key cache of indexer.key_length == 128 with a single head. These mirror
@@ -1555,6 +1715,9 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             if (op->src[0]->type == GGML_TYPE_Q8_0) {
                 return hrx_dense_matmul_q8_0_shape_supported(op);
             }
+            if (op->src[0]->type == GGML_TYPE_F32) {
+                return hrx_dense_matmul_f32_supported(op);
+            }
             return hrx_dense_matmul_weight_supported(op->src[0]->type);
         case GGML_OP_MUL_MAT_ID:
             if (op->src[0] == nullptr) {
@@ -1595,17 +1758,23 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // The prelude's feeding CONCAT stays on CPU by design -- see eager_capability_declared().
         case GGML_OP_SSM_CONV:
             return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_ssm_conv_decode_supported(op);
-        // L2_NORM is never a registered dispatch root: it only ever executed as part of the fused
-        // qwen4exp.gdn_conv_prepare_decode match, which deliberately no longer covers it (covering it
-        // left q_conv_predelta/k_conv_predelta unwritten -- see that matcher's comment). With no
-        // matcher able to claim an L2_NORM node, claiming one here would strand its split, so the
-        // per-head q/k normalization runs on the CPU. These are [128,16] tensors; the cost is noise.
+        // L2_NORM is qwen4exp's per-head q/k normalization inside the GDN prelude: 72 nodes, two per
+        // linear-attention layer. It used never to be a registered dispatch root -- it only ever ran as
+        // a covered node inside the fused qwen4exp.gdn_conv_prepare_decode match, which deliberately
+        // stopped covering it (covering it left q_conv_predelta/k_conv_predelta unwritten -- see that
+        // matcher's comment), leaving nothing able to claim one. dispatch-elementwise.cpp now registers
+        // common.l2_norm_f32, a standalone row-wise kernel that roots at the node itself.
         case GGML_OP_L2_NORM:
-            return false;
+            return hrx_l2_norm_f32_supported(op);
         case GGML_OP_GATED_DELTA_NET:
             return !hrx_gdn_group_disabled("gdncore") && hrx_gdn_gated_delta_net_decode_supported(op);
+        // common.unary_f32 covers SIGMOID/SILU/RELU/SOFTPLUS on any contiguous f32 node, which is what
+        // lets the GDN prelude and the MoE router stay on one backend. The narrower, shape-scoped
+        // hrx_gdn_unary_decode_supported() is still consulted for the conv-prepare SILU so that the
+        // "gdnconv" bisect switch keeps its meaning when the generic path is not applicable.
         case GGML_OP_UNARY:
-            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_unary_decode_supported(op);
+            return hrx_unary_f32_supported(op) ||
+                   (!hrx_gdn_group_disabled("gdnconv") && hrx_gdn_unary_decode_supported(op));
         case GGML_OP_FLASH_ATTN_EXT:
             return !hrx_dispatch_group_disabled("attn") && !hrx_attention_head_size_unsupported(op);
         // llama.cpp clears a recurrent state slot with ggml_scale_inplace(s, 0) and carries surviving
@@ -1616,9 +1785,21 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // scale (common.zero_f32), the same-length contiguous f32 copy (common.copy_f32), and the 2D
         // row-strided f32 copy (common.copy_rows_f32) that the GDN conv-state writeback needs. Any other
         // scale factor, or a type-converting or permuted copy, is declined and runs on the CPU.
+        // SCALE is dst = src*scale + bias. The (0, 0) zero-fill is llama.cpp's recurrent-state clear,
+        // written straight into the pre-allocated cache: ggml_backend_sched aborts rather than falling
+        // back when a pre-allocated tensor's op is declined, so that form must stay claimed on exactly
+        // the terms it was before. common.scale_f32 adds every other affine form, which needs a
+        // contiguous same-shaped f32 source as well.
         case GGML_OP_SCALE:
-            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
-                   ggml_get_op_params_f32(op, 0) == 0.0f && ggml_get_op_params_f32(op, 1) == 0.0f;
+            if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (ggml_get_op_params_f32(op, 0) == 0.0f && ggml_get_op_params_f32(op, 1) == 0.0f) {
+                return true;
+            }
+            return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_nelements(op) > 0;
         case GGML_OP_CPY:
         // GGML_OP_CONT is the same copy with an implicit contiguous destination. qwen4exp's GDN
         // conv-state writeback is ggml_cpy(ggml_cont(tail), dst), and that CONT sits between the CONCAT
@@ -1626,17 +1807,22 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // strands the CONCAT in a split of its own where no matcher can root at it.
         case GGML_OP_CONT:
             return hrx_copy_f32_supported(op);
-        // See hrx_gdn_per_head_scalar_decode_op(): qwen4exp's GDN alpha/gate prelude emits a 48-element
-        // ADD and MUL that no matcher roots at. Everything else keeps the permissive default.
+        // Each remaining guard names a specific qwen4exp shape that no matcher roots at. The GDN
+        // alpha/gate prelude used to be one of them; common.add_f32 / common.mul_f32 now cover it.
         case GGML_OP_ADD:
-            return !hrx_add_non_f32(op) && !hrx_gdn_per_head_scalar_decode_op(op) &&
-                   !hrx_qsa_indexer_row_qwen4exp(op);
+            return !hrx_add_non_f32(op) && !hrx_qsa_indexer_row_qwen4exp(op);
         case GGML_OP_MUL:
-            return !hrx_gdn_norm_gate_row(op) && !hrx_gdn_per_head_scalar_decode_op(op) &&
-                   !hrx_stream_major_mul_qwen4exp(op) &&
-                   !hrx_ple_signed_sqrt_gate_qwen4exp(op) && !hrx_hc_dim_activation_mul_qwen4exp(op) &&
-                   !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
-                   !hrx_hc_grouped_norm_row_qwen4exp(op);
+            // Additive: every MUL the shape guards already allowed stays allowed, and the generic
+            // kernel picks up the ones they declined. Those declines were written when the only MUL
+            // kernel was the one fused into the routed-FFN dispatch; hrx_owned/mul_f32.loom now covers
+            // both broadcast directions, and each of these nodes was sitting as a lone single-node CPU
+            // split inside an otherwise contiguous HRX run, costing two split boundaries apiece.
+            return hrx_mul_f32_generic_supported(op) ||
+                   (!hrx_gdn_norm_gate_row(op) &&
+                    !hrx_stream_major_mul_qwen4exp(op) &&
+                    !hrx_ple_signed_sqrt_gate_qwen4exp(op) && !hrx_hc_dim_activation_mul_qwen4exp(op) &&
+                    !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
+                    !hrx_hc_grouped_norm_row_qwen4exp(op));
         case GGML_OP_RMS_NORM:
             return !hrx_gdn_norm_gate_row(op) && !hrx_attention_head_major_qwen4exp(op) &&
                    !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op);

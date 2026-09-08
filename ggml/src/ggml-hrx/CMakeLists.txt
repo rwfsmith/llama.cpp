@@ -163,6 +163,8 @@ ggml_add_backend_library(ggml-hrx
     dispatch_registration/dispatch-add.h
     dispatch_registration/dispatch-copy.cpp
     dispatch_registration/dispatch-copy.h
+    dispatch_registration/dispatch-elementwise.cpp
+    dispatch_registration/dispatch-elementwise.h
     dispatch_registration/dispatch-gated-delta-net.cpp
     dispatch_registration/dispatch-gated-delta-net.h
     dispatch_registration/dispatch-gather-add.cpp

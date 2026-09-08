@@ -212,6 +212,36 @@
       "owner": "ggml-hrx"
     },
     {
+      "path": "../hrx_owned/unary_f32.loom",
+      "sha256": "cb2d745792d07a53c85f3c95a779032b4e1cf52f76ec4bf114e3102a10cde549",
+      "size": 12092,
+      "owner": "ggml-hrx"
+    },
+    {
+      "path": "../hrx_owned/l2_norm_f32.loom",
+      "sha256": "0b235b78d0ed8e328b94dcef063588ca8c55ae87d33341972a2919e938bcd974",
+      "size": 5981,
+      "owner": "ggml-hrx"
+    },
+    {
+      "path": "../hrx_owned/scale_f32.loom",
+      "sha256": "75161803dde53d6d87a319444f10f2352170b62cc7e6abae5a932f51c6e44b14",
+      "size": 4794,
+      "owner": "ggml-hrx"
+    },
+    {
+      "path": "../hrx_owned/mul_f32.loom",
+      "sha256": "3920b5cafec8ecd229c4b08a3257428080ea64b062672c61d368c4bf2b7b90a0",
+      "size": 10701,
+      "owner": "ggml-hrx"
+    },
+    {
+      "path": "../hrx_owned/dense_f32.loom",
+      "sha256": "5e85733baf75cc27b83187caec9c2e14281a67e64b2f59ec9b5b0b07a116626c",
+      "size": 6463,
+      "owner": "ggml-hrx"
+    },
+    {
       "path": "../hrx_owned/zero_f32.loom",
       "sha256": "25f62bc58fdbd228246a9a0952d2f3e6cadc3677de1d42987f2d84357e0ff51d",
       "size": 1918,
@@ -421,6 +451,358 @@
         "mode": "direct",
         "primary_sources": [
           "../hrx_owned/add_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_dense_matmul_f32",
+      "symbol": "ggml_dense_matmul_f32",
+      "source": "../hrx_owned/dense_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        },
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "input_size",
+          "type": "index"
+        },
+        {
+          "name": "output_size",
+          "type": "index"
+        },
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "weight",
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/dense_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_mul_f32",
+      "symbol": "ggml_mul_f32",
+      "source": "../hrx_owned/mul_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "period",
+          "type": "index"
+        },
+        {
+          "name": "outer_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "period",
+          "type": "index"
+        },
+        {
+          "name": "outer_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "lhs",
+        "rhs",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/mul_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_mul_outer_f32",
+      "symbol": "ggml_mul_outer_f32",
+      "source": "../hrx_owned/mul_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "period",
+          "type": "index"
+        },
+        {
+          "name": "outer_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "period",
+          "type": "index"
+        },
+        {
+          "name": "outer_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "lhs",
+        "rhs",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/mul_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_scale_f32",
+      "symbol": "ggml_scale_f32",
+      "source": "../hrx_owned/scale_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/scale_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_sigmoid_f32",
+      "symbol": "ggml_sigmoid_f32",
+      "source": "../hrx_owned/unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/unary_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_silu_f32",
+      "symbol": "ggml_silu_f32",
+      "source": "../hrx_owned/unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/unary_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_relu_f32",
+      "symbol": "ggml_relu_f32",
+      "source": "../hrx_owned/unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/unary_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_softplus_f32",
+      "symbol": "ggml_softplus_f32",
+      "source": "../hrx_owned/unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/unary_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_l2_norm_f32",
+      "symbol": "ggml_l2_norm_f32",
+      "source": "../hrx_owned/l2_norm_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "row_length",
+          "type": "index"
+        },
+        {
+          "name": "row_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "row_length",
+          "type": "index"
+        },
+        {
+          "name": "row_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/l2_norm_f32.loom"
         ],
         "library_sources": []
       },

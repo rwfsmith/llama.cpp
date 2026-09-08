@@ -1,0 +1,104 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Dense f32 x f32 matmul (GGML_OP_MUL_MAT with an unquantized F32 weight).
+//
+// This exists for split topology, not for FLOPs. qwen4exp's per-layer
+// ssm_alpha / ssm_beta projections are [2560]x[48] F32 -- ~123K MACs, which is
+// why hrx_dense_matmul_weight_supported() originally declined F32 as "too small
+// to be worth a kernel". But those two nodes sit in the middle of the GDN
+// prelude chain
+//
+//   SSM_CONV -> SILU -> L2_NORM x2 -> MUL_MAT(ssm_alpha) -> ADD -> SOFTPLUS
+//                                  -> MUL -> MUL_MAT(ssm_beta) -> SIGMOID
+//
+// and ggml_backend_sched will not fragment a contiguous run: leaving these two
+// on the CPU pins every node downstream of them there too, even though HRX has
+// kernels for all of them. Their weights are already resident in HRX buffers,
+// so each CPU execution also forces a device->host weight copy. Covering them
+// is what lets the whole prelude collapse into the neighbouring GPU island.
+//
+// One workgroup owns one (output_row, token) dot product and reduces the
+// contraction across its 256 lanes. Buffers are addressed through 2D views so
+// both indices are bounded by values the launch geometry already proves; a flat
+// row*width + column index cannot be shown in range against a dynamic extent.
+// This is the same construction hrx_owned/gather_add_f32.loom uses.
+//
+// GGML layout: weight ne=[input_size, output_size], input ne=[input_size,
+// token_count], result ne=[output_size, token_count], all contiguous with ne[0]
+// fastest, which is exactly [outer]x[ne0] in view terms.
+
+amdgpu.target<gfx11-generic> @ggml_dense_f32_gfx11_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_dense_f32_gfx11_wave64) export("ggml_dense_matmul_f32") @ggml_dense_matmul_f32(
+    %input_size: index, %output_size: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %workgroup_size = index.constant 256 : index
+  kernel.launch.config workgroups(%output_size, %token_count, %one) workgroup_size(%workgroup_size, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %token_count: index,
+         %weight: buffer, %input: buffer, %output: buffer) {
+  %width = index.assume %input_size [range(%input_size, 1, 131072)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %tokens = index.assume %token_count [range(%token_count, 1, 2048)] : index
+  %output_row0 = kernel.workgroup.id<x> : index
+  %token0 = kernel.workgroup.id<y> : index
+  %output_row, %launch_outputs = index.assume %output_row0, %outputs [lt(%output_row0, %outputs)] : index, index
+  %token, %launch_tokens = index.assume %token0, %tokens [lt(%token0, %tokens)] : index, index
+  %lane = kernel.workitem.id<x> : index
+  %workgroup_size = index.constant 256 : index
+  %zero_offset = index.constant 0 : offset
+  %zero_index = index.constant 0 : index
+  %weight_noalias, %input_noalias, %output_noalias = buffer.assume.noalias %weight, %input, %output : buffer, buffer, buffer
+  %weight_view = buffer.view %weight_noalias[%zero_offset] : buffer -> view<[%launch_outputs]x[%width]xf32>
+  %input_view = buffer.view %input_noalias[%zero_offset] : buffer -> view<[%launch_tokens]x[%width]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%launch_tokens]x[%launch_outputs]xf32>
+  %zero_f32 = scalar.constant 0.0 : f32
+  %thread_sum = scf.for %column = [%lane to %width step %workgroup_size](%running_sum = %zero_f32 : f32) -> (f32) {
+    %safe_column = index.assume %column [lt(%column, %width)] : index
+    %weight_value = view.load %weight_view[%output_row, %safe_column] : view<[%launch_outputs]x[%width]xf32> -> f32
+    %input_value = view.load %input_view[%token, %safe_column] : view<[%launch_tokens]x[%width]xf32> -> f32
+    %product = scalar.mulf<reassoc|nnan|ninf|nsz> %weight_value, %input_value : f32
+    %next_sum = scalar.addf<reassoc|nnan|ninf|nsz> %running_sum, %product : f32
+    scf.yield %next_sum : f32
+  }
+  // Every lane participates: lanes past the contraction width contributed 0.0.
+  %sum = kernel.workgroup.reduce<addf> %thread_sum : f32
+  %is_writer = index.cmp eq, %lane, %zero_index : index
+  scf.if %is_writer {
+    view.store %sum, %output_view[%token, %output_row] : f32, view<[%launch_tokens]x[%launch_outputs]xf32>
+  }
+  kernel.return
+}
+
+check.case public @ggml_dense_matmul_f32_gemv_case {
+  %input_size = check.literal value(4) : index
+  %output_size = check.literal value(2) : index
+  %token_count = check.literal value(1) : index
+  // weight rows (0,1,2,3) and (4,5,6,7) dotted with input (1,1,1,1) -> (6, 22).
+  // Distinct rows prove each workgroup reads its own weight row.
+  %weight = check.generate.iota offset(0.0) step(1.0) : tensor<2x4xf32>
+  %input = check.generate.fill value(1.0) : tensor<1x4xf32>
+  %output = check.generate.fill value(0.0) : tensor<1x2xf32>
+  %expected = check.generate.iota offset(6.0) step(16.0) : tensor<1x2xf32>
+  func.call @ggml_dense_matmul_f32(%input_size, %output_size, %token_count, %weight, %input, %output) : (index, index, index, tensor<2x4xf32>, tensor<1x4xf32>, tensor<1x2xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<1x2xf32>
+  check.return
+}
+
+check.case public @ggml_dense_matmul_f32_wide_case {
+  %input_size = check.literal value(2560) : index
+  %output_size = check.literal value(1) : index
+  %token_count = check.literal value(1) : index
+  // The real qwen4exp ssm_alpha contraction width. 2560 x (0.5 * 0.5) == 640,
+  // exactly representable, and 10x the workgroup width so this exercises both
+  // the strided accumulation loop and the cross-wave reduction.
+  %weight = check.generate.fill value(0.5) : tensor<1x2560xf32>
+  %input = check.generate.fill value(0.5) : tensor<1x2560xf32>
+  %output = check.generate.fill value(0.0) : tensor<1x1xf32>
+  %expected = check.generate.fill value(640.0) : tensor<1x1xf32>
+  func.call @ggml_dense_matmul_f32(%input_size, %output_size, %token_count, %weight, %input, %output) : (index, index, index, tensor<1x2560xf32>, tensor<1x2560xf32>, tensor<1x1xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.001) rtol(0.000001) nan(same) : tensor<1x1xf32>
+  check.return
+}
+
+check.benchmark<@ggml_dense_matmul_f32_wide_case> @ggml_dense_matmul_f32_2560x1

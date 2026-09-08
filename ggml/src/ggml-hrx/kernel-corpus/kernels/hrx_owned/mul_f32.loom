@@ -1,0 +1,176 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Elementwise f32 multiply with ggml repeat/broadcast semantics (GGML_OP_MUL).
+//
+// Until now the only MUL kernel in the corpus was the one fused inside
+// dispatch-routed-ffn.cpp, yet device_supports_op()'s `default: return true`
+// claimed every MUL node. That is safe only while the scheduler happens to keep
+// unfused MULs on the CPU; as soon as a neighbouring op moves to HRX the MUL
+// gets pulled into the split and the graph aborts with
+// "unsupported HRX node ... MUL". Covering MUL generically both removes that
+// hazard and picks up the 452 MUL nodes a qwen4exp decode census leaves on the
+// CPU.
+//
+// ggml allows src1 to be repeated into src0's shape. This kernel handles the
+// contiguous-prefix form of that: src1's shape agrees with src0's on some
+// leading run of dimensions and is 1 on the rest, so the product of that
+// leading run is a period and dst[i] = src0[i] * src1[i % period]. That covers
+// scalar gates ([1] into [2560]), per-row weights ([ne0] into [ne0,ne1]) and
+// the same-shape case, which together are every MUL in a qwen4exp decode graph.
+// dispatch-elementwise.cpp is what proves the prefix property and computes the
+// period; anything else it declines and leaves on the CPU.
+//
+// Addressing is 2D -- [outer]x[period] over the destination, [period] over
+// src1 -- so both indices are bounded by values the launch geometry already
+// proves. A flat outer*period + column index cannot be shown in range against a
+// dynamic extent. This is the construction hrx_owned/gather_add_f32.loom uses.
+
+amdgpu.target<gfx11-generic> @ggml_mul_gfx11_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_mul_gfx11_wave64) export("ggml_mul_f32") @ggml_mul_f32(
+    %period: index, %outer_count: index) {
+  %one = index.constant 1 : index
+  %workgroup_size = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %period, %rounding : index
+  %column_workgroup_count = index.div %rounded, %workgroup_size : index
+  kernel.launch.config workgroups(%column_workgroup_count, %outer_count, %one) workgroup_size(%workgroup_size, %one, %one) : index
+} launch(%period: index, %outer_count: index, %lhs: buffer, %rhs: buffer, %output: buffer) {
+  %width = index.assume %period [range(%period, 1, 1048576)] : index
+  %outers = index.assume %outer_count [range(%outer_count, 1, 1048576)] : index
+  %column_workgroup = kernel.workgroup.id<x> : index
+  %outer0 = kernel.workgroup.id<y> : index
+  %workitem = kernel.workitem.id<x> : index
+  %workgroup_size = index.constant 256 : index
+  %outer, %launch_outers = index.assume %outer0, %outers [lt(%outer0, %outers)] : index, index
+  %base0 = index.mul %column_workgroup, %workgroup_size : index
+  %column0 = index.add %base0, %workitem : index
+  %column = index.assume %column0 [range(%column0, 0, 1048575)] : index
+  %in_bounds = index.cmp ult, %column, %width : index
+  %zero_offset = index.constant 0 : offset
+  %lhs_noalias, %rhs_noalias, %output_noalias = buffer.assume.noalias %lhs, %rhs, %output : buffer, buffer, buffer
+  %lhs_view = buffer.view %lhs_noalias[%zero_offset] : buffer -> view<[%launch_outers]x[%width]xf32>
+  %rhs_view = buffer.view %rhs_noalias[%zero_offset] : buffer -> view<[%width]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%launch_outers]x[%width]xf32>
+  scf.if %in_bounds {
+    %safe_column = index.assume %column [lt(%column, %width)] : index
+    %lhs_value = view.load %lhs_view[%outer, %safe_column] : view<[%launch_outers]x[%width]xf32> -> f32
+    %rhs_value = view.load %rhs_view[%safe_column] : view<[%width]xf32> -> f32
+    %product = scalar.mulf %lhs_value, %rhs_value : f32
+    view.store %product, %output_view[%outer, %safe_column] : f32, view<[%launch_outers]x[%width]xf32>
+  }
+  kernel.return
+}
+
+// Broadcast a single scalar across a row: the shared-expert gate form
+// ([2560] * [1]) that first exposed the missing kernel.
+check.case public @ggml_mul_f32_scalar_broadcast_case {
+  %period = check.literal value(1) : index
+  %outer_count = check.literal value(4) : index
+  %lhs = check.generate.iota offset(1.0) step(1.0) : tensor<4x1xf32>
+  %rhs = check.generate.fill value(3.0) : tensor<1xf32>
+  %output = check.generate.fill value(0.0) : tensor<4x1xf32>
+  %expected = check.generate.iota offset(3.0) step(3.0) : tensor<4x1xf32>
+  func.call @ggml_mul_f32(%period, %outer_count, %lhs, %rhs, %output) : (index, index, tensor<4x1xf32>, tensor<1xf32>, tensor<4x1xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<4x1xf32>
+  check.return
+}
+
+// Per-column weight indexing: proves the rhs is indexed by column alone. Paired
+// with the scalar case above -- whose single-element rhs would read out of
+// bounds if the rhs index advanced with the outer index -- this pins down both
+// axes of the broadcast.
+check.case public @ggml_mul_f32_row_broadcast_case {
+  %period = check.literal value(4) : index
+  %outer_count = check.literal value(1) : index
+  %lhs = check.generate.fill value(2.0) : tensor<1x4xf32>
+  %rhs = check.generate.iota offset(1.0) step(1.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<1x4xf32>
+  %expected = check.generate.iota offset(2.0) step(2.0) : tensor<1x4xf32>
+  func.call @ggml_mul_f32(%period, %outer_count, %lhs, %rhs, %output) : (index, index, tensor<1x4xf32>, tensor<4xf32>, tensor<1x4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<1x4xf32>
+  check.return
+}
+
+check.benchmark<@ggml_mul_f32_row_broadcast_case> @ggml_mul_f32_row_broadcast
+
+// The complementary broadcast direction: src1 carries one scalar per *outer*
+// index rather than one per column. qwen4exp emits this as f32[2560,4] *
+// f32[1,4] in build_hc_combine() and build_ple(), and as f32[640,10] *
+// f32[1,10] for the routed-expert weighting (ffn_moe_weighted) -- 185 lone MUL
+// nodes in a decode census, each of which cost two split boundaries because it
+// sat as a single-node CPU island inside an otherwise HRX run.
+//
+// Only the rhs indexing differs from ggml_mul_f32 above, so the two share a
+// matcher in dispatch-elementwise.cpp which picks the export from which side of
+// the shape the singleton dimension is on.
+
+kernel.def target(@ggml_mul_gfx11_wave64) export("ggml_mul_outer_f32") @ggml_mul_outer_f32(
+    %period: index, %outer_count: index) {
+  %one = index.constant 1 : index
+  %workgroup_size = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %period, %rounding : index
+  %column_workgroup_count = index.div %rounded, %workgroup_size : index
+  kernel.launch.config workgroups(%column_workgroup_count, %outer_count, %one) workgroup_size(%workgroup_size, %one, %one) : index
+} launch(%period: index, %outer_count: index, %lhs: buffer, %rhs: buffer, %output: buffer) {
+  %width = index.assume %period [range(%period, 1, 1048576)] : index
+  %outers = index.assume %outer_count [range(%outer_count, 1, 1048576)] : index
+  %column_workgroup = kernel.workgroup.id<x> : index
+  %outer0 = kernel.workgroup.id<y> : index
+  %workitem = kernel.workitem.id<x> : index
+  %workgroup_size = index.constant 256 : index
+  %outer, %launch_outers = index.assume %outer0, %outers [lt(%outer0, %outers)] : index, index
+  %base0 = index.mul %column_workgroup, %workgroup_size : index
+  %column0 = index.add %base0, %workitem : index
+  %column = index.assume %column0 [range(%column0, 0, 1048575)] : index
+  %in_bounds = index.cmp ult, %column, %width : index
+  %zero_offset = index.constant 0 : offset
+  %lhs_noalias, %rhs_noalias, %output_noalias = buffer.assume.noalias %lhs, %rhs, %output : buffer, buffer, buffer
+  %lhs_view = buffer.view %lhs_noalias[%zero_offset] : buffer -> view<[%launch_outers]x[%width]xf32>
+  %rhs_view = buffer.view %rhs_noalias[%zero_offset] : buffer -> view<[%launch_outers]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%launch_outers]x[%width]xf32>
+  %rhs_value = view.load %rhs_view[%outer] : view<[%launch_outers]xf32> -> f32
+  scf.if %in_bounds {
+    %safe_column = index.assume %column [lt(%column, %width)] : index
+    %lhs_value = view.load %lhs_view[%outer, %safe_column] : view<[%launch_outers]x[%width]xf32> -> f32
+    %product = scalar.mulf %lhs_value, %rhs_value : f32
+    view.store %product, %output_view[%outer, %safe_column] : f32, view<[%launch_outers]x[%width]xf32>
+  }
+  kernel.return
+}
+
+// One scalar per outer index. This is the exact mirror of
+// @ggml_mul_f32_scalar_broadcast_case above -- same single-column geometry, but
+// an rhs that varies down the outer axis instead of being constant. A kernel
+// that indexed the rhs by column would read rhs[0] for every row here and
+// produce 2,2,2 rather than 2,4,6, so this case alone pins the broadcast axis.
+check.case public @ggml_mul_outer_f32_stream_broadcast_case {
+  %period = check.literal value(1) : index
+  %outer_count = check.literal value(3) : index
+  %lhs = check.generate.fill value(2.0) : tensor<3x1xf32>
+  %rhs = check.generate.iota offset(1.0) step(1.0) : tensor<3xf32>
+  %output = check.generate.fill value(0.0) : tensor<3x1xf32>
+  %expected = check.generate.iota offset(2.0) step(2.0) : tensor<3x1xf32>
+  func.call @ggml_mul_outer_f32(%period, %outer_count, %lhs, %rhs, %output) : (index, index, tensor<3x1xf32>, tensor<3xf32>, tensor<3x1xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<3x1xf32>
+  check.return
+}
+
+// Wide rows against a single-element rhs: confirms the column axis still walks
+// the full period and that the launch geometry covers a row wider than one
+// workgroup.
+check.case public @ggml_mul_outer_f32_wide_row_case {
+  %period = check.literal value(300) : index
+  %outer_count = check.literal value(1) : index
+  %lhs = check.generate.iota offset(1.0) step(1.0) : tensor<1x300xf32>
+  %rhs = check.generate.fill value(3.0) : tensor<1xf32>
+  %output = check.generate.fill value(0.0) : tensor<1x300xf32>
+  %expected = check.generate.iota offset(3.0) step(3.0) : tensor<1x300xf32>
+  func.call @ggml_mul_outer_f32(%period, %outer_count, %lhs, %rhs, %output) : (index, index, tensor<1x300xf32>, tensor<1xf32>, tensor<1x300xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<1x300xf32>
+  check.return
+}
+
+check.benchmark<@ggml_mul_outer_f32_wide_row_case> @ggml_mul_outer_f32_wide_row
