@@ -617,7 +617,9 @@ static bool match_qwen4exp_gdn_norm_gate_decode_dispatch(const DispatchMatchCont
     }
 
     // Emitted at the root's position, so every input has to be live by then. z is the one that is
-    // not: its projection is ordered after this RMS_NORM.
+    // not: its projection is ordered after this RMS_NORM. The scheduler enforces this invariant for
+    // every match as a backstop, but it can only fail the graph; declining here lets the nodes fall
+    // back to CPU instead.
     if (!value_ready_before(context.graph, norm_match.raw_output, context.root_index) ||
         !value_ready_before(context.graph, norm_match.norm_weight, context.root_index) ||
         !value_ready_before(context.graph, norm_match.z, context.root_index)) {

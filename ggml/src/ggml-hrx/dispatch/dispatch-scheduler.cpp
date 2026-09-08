@@ -75,6 +75,51 @@ static bool match_overlaps_covered_nodes(const DispatchMatch & match, const std:
     return false;
 }
 
+// A match's dispatches are emitted below at the traversal position of its *root* node, not at the
+// position of the last node it covers. Every value they bind therefore has to be live by the time
+// the root runs. That is not automatic for a fused match: ggml may order an independent producer
+// between the root and the last covered node, and the fused kernel would then read a buffer that
+// nothing has written yet. The graph, the bindings and the kernel all look correct in that case and
+// only the numerics are wrong, so the failure is silent and extremely expensive to chase -- it cost
+// a full bisect to find in qwen4exp's GDN norm gate, where the z projection is ordered after the
+// RMS_NORM the fusion roots at.
+//
+// A bound value is acceptable when it is produced before the root, produced by a node this match
+// covers (the fusion subsumes that node, so it is computing the value itself rather than reading a
+// stale one), or has no producer at all -- a weight, a graph input, or a plan transient, all of
+// which are materialized outside the traversal.
+static bool match_binds_value_produced_after_root(const Graph &         graph,
+                                                  const DispatchMatch & match,
+                                                  size_t                root_index,
+                                                  const Dispatch *&     offending_dispatch,
+                                                  ValueId &             offending_value) {
+    const auto covers = [&match](size_t index) {
+        return std::find(match.covered_nodes.begin(), match.covered_nodes.end(), index) != match.covered_nodes.end();
+    };
+    const auto scan = [&](const std::vector<Dispatch> & dispatches) {
+        for (const Dispatch & dispatch : dispatches) {
+            for (const DispatchBinding & binding : dispatch.bindings) {
+                const GraphNode * producer = graph.index().producer(binding.value);
+                if (producer == nullptr) {
+                    continue;
+                }
+                size_t producer_index = 0;
+                if (!graph.index().node_index(producer, producer_index)) {
+                    continue;
+                }
+                if (producer_index < root_index || covers(producer_index)) {
+                    continue;
+                }
+                offending_dispatch = &dispatch;
+                offending_value    = binding.value;
+                return true;
+            }
+        }
+        return false;
+    };
+    return scan(match.initialization_dispatches) || scan(match.dispatches);
+}
+
 static bool try_match_registration(const Graph &              graph,
                                    const GraphNode *          node,
                                    size_t                     node_index,
@@ -266,6 +311,23 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
                 diagnostics->unsupported_node_index = i;
                 diagnostics->unsupported_node       = node;
                 diagnostics->unsupported_message    = "invalid HRX dispatch match";
+                diagnostics->match                  = std::move(match_diagnostics);
+            }
+            clear_plan_results(plan_);
+            return false;
+        }
+        const Dispatch * offending_dispatch = nullptr;
+        ValueId          offending_value;
+        if (match_binds_value_produced_after_root(graph, match, i, offending_dispatch, offending_value)) {
+            plan_.status.log(
+                "HRX dispatch kernel_id=%llu for node %zu (%s) binds value %d, which is produced after the node "
+                "it is emitted at; the matcher must decline this graph ordering",
+                offending_dispatch != nullptr ? (unsigned long long) offending_dispatch->kernel.kernel_id : 0ULL, i,
+                ggml_op_name(node->op), offending_value.value);
+            if (diagnostics != nullptr) {
+                diagnostics->unsupported_node_index = i;
+                diagnostics->unsupported_node       = node;
+                diagnostics->unsupported_message    = "HRX dispatch binds a value produced after its root";
                 diagnostics->match                  = std::move(match_diagnostics);
             }
             clear_plan_results(plan_);
