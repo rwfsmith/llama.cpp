@@ -1003,14 +1003,15 @@ static constexpr int64_t kHrxMoeDownExpertHiddenSizeQwen4Exp = 640;
 // same weight or ggml-backend's scheduler aborts with "pre-allocated tensor ... that cannot run the
 // operation (NONE)" -- the weight is stuck in an HRX buffer neither check will let it leave.
 //
-// Currently forced off: HRX's routed FFN is an all-or-nothing fused chain. The down dispatch
+// HRX's routed FFN is an all-or-nothing fused chain. The down dispatch
 // ("llm.routed_ffn.decode_down_qwen4exp") binds match.input_alternate->alternate_value -- the Q8
-// hidden state *produced by* the fused gate/up dispatch ("qwen.decode.moe.hidden_q8") -- so it can
-// only match when gate/up ran on HRX in the same graph. Since qwen4exp's gate/up has no matcher (see
-// hrx_moe_gate_up_weight_qwen4exp() below), that alternate never exists and the down node would be
-// claimed with no dispatch able to run it. Keeping the quant/shape test intact but gating it here
-// means restoring the whole path is a one-line change once a qwen4exp gate/up kernel exists.
-static constexpr bool kHrxMoeDownQwen4ExpEnabled = false;
+// hidden state *produced by* the fused gate/up dispatch -- so it can only match when gate/up ran on
+// HRX in the same graph. This was forced off while qwen4exp's gate/up had no matcher, because the
+// alternate never existed and the down node would be claimed with no dispatch able to run it.
+//
+// "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp" now publishes that alternate (it always
+// emits the next_q8 kernel variant), so the chain can form and this is enabled.
+static constexpr bool kHrxMoeDownQwen4ExpEnabled = true;
 
 static bool hrx_moe_down_weight_supported(const ggml_tensor * weight) {
     return kHrxMoeDownQwen4ExpEnabled && weight != nullptr && hrx_moe_down_quant_supported(weight->type) &&
@@ -1025,31 +1026,33 @@ static constexpr int64_t kHrxHiddenSizeQwen4Exp = 2560;
 // [hidden_size=2560, expert_hidden_size=640, expert_count=512]. Note this is the transpose of the
 // down-projection geometry checked above ([640, 2560, 512]), so the two never collide.
 //
-// Every registered routed-FFN gate/up matcher in dispatch-routed-ffn.cpp
-// ("llm.routed_ffn.decode_gate_up_swiglu_q4k_q8" and "llm.routed_ffn.gate_up_swiglu_q4k_f16_wmma")
-// is written against the kRoutedFfn* constants, which are pinned to the *qwen30b* profile
-// (hidden_size 2048, expert_hidden_size 768, expert_count 128, route_count 8) and must stay pinned --
-// see dispatch-llm-profiles.h. Only the *down* projection ever got a qwen4exp-specific matcher
-// ("llm.routed_ffn.decode_down_qwen4exp"). So a qwen4exp gate/up MUL_MAT_ID matches nothing, and
-// claiming it strands the node with no dispatch and fails its whole split.
+// These are now served by "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp", a qwen4exp-scoped
+// sibling of the qwen30b decode matcher. The qwen30b matchers stay written against the kRoutedFfn*
+// constants pinned to the qwen30b profile (see dispatch-llm-profiles.h); the two sets of shape tests
+// are disjoint, so each declines what the other claims and neither model perturbs the other.
 //
-// Declining leaves the routed gate/up on the CPU. At decode that is route_count(10) x 2560 x 640 x 2
-// projections for a single token, which the CPU absorbs comfortably; a dedicated qwen4exp gate/up
-// kernel + matcher is the natural follow-up once the GDN/QSA decode path is validated.
+// The type test below is not optional. It has to agree exactly with
+// is_routed_ffn_gate_up_weight_qwen4exp() in dispatch-routed-ffn.cpp (the only gate/up kernel we have
+// is Q4_K) *and* with hrx_weight_quant_supported() in the GGML_OP_NONE arm of device_supports_op(),
+// because llama.cpp picks a weight's buffer type by probing its consuming op and ggml-backend then
+// re-probes the placed weight as GGML_OP_NONE. This model's quant mix is not uniform -- UD-Q4_K_XL
+// leaves a couple of expert tensors at Q5_K -- and a shape-only claim pinned one of those into an
+// HRX buffer that the NONE probe then refused, aborting the run with "pre-allocated tensor
+// (blk.2.ffn_gate_exps.weight) in a buffer (HRX0) that cannot run the operation (NONE)". Those few
+// layers keep their gate/up on the CPU.
 static constexpr int64_t kHrxMoeGateUpExpertCountQwen4Exp = 512;
 static constexpr int64_t kHrxMoeRouteCountQwen4Exp        = 10;
 
 static bool hrx_moe_gate_up_weight_qwen4exp(const ggml_tensor * weight) {
-    return weight != nullptr && weight->ne[0] == kHrxHiddenSizeQwen4Exp &&
+    return weight != nullptr && weight->type == GGML_TYPE_Q4_K && weight->ne[0] == kHrxHiddenSizeQwen4Exp &&
            weight->ne[1] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
            weight->ne[2] == kHrxMoeGateUpExpertCountQwen4Exp;
 }
 
 // The SwiGLU between qwen4exp's routed gate/up and down projections. HRX only ever runs this
 // activation *inside* the fused "llm.routed_ffn.*gate_up_swiglu*" dispatches -- there is no matcher
-// rooted at a standalone GGML_OP_GLU anywhere in the corpus. Since hrx_moe_gate_up_weight_qwen4exp()
-// above keeps qwen4exp's gate/up on the CPU, that fused dispatch never forms here and the GLU is left
-// exposed, so it has to follow its producers to the CPU.
+// rooted at a standalone GGML_OP_GLU anywhere in the corpus. So a GLU that HRX claims without its
+// gate/up having been fused alongside it is stranded, and must follow its producers to the CPU.
 //
 // Keyed on the expert_hidden_size=640 row alone, so it covers both the routed decode shape
 // [640, route_count=10] and the shared-expert shape [640, 1]. The latter only became reachable once
@@ -1057,8 +1060,87 @@ static bool hrx_moe_gate_up_weight_qwen4exp(const ggml_tensor * weight) {
 // behind them, where it stranded its split with "unsupported HRX node 8: GLU f32[640]". Other models
 // keep the permissive default -- qwen30b's expert_hidden_size is 768.
 static bool hrx_moe_glu_qwen4exp_decode(const ggml_tensor * op) {
-    return op != nullptr && op->type == GGML_TYPE_F32 && op->ne[0] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
-           op->ne[2] == 1 && op->ne[3] == 1;
+    if (op == nullptr || op->type != GGML_TYPE_F32 || op->ne[0] != kHrxMoeDownExpertHiddenSizeQwen4Exp ||
+        op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    if (op->ne[1] != kHrxMoeRouteCountQwen4Exp) {
+        // Shared-expert GLU [expert_hidden, 1, 1]: no matcher, always CPU.
+        return true;
+    }
+    // Routed decode GLU [expert_hidden, route_count, 1]. llama.cpp's build_moe_ffn() emits this as
+    // glu_split(mul_mat_id(gate_exps, ...), mul_mat_id(up_exps, ...)), so the gate/up expert weights
+    // are reachable from here -- and this GLU is only fused (and therefore only claimable) when
+    // "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp" matched, which requires both of them to
+    // be Q4_K. On the Q5_K layers of this quant mix the gate/up stays on the CPU, and this GLU has to
+    // stay with it. Unlike an expert weight, a GLU is a pure compute node with no buffer-type probe
+    // behind it, so it is safe to decide this from the surrounding topology.
+    const ggml_tensor * gate = op->src[0];
+    const ggml_tensor * up   = op->src[1];
+    const bool          fused = gate != nullptr && up != nullptr && gate->op == GGML_OP_MUL_MAT_ID &&
+                       up->op == GGML_OP_MUL_MAT_ID && hrx_moe_gate_up_weight_qwen4exp(gate->src[0]) &&
+                       hrx_moe_gate_up_weight_qwen4exp(up->src[0]);
+    return !fused;
+}
+
+// True when a qwen4exp routed-FFN down node's activation input comes from a GLU whose gate/up were
+// themselves fusable on HRX. The down dispatch binds a Q8_1-x4 alternate of that activation, and the
+// only thing that ever publishes it is the gate/up dispatch -- so if gate/up ran on the CPU (this
+// quant mix leaves blk.2's expert gate/up at Q5_K), the down node has no alternate to bind, fails to
+// match, and strands its split.
+//
+// The `src[1]->op != GGML_OP_GLU` fallback is load-bearing: llama.cpp's load-time buffer probe builds
+// its MUL_MAT_ID test op with a synthetic f32 leaf for src[1], not a GLU. Returning true there keeps
+// the probe's answer a pure function of the weight, so every down expert weight still lands in an HRX
+// buffer and the GGML_OP_NONE re-probe stays consistent. Only real graph nodes, which always feed the
+// down projection from a GLU, take the chain-checked path.
+static bool hrx_moe_down_chain_fusable_qwen4exp(const ggml_tensor * op) {
+    const ggml_tensor * glu = op == nullptr ? nullptr : op->src[1];
+    if (glu == nullptr || glu->op != GGML_OP_GLU) {
+        return true;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    return gate != nullptr && up != nullptr && gate->op == GGML_OP_MUL_MAT_ID && up->op == GGML_OP_MUL_MAT_ID &&
+           hrx_moe_gate_up_weight_qwen4exp(gate->src[0]) && hrx_moe_gate_up_weight_qwen4exp(up->src[0]);
+}
+
+// qwen4exp's MoE router row: the [n_expert=512, T] gate logits/probabilities and their ARGSORT.
+// dispatch-moe-router.cpp's only matcher roots at the router SOFT_MAX and is written against the
+// qwen30b router profile (128 experts, top-8, ARGSORT + GET_ROWS of reshaped probabilities);
+// qwen4exp routes 10 of 512 through a different top-k topology, so that matcher rejects it --
+// "MoE router top-k matcher rejected node: missing GET_ROWS from reshaped probabilities and top-k
+// ids" -- leaving the node stranded and failing the whole graph with compute status -1.
+//
+// This only became reachable once the routed FFN itself moved onto HRX. With the entire MoE block on
+// the CPU the scheduler left the router beside it; with gate/up/down claimed, the router gets pulled
+// across with them. n_expert=512 is qwen4exp-specific (qwen30b has 128), so other models are
+// untouched, and this restores the placement these nodes had before the routed FFN moved.
+static bool hrx_moe_router_row_qwen4exp(const ggml_tensor * op) {
+    return op != nullptr && op->ne[0] == kHrxMoeGateUpExpertCountQwen4Exp && op->ne[2] == 1 && op->ne[3] == 1;
+}
+
+// qwen4exp's routed-FFN route-weight normalization: SUM_ROWS reduces the [route_count, T] top-k
+// weights to [1, T], a CLAMP applies the epsilon floor to that sum, and a DIV normalizes the weights
+// by it. In qwen30b this trio is folded into the MoE router / routed-FFN dispatches; for qwen4exp the
+// router has no matcher at all, and match_routed_ffn_down_weighted_reduce_topology_qwen4exp() covers
+// only the *output* side of the reduce (the weighted MUL, its per-expert views, and the ADD tree), so
+// nothing roots at any of these. Claiming one strands it -- "unsupported HRX node 0: SUM_ROWS
+// output=f32[1,1,1,1] inputs=[f32[10,1,1,1]] consumers=[CLAMP]".
+//
+// Like the router row above, these only became reachable once the routed FFN moved onto HRX and the
+// scheduler began pulling their split across with it; route_count=10 is qwen4exp-specific (qwen30b
+// routes 8), so the qwen30b fusions that legitimately cover these nodes are untouched.
+static bool hrx_moe_route_weight_norm_qwen4exp(const ggml_tensor * op) {
+    const ggml_tensor * src = op == nullptr ? nullptr : op->src[0];
+    if (src == nullptr || op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    if (src->ne[0] == kHrxMoeRouteCountQwen4Exp && src->ne[2] == 1 && src->ne[3] == 1) {
+        return true;
+    }
+    return src->op == GGML_OP_SUM_ROWS && src->src[0] != nullptr &&
+           src->src[0]->ne[0] == kHrxMoeRouteCountQwen4Exp;
 }
 
 // qwen4exp GDN (Gated DeltaNet) decode-only shape profile: head_k_dim == head_v_dim == 128
@@ -1639,9 +1721,14 @@ static bool hrx_ple_signed_sqrt_gate_qwen4exp(const ggml_tensor * op) {
 //                                                              router weight
 //
 // The HC kernels registered in dispatch-rmsnorm.cpp cover the grouped *norm*, a different pattern that
-// MULs by a full hc_dim-wide (10240) weight; there is no PLE dispatch at all; and the routed-FFN reduce
-// only ever runs fused inside "llm.routed_ffn.*down*" -- which cannot match here (see
-// hrx_moe_down_weight_supported()). So claiming any of them would strand the node with no dispatch.
+// MULs by a full hc_dim-wide (10240) weight; and there is no PLE dispatch at all. So claiming any of
+// those three would strand the node with no dispatch.
+//
+// The routed-FFN reduce is the exception: match_routed_ffn_down_weighted_reduce_topology_qwen4exp()
+// folds it into "llm.routed_ffn.decode_down_qwen4exp", so it *must* stay on HRX -- declining it left
+// the down MUL_MAT_ID with no MUL consumer to fuse, and the down matcher rejected the whole chain
+// ("unsupported HRX node 3: MUL_MAT_ID ... consumers=[]"). It is told apart from the HC/PLE cases by
+// its stream count: route_count (10) rather than the hyper-connection count (4).
 //
 // The `op->ne[1] > 1` guard is load-bearing: it keeps the ordinary RMS_NORM-times-weight fusion
 // (f32[2560,T] * f32[2560,1]) out of this predicate, which would otherwise collide during single-token
@@ -1649,6 +1736,9 @@ static bool hrx_ple_signed_sqrt_gate_qwen4exp(const ggml_tensor * op) {
 // handles them for free.
 static bool hrx_stream_major_mul_qwen4exp(const ggml_tensor * op) {
     if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    if (op->ne[1] == kHrxMoeRouteCountQwen4Exp) {
         return false;
     }
     const ggml_tensor * rows    = op->src[0];
@@ -1878,11 +1968,26 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             if (hrx_dispatch_group_disabled("matmul")) {
                 return false;
             }
-            // Checked before the quantization arm below: the qwen4exp routed gate/up weights are Q4_K,
-            // which hrx_weight_quant_supported() accepts, but no gate/up matcher covers qwen4exp's
-            // geometry. See hrx_moe_gate_up_weight_qwen4exp().
+            // qwen4exp routed (MoE) gate/up projection: Q4_K at [hidden, expert_hidden, experts],
+            // served by "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp", which fuses gate + up
+            // + SwiGLU and republishes the result as a Q8_1-x4 alternate for the down dispatch.
+            //
+            // Deliberately shape-only (no token-count guard), for the same reason the down arm below
+            // is: llama.cpp's load-time buffer probe builds its MUL_MAT_ID test op with 512 tokens
+            // (weight_buft_supported()), which is byte-for-byte the same shape as a real 512-token
+            // prefill node -- so the two are indistinguishable here. Declining on token count would
+            // only push ffn_*_exps.weight into a CPU buffer and strand the whole routed FFN on the
+            // CPU, which is exactly the state this change exists to fix.
+            //
+            // Consequence, identical in kind to the down arm: a genuine prefill gate/up (n_ubatch > 1)
+            // is claimed but has no matcher -- the grouped/prefill schedule packs its expert ordinal
+            // into 7 bits of the partition descriptor, so it is structurally capped at 128 experts and
+            // can never serve qwen4exp's 512 -- and will hard-abort in DispatchScheduler rather than
+            // falling back to CPU. The entire qwen4exp HRX path (attention, GDN, routed down) is
+            // already decode-only for the same reason, so this adds no new constraint: run with
+            // -ub 1. See hrx_moe_gate_up_weight_qwen4exp().
             if (hrx_moe_gate_up_weight_qwen4exp(op->src[0])) {
-                return false;
+                return true;
             }
             if (hrx_weight_quant_supported(op->src[0]->type)) {
                 return true;
@@ -1899,7 +2004,7 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             // back to CPU. This is the same general class of issue as the broader compute-op
             // over-claim in the `default: return true;` case below (RMS_NORM/ADD/ROPE/etc.), just
             // narrower in scope since it is gated to one specific weight quant+shape combination.
-            return hrx_moe_down_weight_supported(op->src[0]);
+            return hrx_moe_down_weight_supported(op->src[0]) && hrx_moe_down_chain_fusable_qwen4exp(op);
         // qwen4exp GDN (Gated DeltaNet): all four of these are real compute ops with the over-claim
         // risk described in the comment above hrx_gdn_ssm_conv_decode_supported(), so each is
         // scoped to the exact qwen4exp decode-time shape profile and declined otherwise (falls back to
@@ -1979,13 +2084,18 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             return !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
                    !hrx_hc_grouped_norm_row_qwen4exp(op);
         case GGML_OP_CLAMP:
-            return !hrx_ple_signed_sqrt_gate_qwen4exp(op);
+            return !hrx_ple_signed_sqrt_gate_qwen4exp(op) && !hrx_moe_route_weight_norm_qwen4exp(op);
         case GGML_OP_SUM_ROWS:
-            return !hrx_ple_stream_reduce_qwen4exp(op);
+            return !hrx_ple_stream_reduce_qwen4exp(op) && !hrx_moe_route_weight_norm_qwen4exp(op);
+        case GGML_OP_DIV:
+            return !hrx_moe_route_weight_norm_qwen4exp(op);
         case GGML_OP_SET_ROWS:
             return !hrx_cache_publish_unmatched_qwen4exp(op);
         case GGML_OP_GLU:
             return !hrx_moe_glu_qwen4exp_decode(op);
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ARGSORT:
+            return !hrx_moe_router_row_qwen4exp(op);
         default:
             return true;
     }

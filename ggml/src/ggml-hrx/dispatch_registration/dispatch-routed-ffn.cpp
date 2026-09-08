@@ -6,6 +6,8 @@
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <utility>
@@ -13,6 +15,32 @@
 
 namespace ggml::hrx {
 namespace {
+
+// When HRX_TRACE_MOE_DOWN is set, log the first gate in match_decode_routed_ffn_down_qwen4exp() that
+// rejects a node. The down matcher has nine independent preconditions and a failure surfaces only as
+// a generic "unsupported HRX node ...: MUL_MAT_ID", which says nothing about which one missed.
+static bool trace_moe_down_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TRACE_MOE_DOWN");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void trace_moe_down_reject(const char * reason) {
+    if (trace_moe_down_enabled()) {
+        std::fprintf(stderr, "hrx: qwen4exp routed down matcher rejected node: %s\n", reason);
+        std::fflush(stderr);
+    }
+}
+
+static void trace_moe_down_reject_counts(const char * reason, size_t views, size_t reductions, bool residual) {
+    if (trace_moe_down_enabled()) {
+        std::fprintf(stderr, "hrx: qwen4exp routed down matcher rejected node: %s (views=%zu reductions=%zu residual=%d)\n",
+                     reason, views, reductions, residual ? 1 : 0);
+        std::fflush(stderr);
+    }
+}
 
 static constexpr KernelCatalogRef kQwenRoutedGateUpSwiGLUQ4KF16WmmaKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_routed_gate_up_swiglu_q4k_f16_wmma");
@@ -42,6 +70,14 @@ static constexpr KernelCatalogRef kQwenRoutedDownQ5_1Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_routed_down_q5_1_q8_1_x4");
 static constexpr KernelCatalogRef kQwenRoutedDownIQ4NLKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_routed_down_iq4_nl_q8_1_x4");
+
+// Standalone f32 -> Q8_1-x4 packer. The qwen30b decode path gets its quantized hidden state for free
+// from "llm.rmsnorm.decode_f32_quantize_q8_1_x4", but that matcher is pinned to qwen30b's hidden size
+// and roots at an RMS_NORM; qwen4exp feeds its routed FFN from a hyper-connection mix instead, so
+// nothing publishes a Q8_1 alternate for it and the qwen4exp gate/up dispatch packs its own input.
+static constexpr KernelCatalogRef kGgmlQuantizeQ8_1X4F32Kernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_quantize_q8_1_x4_f32");
+static constexpr KernelCatalogRef kZeroF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_zero_f32");
 
 static constexpr const LlmMoeDispatchProfile & kRoutedFfnProfile                 = kActiveLlmMoeDispatchProfile;
 static constexpr int64_t                       kRoutedFfnInputSize               = kRoutedFfnProfile.hidden_size;
@@ -121,6 +157,14 @@ static bool is_routed_ffn_projection_output_qwen4exp(const Value & value, int64_
 static bool is_routed_ffn_down_output_qwen4exp(const Value & value, int64_t token_count) {
     return value.type == GGML_TYPE_F32 && value.contiguous &&
            is_shape(value, kQwen4ExpRoutedFfnInputSize, kQwen4ExpRoutedFfnRouteCount, token_count, 1);
+}
+
+// qwen4exp's routed gate/up expert weights are Q4_K at [hidden=2560, expert_hidden=640, experts=512],
+// the transpose of the down geometry checked above, so the two predicates never collide.
+static bool is_routed_ffn_gate_up_weight_qwen4exp(const Value & value) {
+    return value.type == GGML_TYPE_Q4_K && value.contiguous &&
+           is_shape(value, kQwen4ExpRoutedFfnInputSize, kQwen4ExpRoutedFfnExpertHiddenSize,
+                    kQwen4ExpRoutedFfnExpertCount, 1);
 }
 
 static const GraphNode * find_consumer_with_op(const Graph & graph, ValueId value, ggml_op op) {
@@ -203,17 +247,25 @@ static void add_routed_down_compile_parameters(Dispatch & dispatch, int64_t toke
 }
 
 // qwen4exp sibling of add_routed_down_compile_parameters above, using qwen4exp's shape constants
-// instead of the qwen30b-derived kRoutedFfn* ones.
-static void add_qwen4exp_routed_down_compile_parameters(Dispatch & dispatch, int64_t token_count) {
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_down.input_size",
+// instead of the qwen30b-derived kRoutedFfn* ones. Unlike the qwen30b kernels, which share one
+// "qwen3_moe.routed_down.*" config namespace, each of the three standalone qwen4exp down kernels
+// declares its own quant-suffixed namespace ("routed_down_q5_1", "routed_down_q8_0",
+// "routed_down_iq4_nl", plus a matching "workload_<quant>"), so the suffix has to be threaded through
+// here or Loom rejects the specialization with "unresolved config ... remains for final compilation".
+static void add_qwen4exp_routed_down_compile_parameters(Dispatch &        dispatch,
+                                                        int64_t           token_count,
+                                                        const std::string & quant_suffix) {
+    const std::string down_prefix = "qwen3_moe.routed_down_" + quant_suffix + ".";
+    dispatch.kernel.compile_parameters.emplace(down_prefix + "input_size",
                                                to_config_value(kQwen4ExpRoutedFfnExpertHiddenSize));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_down.route_count",
+    dispatch.kernel.compile_parameters.emplace(down_prefix + "route_count",
                                                to_config_value(kQwen4ExpRoutedFfnRouteCount));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_down.expert_count",
+    dispatch.kernel.compile_parameters.emplace(down_prefix + "expert_count",
                                                to_config_value(kQwen4ExpRoutedFfnExpertCount));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_down.output_size",
+    dispatch.kernel.compile_parameters.emplace(down_prefix + "output_size",
                                                to_config_value(kQwen4ExpRoutedFfnInputSize));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity", to_config_value(token_count));
+    dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload_" + quant_suffix + ".token_capacity",
+                                               to_config_value(token_count));
 }
 
 struct RoutedGateUpMatch {
@@ -251,13 +303,17 @@ struct DecodeRoutedGateUpMatch {
     const GraphNode *                 glu_node        = nullptr;
     int64_t                           token_count     = 0;
     int64_t                           route_stride    = 0;
+    int64_t                           route_count     = 0;
     bool                              publish_q8      = false;
+    // Set when the dispatch packs the f32 input into Q8_1-x4 itself instead of binding an alternate
+    // published upstream. qwen4exp has no upstream publisher; see kGgmlQuantizeQ8_1X4F32Kernel.
+    bool                              quantize_input  = false;
 
     bool matched() const {
         return gate_weight != nullptr && up_weight != nullptr && input != nullptr && route_ids != nullptr &&
-               glu_output != nullptr && input_alternate != nullptr && down_node != nullptr && down_weight != nullptr &&
-               gate_node != nullptr && up_node != nullptr && glu_node != nullptr && token_count == 1 &&
-               route_stride >= kRoutedFfnRouteCount;
+               glu_output != nullptr && (input_alternate != nullptr || quantize_input) && down_node != nullptr &&
+               down_weight != nullptr && gate_node != nullptr && up_node != nullptr && glu_node != nullptr &&
+               token_count == 1 && route_count > 0 && route_stride >= route_count;
     }
 };
 
@@ -299,12 +355,19 @@ struct WeightedReduceMatch {
     std::vector<const GraphNode *>    views;
     std::vector<const GraphNode *>    reductions;
     const GraphNode *                 residual = nullptr;
+    // Set when the routed reduce has no residual ADD to fuse. qwen4exp's routed output is consumed by
+    // `ggml_add(moe_out, ffn_shexp)`, and the shared-expert branch feeding it runs on the CPU, so that
+    // ADD lands in a different scheduler split and is invisible to this matcher. The dispatch then
+    // zero-fills `output` (the ADD-tree terminal) before the down kernel accumulates into it, instead
+    // of aliasing a residual buffer into place. Only the qwen4exp matcher ever sets this.
+    bool                              residual_missing = false;
     WeightedReduceNextRmsNormMatch    next_rmsnorm;
     int64_t                           token_count = 0;
 
     bool topology_matched() const {
-        return route_weights != nullptr && routed_output != nullptr && residual_input != nullptr && output != nullptr &&
-               weighted_node != nullptr && !views.empty() && residual != nullptr && token_count > 0;
+        return route_weights != nullptr && routed_output != nullptr && output != nullptr &&
+               weighted_node != nullptr && !views.empty() && token_count > 0 &&
+               (residual_missing || (residual_input != nullptr && residual != nullptr));
     }
 
     bool matched() const { return topology_matched() && routed_alternate != nullptr; }
@@ -341,14 +404,18 @@ struct DecodeRoutedDownPlainMatch {
     const Value *                     route_ids         = nullptr;
     WeightedReduceMatch               reduce;
     KernelCatalogRef                  kernel       = {};
+    // Each qwen4exp down kernel declares its own quant-suffixed Loom config namespace; see
+    // add_qwen4exp_routed_down_compile_parameters().
+    std::string                       quant_suffix;
     int64_t                           token_count  = 0;
     int64_t                           route_stride = 0;
     bool                              input_is_q8  = false;
 
     bool matched() const {
         return input_graph_value != nullptr && weight != nullptr && output != nullptr && route_ids != nullptr &&
-               reduce.topology_matched() && kernel.id != kUncatalogedKernelId && token_count == 1 &&
-               route_stride >= kQwen4ExpRoutedFfnRouteCount && (!input_is_q8 || input_alternate != nullptr);
+               reduce.topology_matched() && kernel.id != kUncatalogedKernelId && !quant_suffix.empty() &&
+               token_count == 1 && route_stride >= kQwen4ExpRoutedFfnRouteCount &&
+               (!input_is_q8 || input_alternate != nullptr);
     }
 };
 
@@ -377,6 +444,25 @@ static bool match_same_route_projection(const Graph &     graph,
     output = graph_value(graph, node.output);
     return weight != nullptr && output != nullptr && is_routed_ffn_gate_up_weight(*weight) &&
            is_routed_ffn_projection_output(*output, token_count);
+}
+
+// qwen4exp sibling of match_same_route_projection(): identical topology test, but against qwen4exp's
+// gate/up weight and projection-output geometry.
+static bool match_same_route_projection_qwen4exp(const Graph &     graph,
+                                                 const GraphNode & node,
+                                                 ValueId           expected_input,
+                                                 ValueId           expected_route_ids,
+                                                 int64_t           token_count,
+                                                 const Value *&    weight,
+                                                 const Value *&    output) {
+    if (node.op != GGML_OP_MUL_MAT_ID || node.inputs.size() != 3 || node.inputs[1] != expected_input ||
+        node.inputs[2] != expected_route_ids) {
+        return false;
+    }
+    weight = graph_value(graph, node.inputs[0]);
+    output = graph_value(graph, node.output);
+    return weight != nullptr && output != nullptr && is_routed_ffn_gate_up_weight_qwen4exp(*weight) &&
+           is_routed_ffn_projection_output_qwen4exp(*output, token_count);
 }
 
 static RoutedDownMatch match_routed_ffn_down_grouped(const DispatchMatchContext & context) {
@@ -582,7 +668,111 @@ static DecodeRoutedGateUpMatch match_decode_routed_ffn_gate_up_swiglu(const Disp
     match.glu_node        = glu_node;
     match.token_count     = 1;
     match.route_stride    = route_stride;
+    match.route_count     = kRoutedFfnRouteCount;
     match.publish_q8      = down_weight->type == GGML_TYPE_Q4_K;
+    return match;
+}
+
+// qwen4exp routed gate/up + SwiGLU, decode (single token). Mirrors
+// match_decode_routed_ffn_gate_up_swiglu() above but against qwen4exp's geometry
+// (hidden 2560, expert_hidden 640, experts 512, route 10) via the kQwen4ExpRoutedFfn* constants.
+//
+// Registered *alongside* the qwen30b matcher rather than switching kActiveLlmMoeDispatchProfile:
+// the two disagree on every shape, so each declines what the other claims and qwen30b is untouched.
+//
+// publish_q8 is unconditionally true here. All three qwen4exp down kernels (Q5_1/Q8_0/IQ4_NL)
+// consume a Q8_1-x4 quantized activation, and match_decode_routed_ffn_down_qwen4exp() looks up
+// exactly that alternate -- so without publishing it the down projection can never match, which is
+// why the down path was gated off until now.
+static DecodeRoutedGateUpMatch match_decode_routed_ffn_gate_up_swiglu_qwen4exp(
+    const DispatchMatchContext & context) {
+    DecodeRoutedGateUpMatch match;
+    const GraphNode *       root = context.root_node;
+    if (root == nullptr || root->op != GGML_OP_MUL_MAT_ID || root->inputs.size() != 3 || !context.graph.has_index()) {
+        return match;
+    }
+
+    const Value * root_weight = graph_value(context.graph, root->inputs[0]);
+    const Value * input       = graph_value(context.graph, root->inputs[1]);
+    const Value * route_ids   = graph_value(context.graph, root->inputs[2]);
+    const Value * root_output = graph_value(context.graph, root->output);
+    if (root_weight == nullptr || input == nullptr || route_ids == nullptr || root_output == nullptr ||
+        !is_routed_ffn_gate_up_weight_qwen4exp(*root_weight) || input->type != GGML_TYPE_F32 || !input->contiguous ||
+        !is_shape(*input, kQwen4ExpRoutedFfnInputSize, 1, 1, 1) || route_ids->type != GGML_TYPE_I32 ||
+        route_ids->nb[0] != sizeof(int32_t) || route_ids->nb[1] % sizeof(int32_t) != 0 ||
+        !is_shape(*route_ids, kQwen4ExpRoutedFfnRouteCount, 1, 1, 1) ||
+        !is_routed_ffn_projection_output_qwen4exp(*root_output, 1)) {
+        return {};
+    }
+
+    const int64_t route_stride = static_cast<int64_t>(route_ids->nb[1] / sizeof(int32_t));
+    if (input->byte_count < static_cast<size_t>(kQwen4ExpRoutedFfnInputSize) * sizeof(float)) {
+        return {};
+    }
+
+    const GraphNode * glu_node = find_consumer_with_op(context.graph, root->output, GGML_OP_GLU);
+    if (glu_node == nullptr || glu_node->inputs.size() != 2) {
+        return {};
+    }
+    const GluParams * glu_params = op_params_as<GluParams>(glu_node->params);
+    if (glu_params == nullptr || glu_params->op != GGML_GLU_OP_SWIGLU) {
+        return {};
+    }
+
+    const GraphNode * gate_node = producer_with_op(context.graph, glu_node->inputs[0], GGML_OP_MUL_MAT_ID);
+    const GraphNode * up_node   = producer_with_op(context.graph, glu_node->inputs[1], GGML_OP_MUL_MAT_ID);
+    if (gate_node == nullptr || up_node == nullptr || gate_node == up_node || (gate_node != root && up_node != root)) {
+        return {};
+    }
+
+    const Value * gate_weight = nullptr;
+    const Value * gate_output = nullptr;
+    const Value * up_weight   = nullptr;
+    const Value * up_output   = nullptr;
+    if (!match_same_route_projection_qwen4exp(context.graph, *gate_node, input->id, route_ids->id, 1, gate_weight,
+                                              gate_output) ||
+        !match_same_route_projection_qwen4exp(context.graph, *up_node, input->id, route_ids->id, 1, up_weight,
+                                              up_output) ||
+        !same_shape(*gate_output, *up_output)) {
+        return {};
+    }
+
+    const Value * glu_output = graph_value(context.graph, glu_node->output);
+    // Deliberately no ValueKind::Transient requirement, unlike the qwen30b matcher above. Transient
+    // is reserved for values a dispatch plan synthesizes; import_ggml_graph() classifies every tensor
+    // that comes out of a ggml graph as External (see graph.cpp -- treating a scheduler-owned tensor
+    // as transient scratch bound kernels to uninitialized arena memory, so that rule was removed), and
+    // the SwiGLU result is an ordinary ggml node. The invariant that check was reaching for -- that
+    // nothing outside this fusion observes the SwiGLU result -- is already established below by
+    // find_single_consumer_with_op(), which requires the down projection to be its only consumer.
+    if (glu_output == nullptr || !is_routed_ffn_projection_output_qwen4exp(*glu_output, 1)) {
+        return {};
+    }
+
+    const GraphNode * down_node   = find_single_consumer_with_op(context.graph, glu_output->id, GGML_OP_MUL_MAT_ID);
+    const Value *     down_weight = down_node == nullptr || down_node->inputs.size() != 3 ?
+                                        nullptr :
+                                        graph_value(context.graph, down_node->inputs[0]);
+    if (down_node == nullptr || down_weight == nullptr || !is_routed_ffn_down_weight_qwen4exp(*down_weight)) {
+        return {};
+    }
+
+    match.gate_weight     = gate_weight;
+    match.up_weight       = up_weight;
+    match.input           = input;
+    match.route_ids       = route_ids;
+    match.glu_output      = glu_output;
+    match.input_alternate = nullptr;
+    match.down_node       = down_node;
+    match.down_weight     = down_weight;
+    match.gate_node       = gate_node;
+    match.up_node         = up_node;
+    match.glu_node        = glu_node;
+    match.token_count     = 1;
+    match.route_stride    = route_stride;
+    match.route_count     = kQwen4ExpRoutedFfnRouteCount;
+    match.publish_q8      = true;
+    match.quantize_input  = true;
     return match;
 }
 
@@ -697,6 +887,38 @@ static const Value * find_qwen_route_weights_for_route_ids(const Graph & graph,
         return nullptr;
     }
     return weights;
+}
+
+// qwen4exp reaches its normalized route weights differently from qwen30b. The qwen30b lookup above
+// walks the router chain (GET_ROWS -> RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE), which only
+// works because qwen30b's MoE router dispatch pulls that whole chain into the same HRX split. qwen4exp
+// has no router dispatch -- its 10-of-512 top-k topology matches nothing in dispatch-moe-router.cpp --
+// so the normalization trio deliberately stays on the CPU (see hrx_moe_route_weight_norm_qwen4exp()),
+// and the HRX split's Graph does not contain those nodes at all. Walking the chain there always fails.
+//
+// What the split does contain is the weighted-reduce MUL, and the normalized weights are simply one of
+// its two inputs, materialized by ggml-backend as a cross-backend copy. Pick them out by shape: the
+// route weights are [1, route_count, token_count] while the routed output is [hidden, route_count,
+// token_count], so the two can never be confused.
+static const Value * find_route_weights_from_weighted_mul(const Graph &     graph,
+                                                          const GraphNode * weighted,
+                                                          const Value *     routed_output,
+                                                          int64_t           token_count,
+                                                          int64_t           route_count) {
+    if (weighted == nullptr || weighted->op != GGML_OP_MUL || weighted->inputs.size() != 2 ||
+        routed_output == nullptr) {
+        return nullptr;
+    }
+    for (ValueId input : weighted->inputs) {
+        const Value * value = graph_value(graph, input);
+        if (value == nullptr || value->id.value == routed_output->id.value) {
+            continue;
+        }
+        if (value->type == GGML_TYPE_F32 && is_shape(*value, 1, route_count, token_count, 1)) {
+            return value;
+        }
+    }
+    return nullptr;
 }
 
 static WeightedReduceMatch match_routed_ffn_down_weighted_reduce_topology(const DispatchMatchContext & context,
@@ -857,6 +1079,7 @@ static WeightedReduceMatch match_routed_ffn_down_weighted_reduce_topology_qwen4e
     }
     if (!node_has_input_or_alias(context.graph, *weighted, routed_output->id) ||
         !node_has_input_or_alias(context.graph, *weighted, route_weights->id)) {
+        trace_moe_down_reject("reduce: weighted MUL inputs");
         return {};
     }
     const Value * weighted_output = graph_value(context.graph, weighted->output);
@@ -864,17 +1087,20 @@ static WeightedReduceMatch match_routed_ffn_down_weighted_reduce_topology_qwen4e
         route_weights->type != GGML_TYPE_F32 || !route_weights->contiguous ||
         !is_shape(*route_weights, 1, kQwen4ExpRoutedFfnRouteCount, routed_output->ne[2], 1) ||
         weighted_output == nullptr || !same_shape(*weighted_output, *routed_output)) {
+        trace_moe_down_reject("reduce: weighted MUL shapes");
         return {};
     }
 
     const int64_t token_count = routed_output->ne[2];
     if (!is_llm_supported_query_length(kQwen4ExpMoeDispatchProfile, token_count)) {
+        trace_moe_down_reject("reduce: query length");
         return {};
     }
 
     std::vector<const GraphNode *> views =
         layout_alias_consumers_with_op(context.graph, weighted->output, GGML_OP_VIEW);
     if (views.size() != kQwen4ExpRoutedFfnRouteCount) {
+        trace_moe_down_reject("reduce: per-expert VIEW count");
         return {};
     }
 
@@ -885,6 +1111,7 @@ static WeightedReduceMatch match_routed_ffn_down_weighted_reduce_topology_qwen4e
         if (value == nullptr || value->type != GGML_TYPE_F32 ||
             !is_shape(*value, kQwen4ExpRoutedFfnInputSize, token_count, 1, 1) ||
             !append_node_if_uncovered(context, view, owned_views)) {
+            trace_moe_down_reject("reduce: per-expert VIEW shape/coverage");
             return {};
         }
         routed_values.insert(view->output.value);
@@ -921,6 +1148,7 @@ static WeightedReduceMatch match_routed_ffn_down_weighted_reduce_topology_qwen4e
                 if (output == nullptr || output->type != GGML_TYPE_F32 ||
                     !is_shape(*output, kQwen4ExpRoutedFfnInputSize, token_count, 1, 1) ||
                     !append_node_if_uncovered(context, add, reductions)) {
+                    trace_moe_down_reject("reduce: ADD-tree node shape/coverage");
                     return {};
                 }
                 routed_values.insert(add->output.value);
@@ -956,21 +1184,58 @@ static WeightedReduceMatch match_routed_ffn_down_weighted_reduce_topology_qwen4e
                 }
             }
             if (routed_input_count != 1 || non_routed_input == nullptr || residual != nullptr) {
+                trace_moe_down_reject("reduce: ambiguous residual ADD");
                 return {};
             }
             residual       = add;
             residual_input = non_routed_input;
         }
     }
-    if (residual == nullptr || reductions.size() + 1 != views.size()) {
+    if (reductions.size() + 1 != views.size()) {
+        trace_moe_down_reject_counts("reduce: incomplete ADD tree", views.size(), reductions.size(),
+                                     residual != nullptr);
         return {};
     }
-    const Value * output = graph_value(context.graph, residual->output);
-    if (output == nullptr || residual_input == nullptr || output->type != GGML_TYPE_F32 ||
-        residual_input->type != GGML_TYPE_F32 || !is_shape(*output, kQwen4ExpRoutedFfnInputSize, token_count, 1, 1) ||
-        !same_shape(*output, *residual_input) || output->byte_count != residual_input->byte_count ||
-        !output->contiguous || !residual_input->contiguous) {
-        return {};
+
+    const Value * output = nullptr;
+    if (residual == nullptr) {
+        // No residual ADD in this split. Fall back to writing the ADD tree's terminal value directly;
+        // the dispatch zero-fills it first so the kernel's unconditional `output += routed_sum`
+        // accumulation still produces the plain reduce. The terminal is the one reduction output that
+        // no other reduction consumes.
+        std::set<int32_t> consumed;
+        for (const GraphNode * add : reductions) {
+            for (ValueId input : add->inputs) {
+                consumed.insert(input.value);
+            }
+        }
+        for (const GraphNode * add : reductions) {
+            if (consumed.count(add->output.value) != 0) {
+                continue;
+            }
+            if (output != nullptr) {
+                trace_moe_down_reject("reduce: ADD tree has multiple terminals");
+                return {};
+            }
+            output = graph_value(context.graph, add->output);
+        }
+        if (output == nullptr || output->type != GGML_TYPE_F32 || !output->contiguous ||
+            !is_shape(*output, kQwen4ExpRoutedFfnInputSize, token_count, 1, 1)) {
+            trace_moe_down_reject("reduce: ADD tree terminal shape/layout");
+            return {};
+        }
+        match.residual_missing = true;
+        residual_input         = nullptr;
+    } else {
+        output = graph_value(context.graph, residual->output);
+        if (output == nullptr || residual_input == nullptr || output->type != GGML_TYPE_F32 ||
+            residual_input->type != GGML_TYPE_F32 ||
+            !is_shape(*output, kQwen4ExpRoutedFfnInputSize, token_count, 1, 1) ||
+            !same_shape(*output, *residual_input) || output->byte_count != residual_input->byte_count ||
+            !output->contiguous || !residual_input->contiguous) {
+            trace_moe_down_reject("reduce: residual output shape/layout");
+            return {};
+        }
     }
 
     match.route_weights  = route_weights;
@@ -1149,6 +1414,98 @@ static bool match_decode_routed_ffn_gate_up_swiglu_q4k_q8_dispatch(const Dispatc
     return true;
 }
 
+// qwen4exp sibling of the dispatch above. Always emits the "next_q8" kernel variant so the SwiGLU
+// result is republished as a Q8_1-x4 alternate for match_decode_routed_ffn_down_qwen4exp() to bind.
+static bool match_decode_routed_ffn_gate_up_swiglu_q4k_q8_qwen4exp_dispatch(const DispatchMatchContext & context,
+                                                                            DispatchMatch & dispatch_match) {
+    const DecodeRoutedGateUpMatch match = match_decode_routed_ffn_gate_up_swiglu_qwen4exp(context);
+    if (!match.matched()) {
+        return false;
+    }
+
+    const size_t q8_output_bytes =
+        q8_1_x4_byte_count(match.token_count * kQwen4ExpRoutedFfnRouteCount, kQwen4ExpRoutedFfnExpertHiddenSize);
+    const size_t  q8_input_bytes      = q8_1_x4_byte_count(match.token_count, kQwen4ExpRoutedFfnInputSize);
+    const ValueId q8_input            = ValueId(context.next_plan_value.value);
+    const ValueId q8_output           = ValueId(context.next_plan_value.value + 1);
+    const ValueId completion_counters = ValueId(context.next_plan_value.value + 2);
+    if (q8_input_bytes == 0 || q8_output_bytes == 0) {
+        return false;
+    }
+
+    // Pass 1: pack the f32 hidden state into Q8_1-x4. The gate/up kernel only reads that layout, and
+    // for qwen4exp nothing upstream publishes it (see kGgmlQuantizeQ8_1X4F32Kernel).
+    const int64_t q8_group_count = match.token_count * ((kQwen4ExpRoutedFfnInputSize + 127) / 128);
+    Dispatch      quantize;
+    quantize.kernel = make_kernel_specialization(kGgmlQuantizeQ8_1X4F32Kernel);
+    quantize.kernel.integer_parameters.emplace("token_count", match.token_count);
+    quantize.kernel.integer_parameters.emplace("input_size", kQwen4ExpRoutedFfnInputSize);
+    quantize.kernel.compile_parameters.emplace("ggml.quantize_q8_1_x4.group_capacity",
+                                               to_config_value(q8_group_count));
+    quantize.bindings.push_back({ match.input->id, 0, match.input->byte_count });
+    quantize.bindings.push_back({ q8_input, 0, q8_input_bytes });
+
+    // Pass 2: the fused gate + up + SwiGLU itself.
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kQwenRoutedGateUpSwiGLUQ4KQ8NextQ8Kernel);
+    dispatch.kernel.integer_parameters.emplace("token_count", match.token_count);
+    dispatch.kernel.integer_parameters.emplace("route_count", kQwen4ExpRoutedFfnRouteCount);
+    dispatch.kernel.integer_parameters.emplace("route_stride", match.route_stride);
+    dispatch.kernel.integer_parameters.emplace("expert_count", kQwen4ExpRoutedFfnExpertCount);
+    dispatch.kernel.integer_parameters.emplace("output_size", kQwen4ExpRoutedFfnExpertHiddenSize);
+    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_gate_up.input_size",
+                                               to_config_value(kQwen4ExpRoutedFfnInputSize));
+    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_gate_up.expert_count",
+                                               to_config_value(kQwen4ExpRoutedFfnExpertCount));
+    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_gate_up.route_count",
+                                               to_config_value(kQwen4ExpRoutedFfnRouteCount));
+    dispatch.kernel.compile_parameters.emplace("qwen3_moe.routed_gate_up.output_size",
+                                               to_config_value(kQwen4ExpRoutedFfnExpertHiddenSize));
+    dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity", to_config_value(match.token_count));
+
+    // The route ids are a [route_count, 1] view into the 512-wide top-k selection, so nb[1] (and hence
+    // route_stride) is 512 while the tensor itself is only route_count elements long. The kernel reads
+    // route_ids[token * route_stride + r], so the extent it actually touches ends at the last token's
+    // route_count-th id -- binding token_count * route_stride would run past the tensor.
+    const size_t route_id_length =
+        static_cast<size_t>((match.token_count - 1) * match.route_stride + kQwen4ExpRoutedFfnRouteCount) *
+        sizeof(int32_t);
+    dispatch.bindings.push_back({ q8_input, 0, q8_input_bytes });
+    dispatch.bindings.push_back({ match.route_ids->id, 0, route_id_length });
+    dispatch.bindings.push_back({ match.gate_weight->id, 0, match.gate_weight->byte_count });
+    dispatch.bindings.push_back({ match.up_weight->id, 0, match.up_weight->byte_count });
+    dispatch.bindings.push_back({ match.glu_output->id, 0, match.glu_output->byte_count });
+    dispatch.bindings.push_back(
+        { completion_counters, 0, gate_up_completion_counter_count(match.token_count) * sizeof(int32_t) });
+    dispatch.bindings.push_back({ q8_output, 0, q8_output_bytes });
+
+    dispatch_match.completion_counter_requests.push_back({
+        completion_counters,
+        "qwen.decode.moe.gate_up_completion_counters",
+        gate_up_completion_counter_count(match.token_count),
+    });
+    dispatch_match.transients.push_back(
+        { q8_input, "qwen4exp.decode.moe.hidden_q8", q8_input_bytes, kRoutedFfnPlanTransientAlignment });
+    dispatch_match.transients.push_back(
+        { q8_output, kRoutedFfnQ8GateUpOutputName, q8_output_bytes, kRoutedFfnPlanTransientAlignment });
+    Status metadata_status;
+    if (!dispatch_match.metadata.append_alternate_value(
+            { match.glu_output->id, q8_output, GGML_TYPE_Q8_1, q8_output_bytes, kRoutedFfnQ8GateUpOutputName },
+            metadata_status)) {
+        dispatch_match.status.append(metadata_status);
+        return false;
+    }
+
+    if (!append_covered_node(context, match.gate_node, dispatch_match) ||
+        !append_covered_node(context, match.up_node, dispatch_match) ||
+        !append_covered_node(context, match.glu_node, dispatch_match)) {
+        return false;
+    }
+    dispatch_match.dispatches.push_back(std::move(quantize));
+    dispatch_match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
 static DecodeRoutedDownMatch match_decode_routed_ffn_down_next_q8(const DispatchMatchContext & context) {
     DecodeRoutedDownMatch match;
     const GraphNode *     root = context.root_node;
@@ -1313,23 +1670,53 @@ static DecodeRoutedDownPlainMatch match_decode_routed_ffn_down_qwen4exp(const Di
     const Value * input       = graph_value(context.graph, root->inputs[1]);
     const Value * route_ids   = graph_value(context.graph, root->inputs[2]);
     const Value * root_output = graph_value(context.graph, root->output);
-    if (weight == nullptr || input == nullptr || route_ids == nullptr || root_output == nullptr ||
-        !is_routed_ffn_down_weight_qwen4exp(*weight) || !is_routed_ffn_projection_output_qwen4exp(*input, 1) ||
-        !is_routed_ffn_down_output_qwen4exp(*root_output, 1) || route_ids->type != GGML_TYPE_I32 ||
-        route_ids->nb[0] != sizeof(int32_t) || route_ids->nb[1] % sizeof(int32_t) != 0 ||
-        !is_shape(*route_ids, kQwen4ExpRoutedFfnRouteCount, 1, 1, 1)) {
+    if (weight == nullptr || input == nullptr || route_ids == nullptr || root_output == nullptr) {
+        return {};
+    }
+    if (!is_routed_ffn_down_weight_qwen4exp(*weight)) {
+        trace_moe_down_reject("down weight quant/shape");
+        return {};
+    }
+    if (!is_routed_ffn_projection_output_qwen4exp(*input, 1)) {
+        trace_moe_down_reject("projection input shape");
+        return {};
+    }
+    if (!is_routed_ffn_down_output_qwen4exp(*root_output, 1)) {
+        trace_moe_down_reject("down output shape");
+        return {};
+    }
+    if (route_ids->type != GGML_TYPE_I32 || route_ids->nb[0] != sizeof(int32_t) ||
+        route_ids->nb[1] % sizeof(int32_t) != 0 || !is_shape(*route_ids, kQwen4ExpRoutedFfnRouteCount, 1, 1, 1)) {
+        trace_moe_down_reject("route id layout");
         return {};
     }
 
     const int64_t route_stride = static_cast<int64_t>(route_ids->nb[1] / sizeof(int32_t));
 
-    const Value * route_weights = find_qwen_route_weights_for_route_ids(context.graph, route_ids->id, 1,
-                                                                        kQwen4ExpRoutedFfnRouteCount);
     const GraphNode * weighted =
         find_single_consumer_with_op_through_layout_aliases(context.graph, root_output->id, GGML_OP_MUL);
+    if (weighted == nullptr) {
+        trace_moe_down_reject("no single MUL consumer (weighted reduce)");
+        return {};
+    }
+    const Value * route_weights = find_qwen_route_weights_for_route_ids(context.graph, route_ids->id, 1,
+                                                                        kQwen4ExpRoutedFfnRouteCount);
+    if (route_weights == nullptr) {
+        route_weights = find_route_weights_from_weighted_mul(context.graph, weighted, root_output, 1,
+                                                             kQwen4ExpRoutedFfnRouteCount);
+    }
+    if (route_weights == nullptr) {
+        trace_moe_down_reject("route weights not found");
+        return {};
+    }
     WeightedReduceMatch reduce =
         match_routed_ffn_down_weighted_reduce_topology_qwen4exp(context, weighted, root_output, route_weights);
-    if (!reduce.topology_matched() || !residual_input_is_safe_for_in_place(context, reduce)) {
+    if (!reduce.topology_matched()) {
+        trace_moe_down_reject("weighted reduce topology");
+        return {};
+    }
+    if (!reduce.residual_missing && !residual_input_is_safe_for_in_place(context, reduce)) {
+        trace_moe_down_reject("residual not safe for in-place");
         return {};
     }
 
@@ -1341,6 +1728,7 @@ static DecodeRoutedDownPlainMatch match_decode_routed_ffn_down_qwen4exp(const Di
         find_alternate_value(context.graph, context.plan, input->id, GGML_TYPE_Q8_1,
                              q8_1_x4_byte_count(kQwen4ExpRoutedFfnRouteCount, kQwen4ExpRoutedFfnExpertHiddenSize));
     if (input_alternate == nullptr) {
+        trace_moe_down_reject("no Q8_1-x4 alternate for the GLU activation");
         return {};
     }
 
@@ -1352,7 +1740,10 @@ static DecodeRoutedDownPlainMatch match_decode_routed_ffn_down_qwen4exp(const Di
     match.reduce            = std::move(reduce);
     match.kernel            = weight->type == GGML_TYPE_Q8_0 ? kQwenRoutedDownQ8_0Kernel :
                               weight->type == GGML_TYPE_Q5_1 ? kQwenRoutedDownQ5_1Kernel :
-                                                                kQwenRoutedDownIQ4NLKernel;
+                                                               kQwenRoutedDownIQ4NLKernel;
+    match.quant_suffix      = weight->type == GGML_TYPE_Q8_0 ? "q8_0" :
+                              weight->type == GGML_TYPE_Q5_1 ? "q5_1" :
+                                                               "iq4_nl";
     match.token_count  = 1;
     match.route_stride = route_stride;
     match.input_is_q8  = input_is_q8;
@@ -1374,16 +1765,21 @@ static bool match_decode_routed_ffn_down_qwen4exp_dispatch(const DispatchMatchCo
     dispatch.kernel.integer_parameters.emplace("route_id_stride", match.route_stride);
     dispatch.kernel.integer_parameters.emplace("expert_count", kQwen4ExpRoutedFfnExpertCount);
     dispatch.kernel.integer_parameters.emplace("output_size", kQwen4ExpRoutedFfnInputSize);
-    add_qwen4exp_routed_down_compile_parameters(dispatch, match.token_count);
+    add_qwen4exp_routed_down_compile_parameters(dispatch, match.token_count, match.quant_suffix);
 
-    const size_t route_id_length = static_cast<size_t>(match.token_count * match.route_stride) * sizeof(int32_t);
+    // Same [route_count, 1]-view-into-512 stride/extent split as the gate/up dispatch above.
+    const size_t route_id_length =
+        static_cast<size_t>((match.token_count - 1) * match.route_stride + kQwen4ExpRoutedFfnRouteCount) *
+        sizeof(int32_t);
     dispatch.bindings.push_back({ match.input_alternate->alternate_value, 0, match.input_alternate->byte_count });
     dispatch.bindings.push_back({ match.route_ids->id, 0, route_id_length });
     dispatch.bindings.push_back({ match.reduce.route_weights->id, 0, match.reduce.route_weights->byte_count });
     dispatch.bindings.push_back({ match.weight->id, 0, match.weight->byte_count });
     dispatch.bindings.push_back({ match.output->id, 0, match.output->byte_count });
 
-    dispatch_match.value_aliases.push_back({ match.reduce.residual_input->id, match.output->id });
+    if (!match.reduce.residual_missing) {
+        dispatch_match.value_aliases.push_back({ match.reduce.residual_input->id, match.output->id });
+    }
 
     if (!append_covered_node(context, context.root_node, dispatch_match) ||
         !append_covered_node(context, match.reduce.weighted_node, dispatch_match)) {
@@ -1399,10 +1795,20 @@ static bool match_decode_routed_ffn_down_qwen4exp_dispatch(const DispatchMatchCo
             return false;
         }
     }
-    if (!append_covered_node(context, match.reduce.residual, dispatch_match)) {
+    if (!match.reduce.residual_missing && !append_covered_node(context, match.reduce.residual, dispatch_match)) {
         return false;
     }
 
+    // Without a residual to accumulate onto, the destination has to start at zero: the routed-down
+    // kernels all end in an unconditional `output[c] = output[c] + routed_sum`, and `output` here is an
+    // ordinary graph tensor whose buffer the ggml allocator may have recycled from an earlier node.
+    if (match.reduce.residual_missing) {
+        Dispatch zero;
+        zero.kernel = make_kernel_specialization(kZeroF32Kernel);
+        zero.kernel.integer_parameters.emplace("element_count", match.output->element_count);
+        zero.bindings.push_back({ match.output->id, 0, match.output->byte_count });
+        dispatch_match.dispatches.push_back(std::move(zero));
+    }
     dispatch_match.dispatches.push_back(std::move(dispatch));
     return true;
 }
@@ -1516,6 +1922,14 @@ void register_routed_ffn_dispatches(DispatchRegistryBuilder & registry) {
         1200,
         DispatchSource::Llm,
         match_decode_routed_ffn_gate_up_swiglu_q4k_q8_dispatch,
+    });
+    registry.add({
+        "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp",
+        GGML_OP_MUL_MAT_ID,
+        DispatchMatchKind::Fused,
+        1190,
+        DispatchSource::Llm,
+        match_decode_routed_ffn_gate_up_swiglu_q4k_q8_qwen4exp_dispatch,
     });
     registry.add({
         "llm.routed_ffn.decode_down_next_q8",
