@@ -6,8 +6,11 @@
 #include "graph/graph-matcher.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -195,6 +198,29 @@ struct NormGateMatch {
     }
 };
 
+// HRX_TRACE_GDN_NORM_GATE=1 reports why the norm-gate fusion declined, and the layout of the four
+// values it binds when it fires. The kernel treats all of them as dense, so strides matter.
+static bool trace_norm_gate_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TRACE_GDN_NORM_GATE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void trace_norm_gate_value(const char * label, const Value * value) {
+    if (value == nullptr) {
+        std::fprintf(stderr, "HRX gdn_norm_gate %-12s <null>\n", label);
+        return;
+    }
+    std::fprintf(stderr,
+                 "HRX gdn_norm_gate %-12s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                 "] nb=[%zu,%zu,%zu,%zu] contig=%d off=%zu bytes=%zu name=%s\n",
+                 label, value->ne[0], value->ne[1], value->ne[2], value->ne[3], value->nb[0], value->nb[1],
+                 value->nb[2], value->nb[3], value->contiguous ? 1 : 0, value->storage_offset,
+                 value->byte_count, value->tensor == nullptr ? "?" : value->tensor->name);
+}
+
 static NormGateMatch match_qwen4exp_gdn_norm_gate(const Graph & graph, const GraphNode * node) {
     NormGateMatch match;
     if (node == nullptr || node->op != GGML_OP_RMS_NORM || node->inputs.size() != 1 || !graph.has_index()) {
@@ -264,6 +290,26 @@ static NormGateMatch match_qwen4exp_gdn_norm_gate(const Graph & graph, const Gra
         !is_shape(*sigmoid_output, kGdnHeadDim, kGdnValueHeadCount, 1, 1) ||
         !is_shape(*output, kGdnHeadDim, kGdnValueHeadCount, 1, 1)) {
         return {};
+    }
+
+    // The kernel views every one of these as a dense `view<6144xf32>`/`view<128xf32>` based at
+    // offset zero, so a strided view would be read as if it were packed. Nothing above checks that:
+    // the shape guards only constrain ne. qwen4exp's gate z is sliced out of the fused QKVZ
+    // projection, so it is exactly the kind of value that can arrive non-contiguous.
+    if (!raw_output->contiguous || !norm_weight->contiguous || !z->contiguous || !output->contiguous) {
+        if (trace_norm_gate_enabled()) {
+            std::fprintf(stderr,
+                         "HRX gdn_norm_gate decline non-contiguous raw=%d weight=%d z=%d out=%d\n",
+                         raw_output->contiguous ? 1 : 0, norm_weight->contiguous ? 1 : 0,
+                         z->contiguous ? 1 : 0, output->contiguous ? 1 : 0);
+        }
+        return {};
+    }
+    if (trace_norm_gate_enabled()) {
+        trace_norm_gate_value("raw_output", raw_output);
+        trace_norm_gate_value("norm_weight", norm_weight);
+        trace_norm_gate_value("z", z);
+        trace_norm_gate_value("output", output);
     }
 
     match.rms_node       = node;
@@ -532,10 +578,57 @@ static bool match_qwen4exp_gdn_recurrent_decode_split_dispatch(const DispatchMat
     return true;
 }
 
+// A fused dispatch executes at the traversal position of its *root* node, not at the position of
+// the last node it covers. Every value the fused kernel reads must therefore already have been
+// produced when the root runs. That is not automatic: ggml is free to order an independent producer
+// anywhere between the root and the last covered node, and here it does exactly that --
+//
+//   VIEW[128,48] RMS_NORM[128,48] MUL[128,48] MUL_MAT[6144,1] RESHAPE[128,48] UNARY[128,48] MUL[128,48]
+//                ^^^^ root                    ^^^^ produces z              ^^^^ covered  ^^^^ covered
+//
+// -- the z projection lands *after* the RMS_NORM this fusion roots at, so a kernel emitted at the
+// root reads z before it exists. The graph, the bindings and the kernel are all individually correct
+// and the failure is silent: coherent-looking tensors, garbage logits. Guard the ordering instead of
+// trusting it.
+static bool value_ready_before(const Graph & graph, const Value * value, size_t root_index) {
+    if (value == nullptr) {
+        return false;
+    }
+    if (!graph.has_index()) {
+        return false;
+    }
+    const GraphNode * producer = graph.index().producer(value->id);
+    if (producer == nullptr) {
+        // A graph input or a weight: materialized before the graph runs.
+        return true;
+    }
+    size_t producer_index = 0;
+    if (!graph.index().node_index(producer, producer_index)) {
+        return false;
+    }
+    return producer_index < root_index;
+}
+
 static bool match_qwen4exp_gdn_norm_gate_decode_dispatch(const DispatchMatchContext & context,
                                                           DispatchMatch &              match) {
     const NormGateMatch norm_match = match_qwen4exp_gdn_norm_gate(context.graph, context.root_node);
     if (!norm_match.matched()) {
+        return false;
+    }
+
+    // Emitted at the root's position, so every input has to be live by then. z is the one that is
+    // not: its projection is ordered after this RMS_NORM.
+    if (!value_ready_before(context.graph, norm_match.raw_output, context.root_index) ||
+        !value_ready_before(context.graph, norm_match.norm_weight, context.root_index) ||
+        !value_ready_before(context.graph, norm_match.z, context.root_index)) {
+        if (trace_norm_gate_enabled()) {
+            std::fprintf(stderr,
+                         "HRX gdn_norm_gate decline input produced after root=%zu raw=%d weight=%d z=%d\n",
+                         context.root_index,
+                         value_ready_before(context.graph, norm_match.raw_output, context.root_index) ? 1 : 0,
+                         value_ready_before(context.graph, norm_match.norm_weight, context.root_index) ? 1 : 0,
+                         value_ready_before(context.graph, norm_match.z, context.root_index) ? 1 : 0);
+        }
         return false;
     }
 

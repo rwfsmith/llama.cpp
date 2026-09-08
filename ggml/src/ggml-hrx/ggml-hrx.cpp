@@ -1405,6 +1405,10 @@ static bool hrx_mul_outer_broadcast_enabled() {
     return enabled == nullptr || enabled[0] != '0';
 }
 
+// Default off, and it has to stay that way: HRX_ENABLE_REPEAT=1 on a "capital of France" decode
+// moves the 96 hyper-connection REPEAT nodes onto the GPU and produces garbage tokens
+// ("Weih Weihжек sensit呦quedaoise...") for a 2.7% decode gain. The knob is kept so the corruption
+// stays reproducible against common.repeat_f32, not because it is a tuning option.
 static bool hrx_repeat_dispatch_enabled() {
     const char * enabled = std::getenv("HRX_ENABLE_REPEAT");
     return enabled != nullptr && enabled[0] != '0';
@@ -1696,26 +1700,49 @@ static bool hrx_misc_group_disabled(const char * op_class) {
 // separable from the rest of GDN. Only the RMS_NORM root and the MUL shapes are keyed here; the
 // SIGMOID rides along on the UNARY arm.
 //
-// The decline is now UNCONDITIONAL rather than scoped to the "gdngate" bisect group. No registered
-// matcher roots at a [head_dim, value_head_count] MUL -- the only GGML_OP_MUL registration in the
-// whole corpus is llm.routed_ffn.down_weighted_reduce -- so such a MUL is reachable only as a
-// non-root node of the RMS_NORM-rooted fusion above. ggml is free to cut a split between the
-// RMS_NORM and the gated MUL, and when it does the MUL lands as node 0 of a split nothing can root
-// at, which is a hard "unsupported HRX node 0: MUL f32[128,48]" abort rather than a CPU fallback.
-// That is exactly what enabling the Q8_0 dense weights did: relocating those weights into HRX
-// buffers perturbed ggml's input-locality placement and cut the pair apart. These are [128,48]
-// tensors (6144 elements); running the whole gate norm on the CPU is noise, and it removes a latent
-// abort that any future placement change could re-trigger. Same reasoning as the L2_NORM arm.
+// The decline was made unconditional when no registered matcher could root at a bare
+// [head_dim, value_head_count] MUL: such a MUL was reachable only as a non-root node of the
+// RMS_NORM-rooted fusion above, so whenever ggml cut a split between the RMS_NORM and the gated MUL
+// the MUL landed as node 0 of a split nothing could root at -- a hard "unsupported HRX node 0:
+// MUL f32[128,48]" abort rather than a CPU fallback. That original hazard is gone: common.mul_f32
+// (dispatch-elementwise.cpp) now registers GGML_OP_MUL as a root, so a stranded gate MUL falls back
+// to the generic elementwise kernel instead of aborting.
+//
+// The decline still has to stay, for two independently sufficient reasons, both measured:
+//
+//  1. The fusion cannot fire here anyway. A fused dispatch executes at its *root's* traversal
+//     position, and ggml orders the z projection after this RMS_NORM, so the kernel would read z
+//     before it is produced. match_qwen4exp_gdn_norm_gate_decode_dispatch() now detects that and
+//     declines -- see the ordering guard there, which rejects all 36 GDN layers on this model.
+//     The kernel itself is correct: it was checked against a single-lane serial reference on
+//     non-uniform (iota) inputs, which discriminates the wrong-reduction-scope, wrong-weight-index
+//     and wrong-z-offset failures that the uniform-fill known_case in gdn_decode.loom cannot see.
+//     That check is not in the corpus because the qwen_moe tree is vendored from rocm/hrx at a
+//     pinned revision with per-file digests in manifest.json; it belongs upstream.
+//
+//  2. Claiming the shape at all corrupts the model even with the fusion declined, because the
+//     RMS_NORM and the two MULs then scatter across common.rmsnorm / common.mul_f32 as isolated
+//     single-node dispatches. That is precisely HRX_MUL_CLAIM_MASK bit 0, and 0x75 (bit 0 on top of
+//     the known-coherent 0x74) bisects to garbage -- the one gap left in the table above.
+//
+// HRX_ENABLE_GDN_NORM_GATE=1 lifts the decline for the head-major form so both effects stay
+// reproducible; it is not a shippable configuration. The flattened 6144-wide form below is never
+// lifted: it is a separate gate whose MUL the fusion does not cover at all.
+static bool hrx_gdn_norm_gate_dispatch_enabled() {
+    const char * enabled = std::getenv("HRX_ENABLE_GDN_NORM_GATE");
+    return enabled != nullptr && enabled[0] != '0';
+}
+
 static bool hrx_gdn_norm_gate_row(const ggml_tensor * op) {
     if (op == nullptr) {
         return false;
     }
     if (op->ne[0] == kHrxGdnHeadDimQwen4Exp && op->ne[1] == kHrxGdnValueHeadCountQwen4Exp) {
-        return true;
+        return !hrx_gdn_norm_gate_dispatch_enabled();
     }
     // Same gate, flattened. llama.cpp reshapes the gated value stream to [head_dim*value_head_count, T]
     // before the out projection, so the identical MUL also shows up as a plain 6144-wide row feeding a
-    // MUL_MAT. It has no root matcher either.
+    // MUL_MAT. qwen4exp.gdn_norm_gate_decode does not cover it.
     return op->ne[0] == kHrxGdnHeadDimQwen4Exp * kHrxGdnValueHeadCountQwen4Exp && op->ne[1] == 1 &&
            op->ne[2] == 1 && op->ne[3] == 1;
 }
@@ -1914,6 +1941,12 @@ static bool hrx_ple_stream_reduce_qwen4exp(const ggml_tensor * op) {
 //   0x77  all but hc_activation                           -> garbage   => bit 0 or 1 is bad too
 //   0x76  all but hc_activation|gdn_norm_gate             -> garbage   => bit 1 is bad
 //   0x74  ple_sqrt_gate|head_major|qsa_indexer|hc_grouped -> coherent
+//   0x75  0x74|gdn_norm_gate                              -> garbage   => bit 0 is bad too
+//
+// Bit 0 was originally only ever tested inside 0x77/0x7F, so "bit 1 is bad" left it unattributed;
+// 0x75 isolates it. Claiming the [128,48] gate shape scatters the GDN post-norm across
+// common.rmsnorm/common.mul_f32 as isolated single-node dispatches and corrupts the model, which is
+// why hrx_gdn_norm_gate_row() below has to keep declining it.
 //
 // The arithmetic is not the problem: hrx_owned/mul_f32.loom's check cases cover both broadcast
 // directions, test-backend-ops passes same-shape f32 MUL, and the three bad guards select ordinary
