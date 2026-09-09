@@ -427,6 +427,7 @@ static void backend_free(ggml_backend_t backend) {
     auto * context = static_cast<ggml_backend_hrx_context *>(backend->context);
     auto * registry = context->device->registry;
     HRX_CHECK(hrx_stream_synchronize(context->stream));
+    context->device_timing.print_shutdown_summary(context->name.c_str());
     context->prepared_programs.clear();
     context->graph_programs.clear();
     context->kernel_executables.clear();
@@ -833,6 +834,8 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     const bool timing = hrx_time_compute_enabled();
     using clock = std::chrono::steady_clock;
     const clock::time_point t_entry = timing ? clock::now() : clock::time_point{};
+    ggml::hrx::DeviceTimingManager::GraphMeasurement device_measurement =
+        context->device_timing.begin_graph_measurement(context->stream);
     hrx_trace_split(*graph);
     const std::vector<hrx_verify_capture> captures = hrx_verify_before(context, *graph);
     const ggml::hrx::GraphExecutor        executor = ggml::hrx::GraphExecutor(*context);
@@ -862,7 +865,12 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     // op at all -- while ggml_backend_graph_compute() (used by test-backend-ops) hides the bug because it
     // calls ggml_backend_synchronize() itself. Retire the compute stream here so the buffer interface and
     // any host readback are guaranteed to see completed work.
-    HRX_CHECK(hrx_stream_synchronize(context->stream));
+    const bool synchronized = HRX_CHECK(hrx_stream_synchronize(context->stream));
+    if (synchronized) {
+        context->device_timing.finish_graph_measurement(device_measurement);
+    } else {
+        context->device_timing.cancel_graph_measurement(device_measurement);
+    }
     if (timing) {
         const clock::time_point t_synced = clock::now();
         const auto              elapsed  = [](clock::time_point a, clock::time_point b) {

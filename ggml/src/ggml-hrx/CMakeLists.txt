@@ -212,6 +212,8 @@ ggml_add_backend_library(ggml-hrx
     graph/value-map.h
     runtime/command-program-executor.cpp
     runtime/command-program-executor.h
+    runtime/device-timing.cpp
+    runtime/device-timing.h
     runtime/graph-executor.cpp
     runtime/graph-executor.h
     runtime/graph-program-cache.cpp
@@ -232,6 +234,32 @@ ggml_add_backend_library(ggml-hrx
 target_link_libraries(ggml-hrx PRIVATE ggml-hrx-kernel-corpus hrx::hrx loomc::loomc)
 target_include_directories(ggml-hrx PRIVATE . "${CMAKE_CURRENT_BINARY_DIR}" ../../../vendor)
 target_compile_definitions(ggml-hrx PRIVATE GGML_USE_HRX)
+
+get_target_property(GGML_HRX_IMPORTED_INCLUDE_DIRS hrx::hrx INTERFACE_INCLUDE_DIRECTORIES)
+set(GGML_HRX_PRIVATE_SOURCE_DIR "")
+foreach(_ggml_hrx_imported_dir IN LISTS GGML_HRX_IMPORTED_INCLUDE_DIRS)
+    if(EXISTS "${_ggml_hrx_imported_dir}/hrx_runtime.h")
+        get_filename_component(_ggml_hrx_include_root "${_ggml_hrx_imported_dir}" DIRECTORY)
+        get_filename_component(_ggml_hrx_install_root "${_ggml_hrx_include_root}" DIRECTORY)
+        get_filename_component(_ggml_hrx_install_name "${_ggml_hrx_install_root}" NAME)
+        if(_ggml_hrx_install_name MATCHES "-install$")
+            string(REGEX REPLACE "-install$" "" _ggml_hrx_source_root "${_ggml_hrx_install_root}")
+            if(EXISTS "${_ggml_hrx_source_root}/libhrx/src/libhrx/hrx_internal.h" AND
+               EXISTS "${_ggml_hrx_source_root}/runtime/src/iree/hal/drivers/hip/per_device_information.h")
+                set(GGML_HRX_PRIVATE_SOURCE_DIR "${_ggml_hrx_source_root}")
+                break()
+            endif()
+        endif()
+    endif()
+endforeach()
+
+if(GGML_HRX_PRIVATE_SOURCE_DIR)
+    target_include_directories(ggml-hrx PRIVATE
+        "${GGML_HRX_PRIVATE_SOURCE_DIR}/libhrx/src"
+        "${GGML_HRX_PRIVATE_SOURCE_DIR}/libhrx/src/libhrx"
+        "${GGML_HRX_PRIVATE_SOURCE_DIR}/runtime/src")
+    target_compile_definitions(ggml-hrx PRIVATE GGML_HRX_HAVE_DEVICE_TIMING_INTERNALS=1)
+endif()
 
 if (GGML_HRX_BUNDLE_RUNTIME_LIBS)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleRuntime.cmake")

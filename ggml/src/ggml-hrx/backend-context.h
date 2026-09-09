@@ -4,6 +4,7 @@
 #include "graph/value-map.h"
 #include "runtime/graph-program-cache.h"
 #include "runtime/host-buffer-registry.h"
+#include "runtime/device-timing.h"
 #include "runtime/host-memory.h"
 #include "runtime/kernel-executable-cache.h"
 #include "runtime/prepared-command-program-cache.h"
@@ -64,6 +65,7 @@ struct ggml_backend_hrx_context {
     ggml::hrx::GraphProgramCache           graph_programs;
     ggml::hrx::PreparedCommandProgramCache prepared_programs;
     ggml::hrx::TransientArena              transient_arena;
+    ggml::hrx::DeviceTimingManager         device_timing;
     ggml::hrx::HostTransferManager         host_transfers;
     ggml::hrx::HostWeightCache             host_weights;
     std::string                            name;

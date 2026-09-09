@@ -1925,6 +1925,11 @@ static DecodeRoutedDownPlainMatch match_decode_routed_ffn_down_qwen4exp(const Di
     }
     if (!reduce.residual_missing && (!residual_input_is_safe_for_in_place(context, reduce) ||
                                      !input_ready_at_root(context, reduce.residual_input))) {
+        const char * swiglu = std::getenv("HRX_ENABLE_SWIGLU");
+        if (swiglu == nullptr || std::strcmp(swiglu, "1") != 0) {
+            trace_moe_down_reject("residual not ready/safe and standalone SwiGLU is disabled");
+            return {};
+        }
         // Shared SwiGLU can merge a later shared-FFN producer into this split.
         // Keep the routed reduce on GPU, but leave the final ADD at its original position.
         reduce = match_routed_ffn_down_weighted_reduce_topology_qwen4exp(

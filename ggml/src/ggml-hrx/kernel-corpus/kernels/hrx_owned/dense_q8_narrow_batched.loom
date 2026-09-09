@@ -1,0 +1,169 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// T=2..8 counterpart of dense_q8_narrow.loom. Only token-row addressing
+// and launch.y differ: preserve its nearest-even Q8_0 pack and wave32
+// integer-block/F32 dot arithmetic. Keep the original T1 exports untouched.
+// No noalias assumptions: the full pack completes before output publication.
+amdgpu.target<gfx11-generic> @ggml_q8_narrow_batched_wave32 {subgroup_size = 32}
+
+kernel.def target(@ggml_q8_narrow_batched_wave32) export("ggml_q8_narrow_pack_batched") @ggml_q8_narrow_pack_batched(%input_size: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 32 : index
+  %blocks = index.div %input_size, %threads : index
+  kernel.launch.config workgroups(%blocks, %token_count, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%input_size: index, %token_count: index, %input: buffer, %packed: buffer) {
+  %width = index.assume %input_size [range(%input_size, 320, 640), mul(%input_size, 32)] : index
+  %tokens = index.assume %token_count [range(%token_count, 2, 8)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token = index.assume %token0 [lt(%token0, %tokens)] : index
+  %c0 = index.constant 0 : index
+  %c32 = index.constant 32 : index
+  %blocks = index.div %width, %c32 : index
+  %block0 = kernel.workgroup.id<x> : index
+  %block = index.assume %block0 [lt(%block0, %blocks)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %base = index.mul %block, %c32 : index
+  %column0 = index.add %base, %lane : index
+  %column = index.assume %column0 [lt(%column0, %width)] : index
+  %off2 = index.constant 2 : offset
+  %off4 = index.constant 4 : offset
+  %off34 = index.constant 34 : offset
+  %input_row = index.mul %token, %width : index
+  %input_offset = index.scale %input_row, %off4 : index, offset -> offset
+  %packed_row = index.mul %token, %blocks : index
+  %packed_offset = index.scale %packed_row, %off34 : index, offset -> offset
+  %input_view = buffer.view %input[%input_offset] : buffer -> view<[%width]xf32>
+  %xv = vector.load %input_view[%column] : view<[%width]xf32> -> vector<1xf32>
+  %av = vector.absf %xv : vector<1xf32>
+  %x = vector.extract %xv[0] : vector<1xf32> -> f32
+  %a = vector.extract %av[0] : vector<1xf32> -> f32
+  %amax = kernel.subgroup.reduce<maxnumf> %a : f32
+  %zero = scalar.constant 0.0 : f32
+  %half = scalar.constant 0.5 : f32
+  %c127 = scalar.constant 127.0 : f32
+  %d = scalar.divf %amax, %c127 : f32
+  %nonzero = scalar.cmpf one, %amax, %zero : f32
+  %inverse = scf.if %nonzero -> (f32) {
+    %v = scalar.divf %c127, %amax : f32
+    scf.yield %v : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  %scaled_abs = scalar.mulf %a, %inverse : f32
+  %scaled_v = vector.splat %scaled_abs : vector<1xf32>
+  %integer_v = vector.fptosi %scaled_v : vector<1xf32> to vector<1xi32>
+  %integer = vector.extract %integer_v[0] : vector<1xi32> -> i32
+  %integer_f = scalar.sitofp %integer : i32 to f32
+  %fraction = scalar.subf %scaled_abs, %integer_f : f32
+  %zero_i = scalar.constant 0 : i32
+  %one_i = scalar.constant 1 : i32
+  %odd_bit = scalar.andi %integer, %one_i : i32
+  %odd = scalar.cmpi ne, %odd_bit, %zero_i : i32
+  %tie = scalar.cmpf oeq, %fraction, %half : f32
+  %above = scalar.cmpf ogt, %fraction, %half : f32
+  %odd_tie = scalar.andi %tie, %odd : i1
+  %up = scalar.ori %above, %odd_tie : i1
+  %increment = scf.select %up, %one_i, %zero_i : i32
+  %rounded = scalar.addi %integer, %increment : i32
+  %negative = scalar.cmpf olt, %x, %zero : f32
+  %negated = scalar.subi %zero_i, %rounded : i32
+  %signed = scf.select %negative, %negated, %rounded : i32
+  %code = scalar.trunci %signed : i32 to i8
+  %local_block_offset = index.scale %block, %off34 : index, offset -> offset
+  %block_offset = index.add %packed_offset, %local_block_offset : offset
+  %code_offset = index.add %block_offset, %off2 : offset
+  %codes = buffer.view %packed[%code_offset] : buffer -> view<32xi8>
+  view.store %code, %codes[%lane] : i8, view<32xi8>
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.if %leader {
+    %scale = scalar.fptrunc %d : f32 to f16
+    %scales = buffer.view %packed[%block_offset] : buffer -> view<1xf16>
+    view.store %scale, %scales[0] : f16, view<1xf16>
+  }
+  kernel.return
+}
+
+kernel.def target(@ggml_q8_narrow_batched_wave32) export("ggml_q8_narrow_dot_batched") @ggml_q8_narrow_dot_batched(
+    %input_size: index, %output_size: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %three = index.constant 3 : index
+  %four = index.constant 4 : index
+  %threads = index.constant 128 : index
+  %rounded = index.add %output_size, %three : index
+  %groups = index.div %rounded, %four : index
+  kernel.launch.config workgroups(%groups, %token_count, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %token_count: index, %packed: buffer, %weight: buffer, %output: buffer) {
+  %width = index.assume %input_size [range(%input_size, 320, 640), mul(%input_size, 32)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 10240)] : index
+  %tokens = index.assume %token_count [range(%token_count, 2, 8)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token = index.assume %token0 [lt(%token0, %tokens)] : index
+  %tile = kernel.workgroup.id<x> : index
+  %wave0 = kernel.subgroup.id : index
+  %wave = index.assume %wave0 [range(%wave0, 0, 3)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c32 = index.constant 32 : index
+  %off2 = index.constant 2 : offset
+  %off4 = index.constant 4 : offset
+  %off34 = index.constant 34 : offset
+  %blocks = index.div %width, %c32 : index
+  %packed_row = index.mul %token, %blocks : index
+  %packed_offset = index.scale %packed_row, %off34 : index, offset -> offset
+  %output_row = index.mul %token, %outputs : index
+  %output_offset = index.scale %output_row, %off4 : index, offset -> offset
+  %row_base = index.mul %tile, %c4 : index
+  %row = index.add %row_base, %wave : index
+  %valid_row = index.cmp ult, %row, %outputs : index
+  %valid_block = index.cmp ult, %lane, %blocks : index
+  %valid = scalar.andi %valid_row, %valid_block : i1
+  %zero = scalar.constant 0.0 : f32
+  %term = scf.if %valid -> (f32) {
+    %safe_row = index.assume %row [lt(%row, %outputs)] : index
+    %block = index.assume %lane [lt(%lane, %blocks)] : index
+    %row_block = index.mul %safe_row, %blocks : index
+    %flat0 = index.add %row_block, %block : index
+    %flat = index.assume %flat0 [range(%flat0, 0, 204799)] : index
+    %wbase = index.scale %flat, %off34 : index, offset -> offset
+    %local_abase = index.scale %block, %off34 : index, offset -> offset
+    %abase = index.add %packed_offset, %local_abase : offset
+    %wcodes_base = index.add %wbase, %off2 : offset
+    %acodes_base = index.add %abase, %off2 : offset
+    %wscale_view = buffer.view %weight[%wbase] : buffer -> view<1xf16>
+    %ascale_view = buffer.view %packed[%abase] : buffer -> view<1xf16>
+    %wcodes = buffer.view %weight[%wcodes_base] : buffer -> view<32xi8>
+    %acodes = buffer.view %packed[%acodes_base] : buffer -> view<32xi8>
+    %wh = view.load %wscale_view[0] : view<1xf16> -> f16
+    %ah = view.load %ascale_view[0] : view<1xf16> -> f16
+    %wd = scalar.extf %wh : f16 to f32
+    %ad = scalar.extf %ah : f16 to f32
+    %d = scalar.mulf %wd, %ad : f32
+    %zero_i = scalar.constant 0 : i32
+    %dot = scf.for %q = [%c0 to %c32 step %c1](%acc = %zero_i : i32) -> (i32) {
+      %wb = view.load %wcodes[%q] : view<32xi8> -> i8
+      %ab = view.load %acodes[%q] : view<32xi8> -> i8
+      %wi = scalar.extsi %wb : i8 to i32
+      %ai = scalar.extsi %ab : i8 to i32
+      %product = scalar.muli %wi, %ai : i32
+      %next = scalar.addi %acc, %product : i32
+      scf.yield %next : i32
+    }
+    %dot_f = scalar.sitofp %dot : i32 to f32
+    %value = scalar.mulf %dot_f, %d : f32
+    scf.yield %value : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %term : f32
+  %leader = index.cmp eq, %lane, %c0 : index
+  %writer = scalar.andi %valid_row, %leader : i1
+  scf.if %writer {
+    %safe_row = index.assume %row [lt(%row, %outputs)] : index
+    %out = buffer.view %output[%output_offset] : buffer -> view<[%outputs]xf32>
+    view.store %sum, %out[%safe_row] : f32, view<[%outputs]xf32>
+  }
+  kernel.return
+}

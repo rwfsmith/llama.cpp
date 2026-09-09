@@ -339,6 +339,12 @@ def with_owned_kernels(manifest: dict, corpus_dir: pathlib.Path) -> dict:
             ("ggml_q8_narrow_dot", ["input_size", "output_size"],
              ["packed", "weight", "output"], ["read", "read", "write"]),
         ]),
+        ("../hrx_owned/dense_q8_narrow_batched.loom", [
+            ("ggml_q8_narrow_pack_batched", ["input_size", "token_count"],
+             ["input", "packed"], ["read", "write"]),
+            ("ggml_q8_narrow_dot_batched", ["input_size", "output_size", "token_count"],
+             ["packed", "weight", "output"], ["read", "read", "write"]),
+        ]),
         ("../hrx_owned/dense_quantized_f32_accum.loom", [
             (name, ["token_count"], ["input", "weight", "output"], ["read", "read", "write"])
             for name in ("ggml_dense_q4k_f32_accum", "ggml_dense_q6k_f32_accum",

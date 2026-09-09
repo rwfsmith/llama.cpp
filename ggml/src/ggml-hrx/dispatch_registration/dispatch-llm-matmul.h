@@ -29,15 +29,15 @@ bool llm_mtp_hc_projection_supported(const Tensor & weight, const Tensor & input
     return true;
 }
 
-// Shared by the tensor capability probe and imported-graph matcher. Decode only.
+// Shared by the tensor capability probe and imported-graph matcher. Contiguous T=1..8.
 template <typename Tensor>
 bool llm_q8_narrow_supported(const Tensor & weight, const Tensor & input, const Tensor & output) {
     const char * flag = std::getenv("HRX_ENABLE_Q8_NARROW");
     if (flag == nullptr || std::strcmp(flag, "1") != 0 ||
         weight.type != GGML_TYPE_Q8_0 || input.type != GGML_TYPE_F32 || output.type != GGML_TYPE_F32 ||
         (weight.ne[0] != 320 && weight.ne[0] != 640) || weight.ne[1] < 1 || weight.ne[1] > 10240 ||
-        input.ne[0] != weight.ne[0] || input.ne[1] != 1 ||
-        output.ne[0] != weight.ne[1] || output.ne[1] != 1) {
+        input.ne[0] != weight.ne[0] || input.ne[1] < 1 || input.ne[1] > 8 ||
+        output.ne[0] != weight.ne[1] || output.ne[1] != input.ne[1]) {
         return false;
     }
     for (const Tensor * tensor : { &weight, &input, &output }) {

@@ -8,12 +8,14 @@
 #include "dispatch_registration/dispatch-swiglu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-hrx.h"
 #include "ggml-impl.h"
 #include "ggml.h"
 #include "graph/graph.h"
 #include "kernel-corpus/kernel-corpus.h"
 #include "runtime/command-program-executor.h"
+#include "runtime/device-timing.h"
 #include "runtime/graph-executor.h"
 
 #include <algorithm>
@@ -604,6 +606,9 @@ struct AttentionPostprocessGraph {
     ggml_tensor * key_cache_indices   = nullptr;
     ggml_tensor * value_cache_indices = nullptr;
     ggml_tensor * attention_mask      = nullptr;
+    ggml_tensor * query_raw           = nullptr;
+    ggml_tensor * key_raw             = nullptr;
+    ggml_tensor * value_raw           = nullptr;
     ggml_tensor * query_reshape       = nullptr;
     ggml_tensor * query_output        = nullptr;
     ggml_tensor * key_output          = nullptr;
@@ -634,6 +639,9 @@ static AttentionPostprocessGraph build_attention_postprocess_graph(ggml_context 
     REQUIRE(query_raw != nullptr);
     REQUIRE(key_raw != nullptr);
     REQUIRE(value_raw != nullptr);
+    graph.query_raw = query_raw;
+    graph.key_raw   = key_raw;
+    graph.value_raw = value_raw;
 
     ggml_tensor * query_reshape = ggml_reshape_3d(ctx, query_raw, kQwenFlashHeadSize, query_head_count, token_count);
     ggml_tensor * key_reshape   = ggml_reshape_3d(ctx, key_raw, kQwenFlashHeadSize, key_value_head_count, token_count);
@@ -1673,6 +1681,55 @@ class ScopedHrxEnvironment {
     bool        had_previous = false;
     std::string saved;
 };
+
+static void require_zero_device_timing_calls(const ggml::hrx::DeviceTimingTestSnapshot & snapshot) {
+    REQUIRE(snapshot.init_attempts == 0);
+    REQUIRE(snapshot.event_create_calls == 0);
+    REQUIRE(snapshot.event_record_calls == 0);
+    REQUIRE(snapshot.event_synchronize_calls == 0);
+    REQUIRE(snapshot.event_elapsed_calls == 0);
+    REQUIRE(snapshot.event_destroy_calls == 0);
+    REQUIRE(snapshot.graph_measurements == 0);
+}
+
+static void run_device_timing_schedule_checks() {
+    for (const char * flag : { static_cast<const char *>(nullptr), "", "0" }) {
+        ScopedHrxEnvironment environment("HRX_ENABLE_DEVICE_TIMING", flag);
+        ggml::hrx::reset_device_timing_test_snapshot();
+        ggml::hrx::device_timing_test_probe_flag_off_path();
+        const auto snapshot = ggml::hrx::device_timing_test_snapshot();
+        REQUIRE(!snapshot.env_enabled);
+        require_zero_device_timing_calls(snapshot);
+    }
+}
+
+static void run_device_timing_gpu_checks() {
+    {
+        ScopedHrxEnvironment environment("HRX_ENABLE_DEVICE_TIMING", "1");
+        ggml::hrx::reset_device_timing_test_snapshot();
+        run_rmsnorm_mul_case(256, 1);
+        const auto snapshot = ggml::hrx::device_timing_test_snapshot();
+        REQUIRE(snapshot.env_enabled);
+        REQUIRE(snapshot.internals_available);
+        REQUIRE(snapshot.init_attempts >= 1);
+        REQUIRE(snapshot.event_create_calls >= 2);
+        REQUIRE(snapshot.event_record_calls >= 2);
+        REQUIRE(snapshot.event_synchronize_calls >= 1);
+        REQUIRE(snapshot.event_elapsed_calls >= 1);
+        REQUIRE(snapshot.graph_measurements >= 1);
+        REQUIRE(snapshot.last_graph_ms >= 0.0);
+        REQUIRE(snapshot.last_graph_ms < 60000.0);
+    }
+    {
+        ScopedHrxEnvironment environment("HRX_ENABLE_DEVICE_TIMING", "0");
+        ggml::hrx::reset_device_timing_test_snapshot();
+        run_rmsnorm_mul_case(256, 1);
+        const auto snapshot = ggml::hrx::device_timing_test_snapshot();
+        REQUIRE(!snapshot.env_enabled);
+        require_zero_device_timing_calls(snapshot);
+    }
+    std::fprintf(stderr, "Device timing checks passed (HIP graph timing on/off, no schedule-path overhead)\n");
+}
 
 static void run_q8_embedding_scheduling_checks() {
     for (const char * flag : { static_cast<const char *>(nullptr), "", "0", "true", "01", "1x", "1" }) {
@@ -2771,7 +2828,7 @@ static void run_q8_narrow_scheduling_checks() {
     for (const char * flag : flags) {
         ScopedHrxEnvironment environment("HRX_ENABLE_Q8_NARROW", flag);
         for (int64_t width : { 320, 640 }) {
-            for (int64_t tokens : { 1, 2, 512 }) {
+            for (int64_t tokens : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 512 }) {
                 for (int64_t rows : { 3, 2560, 10240 }) {
                     ggml_init_params params = {};
                     params.mem_size = 1024 * 1024;
@@ -2783,7 +2840,7 @@ static void run_q8_narrow_scheduling_checks() {
                     ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
                     ggml_cgraph * graph = ggml_new_graph(ctx);
                     ggml_build_forward_expand(graph, output);
-                    const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0 && tokens == 1;
+                    const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0 && tokens <= 8;
                     REQUIRE(ggml::hrx::llm_q8_narrow_supported(*weight, *input, *output) == enabled);
                     auto imported = ggml::hrx::import_ggml_graph(*graph);
                     REQUIRE(imported.valid());
@@ -2797,8 +2854,16 @@ static void run_q8_narrow_scheduling_checks() {
                         REQUIRE(plan.constant_initializations.empty());
                         const auto & pack = plan.dispatches[0];
                         const auto & dot = plan.dispatches[1];
-                        REQUIRE(kernel_name_for_id(pack.kernel.kernel_id) == "hrx_owned:ggml_q8_narrow_pack");
-                        REQUIRE(kernel_name_for_id(dot.kernel.kernel_id) == "hrx_owned:ggml_q8_narrow_dot");
+                        REQUIRE(kernel_name_for_id(pack.kernel.kernel_id) == (tokens == 1 ?
+                            "hrx_owned:ggml_q8_narrow_pack" : "hrx_owned:ggml_q8_narrow_pack_batched"));
+                        REQUIRE(kernel_name_for_id(dot.kernel.kernel_id) == (tokens == 1 ?
+                            "hrx_owned:ggml_q8_narrow_dot" : "hrx_owned:ggml_q8_narrow_dot_batched"));
+                        REQUIRE(pack.kernel.integer_parameters.size() == (tokens == 1 ? 1 : 2));
+                        REQUIRE(dot.kernel.integer_parameters.size() == (tokens == 1 ? 2 : 3));
+                        if (tokens > 1) {
+                            REQUIRE(pack.kernel.integer_parameters.at("token_count") == tokens);
+                            REQUIRE(dot.kernel.integer_parameters.at("token_count") == tokens);
+                        }
                         REQUIRE(pack.kernel.integer_parameters.at("input_size") == width);
                         REQUIRE(dot.kernel.integer_parameters.at("input_size") == width);
                         REQUIRE(dot.kernel.integer_parameters.at("output_size") == rows);
@@ -2808,7 +2873,7 @@ static void run_q8_narrow_scheduling_checks() {
                         REQUIRE(pack.bindings[0].length == ggml_nbytes(input));
                         REQUIRE(pack.bindings[1].value == plan.transients[0].value);
                         REQUIRE(dot.bindings[0].value == plan.transients[0].value);
-                        REQUIRE(pack.bindings[1].length == ggml_row_size(GGML_TYPE_Q8_0, width));
+                        REQUIRE(pack.bindings[1].length == ggml_row_size(GGML_TYPE_Q8_0, width) * tokens);
                         REQUIRE(dot.bindings[0].length == pack.bindings[1].length);
                         REQUIRE(plan.transients[0].size == pack.bindings[1].length);
                         REQUIRE(dot.bindings[1].value == imported.graph.values().find_tensor(weight)->id);
@@ -2823,49 +2888,57 @@ static void run_q8_narrow_scheduling_checks() {
     }
 
     ScopedHrxEnvironment environment("HRX_ENABLE_Q8_NARROW", "1");
-    for (int malformed = 0; malformed < 7; ++malformed) {
+    for (int64_t tokens : { 1, 4 }) {
+        for (int malformed = 0; malformed < 11; ++malformed) {
+            ggml_init_params params = {};
+            params.mem_size = 1024 * 1024;
+            params.no_alloc = true;
+            ggml_context * ctx = ggml_init(params);
+            REQUIRE(ctx != nullptr);
+            ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, malformed == 0 ? 352 : 320,
+                                                     malformed == 1 ? 10241 : 5);
+            ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weight->ne[0], tokens);
+            ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
+            if (malformed == 2) { weight->nb[1] += 34; }
+            if (malformed == 3) { input->nb[0] *= 2; }
+            if (malformed == 4) { output->nb[0] *= 2; }
+            if (malformed == 5) { input->type = GGML_TYPE_F16; }
+            if (malformed == 6) { output->ne[2] = 2; }
+            if (malformed == 7) { input->nb[1] += sizeof(float); }
+            if (malformed == 8) { output->nb[1] += sizeof(float); }
+            if (malformed == 9) { weight->ne[2] = 2; }
+            if (malformed == 10) { output->ne[1] += 1; }
+            REQUIRE(!ggml::hrx::llm_q8_narrow_supported(*weight, *input, *output));
+            ggml_cgraph * graph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(graph, output);
+            auto imported = ggml::hrx::import_ggml_graph(*graph);
+            if (imported.valid()) {
+                ggml::hrx::DispatchScheduler scheduler;
+                REQUIRE(!scheduler.schedule_graph(imported.graph, { "gfx1151" }));
+            }
+            ggml_free(ctx);
+        }
+    }
+
+    // The activation's producer must execute before the pack, not be consumed by a later-root fusion.
+    for (int64_t tokens : { 1, 2, 3, 4, 8 }) {
         ggml_init_params params = {};
         params.mem_size = 1024 * 1024;
         params.no_alloc = true;
         ggml_context * ctx = ggml_init(params);
         REQUIRE(ctx != nullptr);
-        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, malformed == 0 ? 352 : 320,
-                                                 malformed == 1 ? 10241 : 5);
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, weight->ne[0], 1);
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 320, 5);
+        ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 320, tokens);
+        ggml_tensor * input = ggml_add(ctx, source, source);
         ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
-        if (malformed == 2) { weight->nb[1] += 34; }
-        if (malformed == 3) { input->nb[0] *= 2; }
-        if (malformed == 4) { output->nb[0] *= 2; }
-        if (malformed == 5) { input->type = GGML_TYPE_F16; }
-        if (malformed == 6) { output->ne[2] = 2; }
-        REQUIRE(!ggml::hrx::llm_q8_narrow_supported(*weight, *input, *output));
         ggml_cgraph * graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, output);
-        auto imported = ggml::hrx::import_ggml_graph(*graph);
-        if (imported.valid()) {
-            ggml::hrx::DispatchScheduler scheduler;
-            REQUIRE(!scheduler.schedule_graph(imported.graph, { "gfx1151" }));
-        }
+        const auto sequence = scheduled_kernel_sequence(graph);
+        REQUIRE(sequence.size() == 3);
+        REQUIRE(sequence[1] == (tokens == 1 ? "hrx_owned:ggml_q8_narrow_pack" : "hrx_owned:ggml_q8_narrow_pack_batched"));
+        REQUIRE(sequence[2] == (tokens == 1 ? "hrx_owned:ggml_q8_narrow_dot" : "hrx_owned:ggml_q8_narrow_dot_batched"));
         ggml_free(ctx);
     }
-
-    // The activation's producer must execute before the pack, not be consumed by a later-root fusion.
-    ggml_init_params params = {};
-    params.mem_size = 1024 * 1024;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    REQUIRE(ctx != nullptr);
-    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 320, 5);
-    ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 320, 1);
-    ggml_tensor * input = ggml_add(ctx, source, source);
-    ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
-    ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, output);
-    const auto sequence = scheduled_kernel_sequence(graph);
-    REQUIRE(sequence.size() == 3);
-    REQUIRE(sequence[1] == "hrx_owned:ggml_q8_narrow_pack");
-    REQUIRE(sequence[2] == "hrx_owned:ggml_q8_narrow_dot");
-    ggml_free(ctx);
 }
 
 static std::vector<uint8_t> q8_narrow_activation_reference(const std::vector<float> & input) {
@@ -2892,42 +2965,52 @@ static std::vector<uint8_t> q8_narrow_activation_reference(const std::vector<flo
 }
 
 static std::vector<float> q8_narrow_dot_reference(const std::vector<uint8_t> & weight,
-                                                 const std::vector<uint8_t> & input, int64_t rows) {
-    const size_t blocks = input.size() / 34;
-    std::vector<float> expected(rows);
-    for (int64_t row = 0; row < rows; ++row) {
-        double sum = 0.0;
-        for (size_t block = 0; block < blocks; ++block) {
-            const uint8_t * w = weight.data() + (row * blocks + block) * 34;
-            const uint8_t * a = input.data() + block * 34;
-            ggml_fp16_t wd, ad;
-            std::memcpy(&wd, w, sizeof(wd));
-            std::memcpy(&ad, a, sizeof(ad));
-            int dot = 0;
-            for (size_t q = 0; q < 32; ++q) {
-                int8_t wq, aq;
-                std::memcpy(&wq, w + 2 + q, 1);
-                std::memcpy(&aq, a + 2 + q, 1);
-                dot += static_cast<int>(wq) * static_cast<int>(aq);
+                                                 const std::vector<uint8_t> & input, int64_t rows, int64_t tokens = 1) {
+    const size_t blocks = input.size() / 34 / tokens;
+    std::vector<float> expected(rows * tokens);
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t row = 0; row < rows; ++row) {
+            double sum = 0.0;
+            for (size_t block = 0; block < blocks; ++block) {
+                const uint8_t * w = weight.data() + (row * blocks + block) * 34;
+                const uint8_t * a = input.data() + (token * blocks + block) * 34;
+                ggml_fp16_t wd, ad;
+                std::memcpy(&wd, w, sizeof(wd));
+                std::memcpy(&ad, a, sizeof(ad));
+                int dot = 0;
+                for (size_t q = 0; q < 32; ++q) {
+                    int8_t wq, aq;
+                    std::memcpy(&wq, w + 2 + q, 1);
+                    std::memcpy(&aq, a + 2 + q, 1);
+                    dot += static_cast<int>(wq) * static_cast<int>(aq);
+                }
+                sum += static_cast<float>(dot) * (ggml_fp16_to_fp32(wd) * ggml_fp16_to_fp32(ad));
             }
-            sum += static_cast<float>(dot) * (ggml_fp16_to_fp32(wd) * ggml_fp16_to_fp32(ad));
+            expected[token * rows + row] = static_cast<float>(sum);
         }
-        expected[row] = static_cast<float>(sum);
     }
     return expected;
 }
 
-static void run_q8_narrow_reference_case(int64_t width, int64_t rows, bool basis, bool use_hrx) {
+static void run_q8_narrow_reference_case(int64_t width, int64_t rows, bool basis, bool use_hrx,
+                                        int64_t tokens = 1, bool alias = false) {
     ScopedHrxEnvironment environment("HRX_ENABLE_Q8_NARROW", "1");
     ScopedHrxEnvironment gemv("HRX_ENABLE_Q8_GEMV", "0");
-    ggml_backend_t backends[2] = { init_cpu_backend(), use_hrx ? ggml_backend_hrx_init(0) : nullptr };
-    REQUIRE(!use_hrx || backends[1] != nullptr);
+    // init_by_type initializes the global backend registry, including GPU discovery.
+    ggml_backend_t backends[2] = { ggml_backend_cpu_init(), use_hrx ? ggml_backend_hrx_init(0) : nullptr };
+    REQUIRE(backends[0] != nullptr && (!use_hrx || backends[1] != nullptr));
     ggml_context * contexts[2] = {};
     ggml_backend_buffer_t buffers[2] = {};
     ggml_tensor * weights[2] = {};
     ggml_tensor * inputs[2] = {};
     ggml_tensor * outputs[2] = {};
+    ggml_tensor * arenas[2] = {};
     ggml_cgraph * graphs[2] = {};
+    ggml_tensor * single_input = nullptr;
+    ggml_tensor * single_output = nullptr;
+    ggml_cgraph * single_graph = nullptr;
+    const int64_t guard = 32, shift = 8;
+    const int64_t arena_count = 2 * guard + std::max(width * tokens, shift + rows * tokens);
     const int backend_count = use_hrx ? 2 : 1;
     for (int b = 0; b < backend_count; ++b) {
         ggml_init_params params = {};
@@ -2936,16 +3019,32 @@ static void run_q8_narrow_reference_case(int64_t width, int64_t rows, bool basis
         contexts[b] = ggml_init(params);
         REQUIRE(contexts[b] != nullptr);
         weights[b] = ggml_new_tensor_2d(contexts[b], GGML_TYPE_Q8_0, width, rows);
-        inputs[b] = ggml_new_tensor_2d(contexts[b], GGML_TYPE_F32, width, 1);
+        if (alias) {
+            arenas[b] = ggml_new_tensor_1d(contexts[b], GGML_TYPE_F32, arena_count);
+            inputs[b] = ggml_view_2d(contexts[b], arenas[b], width, tokens, width * sizeof(float), guard * sizeof(float));
+        } else {
+            inputs[b] = ggml_new_tensor_2d(contexts[b], GGML_TYPE_F32, width, tokens);
+        }
         outputs[b] = ggml_mul_mat(contexts[b], weights[b], inputs[b]);
+        if (alias) {
+            outputs[b]->view_src = arenas[b];
+            outputs[b]->view_offs = (guard + shift) * sizeof(float);
+        }
         graphs[b] = ggml_new_graph(contexts[b]);
         ggml_build_forward_expand(graphs[b], outputs[b]);
+        if (b == 1 && tokens > 1) {
+            single_input = ggml_new_tensor_2d(contexts[b], GGML_TYPE_F32, width, 1);
+            single_output = ggml_mul_mat(contexts[b], weights[b], single_input);
+            single_graph = ggml_new_graph(contexts[b]);
+            ggml_build_forward_expand(single_graph, single_output);
+        }
         buffers[b] = ggml_backend_alloc_ctx_tensors(contexts[b], backends[b]);
         REQUIRE(buffers[b] != nullptr);
         if (b == 1) {
             REQUIRE(ggml_backend_supports_op(backends[b], outputs[b]));
-            require_kernel_subsequence(scheduled_kernel_sequence(graphs[b]),
-                                       { "hrx_owned:ggml_q8_narrow_pack", "hrx_owned:ggml_q8_narrow_dot" });
+            require_kernel_subsequence(scheduled_kernel_sequence(graphs[b]), tokens == 1 ?
+                std::vector<std::string>{ "hrx_owned:ggml_q8_narrow_pack", "hrx_owned:ggml_q8_narrow_dot" } :
+                std::vector<std::string>{ "hrx_owned:ggml_q8_narrow_pack_batched", "hrx_owned:ggml_q8_narrow_dot_batched" });
             ScopedHrxEnvironment disabled("HRX_ENABLE_Q8_NARROW", "0");
             REQUIRE(!ggml_backend_supports_op(backends[b], outputs[b]));
         }
@@ -2970,36 +3069,44 @@ static void run_q8_narrow_reference_case(int64_t width, int64_t rows, bool basis
         set_tensor_bytes(backends[b], weights[b], weight.data(), weight.size());
     }
     for (int replay = 0; replay < 5; ++replay) {
-        std::vector<float> input(width);
-        for (int64_t column = 0; column < width; ++column) {
-            const int64_t block = column / 32;
-            const int64_t q = column % 32;
-            if (replay == 1) {
-                const float step = (block % 2 == 0 ? 1.0f : 0.0625f);
-                input[column] = (q == 31 ? 127.0f : q == 30 ? -127.0f :
-                    (q % 2 == 0 ? 1.0f : -1.0f) * (static_cast<float>(q / 2) + 0.5f)) * step;
-            } else if (replay == 3 || (replay == 0 && block < 2)) {
-                input[column] = q % 2 == 0 ? 0.0f : -0.0f;
-            } else {
-                input[column] = static_cast<float>((column * 17 + block * 11 + replay * 7) % 253 - 126) *
-                                (replay == 2 ? 0.0000013f : 0.0013f);
+        std::vector<float> input(width * tokens);
+        for (int64_t token = 0; token < tokens; ++token) {
+            for (int64_t column = 0; column < width; ++column) {
+                const int64_t block = column / 32;
+                const int64_t q = column % 32;
+                if (replay == 1) {
+                    const float step = (block % 2 == 0 ? 1.0f : 0.0625f);
+                    input[token * width + column] = (q == 31 ? 127.0f : q == 30 ? -127.0f :
+                        (q % 2 == 0 ? 1.0f : -1.0f) * (static_cast<float>((q / 2 + token) % 15) + 0.5f)) *
+                        step * (token % 2 == 0 ? 1.0f : -2.0f);
+                } else if (replay == 3 || (replay == 0 && block < 2)) {
+                    input[token * width + column] = q % 2 == 0 ? 0.0f : -0.0f;
+                } else {
+                    input[token * width + column] =
+                        static_cast<float>((column * 17 + block * 11 + replay * 7 + token * 23) % 253 - 126) *
+                        (replay == 2 ? 0.0000013f : 0.0013f);
+                }
             }
         }
         const auto packed = q8_narrow_activation_reference(input);
         if (replay == 1) {
             std::vector<uint8_t> scalar_reference(packed.size());
-            ggml_get_type_traits(GGML_TYPE_Q8_0)->from_float_ref(input.data(), scalar_reference.data(), width);
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->from_float_ref(input.data(), scalar_reference.data(), input.size());
             REQUIRE(packed != scalar_reference);
             int8_t first_even, first_away;
             std::memcpy(&first_even, packed.data() + 2, 1);
             std::memcpy(&first_away, scalar_reference.data() + 2, 1);
             REQUIRE(first_even == 0 && first_away == 1);
         }
-        const auto expected = q8_narrow_dot_reference(weight, packed, rows);
+        const auto expected = q8_narrow_dot_reference(weight, packed, rows, tokens);
         for (int b = 0; b < backend_count; ++b) {
-            const std::vector<float> dirty(rows, 123.0f);
-            set_tensor_bytes(backends[b], inputs[b], input.data(), input.size() * sizeof(float));
+            if (alias) {
+                const std::vector<float> canary(arena_count, 12345.0f);
+                set_tensor_bytes(backends[b], arenas[b], canary.data(), canary.size() * sizeof(float));
+            }
+            const std::vector<float> dirty(rows * tokens, 123.0f);
             set_tensor_bytes(backends[b], outputs[b], dirty.data(), dirty.size() * sizeof(float));
+            set_tensor_bytes(backends[b], inputs[b], input.data(), input.size() * sizeof(float));
             REQUIRE(ggml_backend_graph_compute(backends[b], graphs[b]) == GGML_STATUS_SUCCESS);
             const auto actual = get_f32_tensor(backends[b], outputs[b]);
             for (float value : actual) {
@@ -3008,24 +3115,50 @@ static void run_q8_narrow_reference_case(int64_t width, int64_t rows, bool basis
             // Basis rows expose each packed code and f16 scale, including signed ties and zero blocks.
             // The CPU comparison pins the AVX semantics, rather than assuming from_float_ref is equivalent.
             require_close(actual, expected, basis ? 0.0f : 3.0e-5f, basis ? 0.0f : 2.0e-5f);
+            if (alias) {
+                const auto arena = get_f32_tensor(backends[b], arenas[b]);
+                REQUIRE(std::memcmp(arena.data() + guard + shift, actual.data(), actual.size() * sizeof(float)) == 0);
+                for (int64_t i = 0; i < arena_count; ++i) {
+                    if (i >= guard + shift && i < guard + shift + rows * tokens) { continue; }
+                    const float untouched = i >= guard && i < guard + width * tokens ? input[i - guard] : 12345.0f;
+                    REQUIRE(std::memcmp(&arena[i], &untouched, sizeof(float)) == 0);
+                }
+            }
+            if (b == 1 && tokens > 1) {
+                for (int64_t token = 0; token < tokens; ++token) {
+                    set_tensor_bytes(backends[b], single_input, input.data() + token * width, width * sizeof(float));
+                    REQUIRE(ggml_backend_graph_compute(backends[b], single_graph) == GGML_STATUS_SUCCESS);
+                    const auto single = get_f32_tensor(backends[b], single_output);
+                    REQUIRE(std::memcmp(single.data(), actual.data() + token * rows, rows * sizeof(float)) == 0);
+                }
+            }
         }
     }
     for (int b = 0; b < backend_count; ++b) {
+        std::vector<uint8_t> unchanged(weight.size());
+        ggml_backend_tensor_get(weights[b], unchanged.data(), 0, unchanged.size());
+        ggml_backend_synchronize(backends[b]);
+        REQUIRE(unchanged == weight);
         ggml_backend_buffer_free(buffers[b]);
         ggml_free(contexts[b]);
         ggml_backend_free(backends[b]);
     }
 }
 
-static void run_q8_narrow_reference_checks() {
-    for (int64_t width : { 320, 640 }) {
-        run_q8_narrow_reference_case(width, width, true, true);
-        for (int64_t rows : { 1, 3, 4, 5, 65 }) {
-            run_q8_narrow_reference_case(width, rows, false, true);
+static void run_q8_narrow_reference_checks(bool use_hrx = true) {
+    for (int64_t tokens : { 1, 2, 3, 4, 8 }) {
+        for (int64_t width : { 320, 640 }) {
+            run_q8_narrow_reference_case(width, width, true, use_hrx, tokens);
+            for (int64_t rows : { 1, 3, 4, 5, 65 }) {
+                run_q8_narrow_reference_case(width, rows, false, use_hrx, tokens);
+            }
+            run_q8_narrow_reference_case(width, 65, false, use_hrx, tokens, true);
         }
+        run_q8_narrow_reference_case(320, 10240, false, use_hrx, tokens);
+        run_q8_narrow_reference_case(640, 2560, false, use_hrx, tokens);
+        std::fprintf(stderr, "Q8 narrow T=%lld: 16 cases, 80 CPU/reference%s replays passed\n",
+                     (long long) tokens, use_hrx ? (tokens > 1 ? "/GPU/T1-bitwise" : "/GPU") : "");
     }
-    run_q8_narrow_reference_case(320, 10240, false, true);
-    run_q8_narrow_reference_case(640, 2560, false, true);
 }
 
 static void run_iq_expert_scheduling_checks(bool small_batch = false) {
@@ -4271,6 +4404,13 @@ static void run_attention_postprocess_cpu_reference_case() {
     ggml_cgraph * hrx_graph = ggml_new_graph(hrx_ctx);
     REQUIRE(cpu_graph != nullptr);
     REQUIRE(hrx_graph != nullptr);
+    // The isolated postprocess fusion needs all three projections live at the query reshape.
+    ggml_build_forward_expand(cpu_graph, cpu.query_raw);
+    ggml_build_forward_expand(cpu_graph, cpu.key_raw);
+    ggml_build_forward_expand(cpu_graph, cpu.value_raw);
+    ggml_build_forward_expand(hrx_graph, hrx.query_raw);
+    ggml_build_forward_expand(hrx_graph, hrx.key_raw);
+    ggml_build_forward_expand(hrx_graph, hrx.value_raw);
     ggml_build_forward_expand(cpu_graph, cpu.query_output);
     ggml_build_forward_expand(cpu_graph, cpu.key_output);
     ggml_build_forward_expand(cpu_graph, cpu.value_output);
@@ -5721,7 +5861,12 @@ int main(int argc, char ** argv) {
     bool q8_selected = false;
     bool mtp_hc_projection_selected = false;
     bool dense_f32_accum_selected = false;
+    bool device_timing_selected = false;
+    bool device_timing_schedule_selected = false;
+    bool device_timing_schedule_only = argc > 1;
     bool q8_narrow_selected = false;
+    bool q8_narrow_cpu_selected = false;
+    bool q8_narrow_cpu_only = argc > 1;
     bool q8_embedding_selected = false;
     bool q4_embedding_selected = false;
     bool iq_selected = false;
@@ -5738,14 +5883,26 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         q4_ids_only = q4_ids_only && std::strcmp(argv[i], "--q4-expert-ids") == 0;
         swiglu_schedule_only = swiglu_schedule_only && std::strcmp(argv[i], "--swiglu-schedule") == 0;
+        device_timing_schedule_only =
+            device_timing_schedule_only && std::strcmp(argv[i], "--device-timing-schedule") == 0;
+        q8_narrow_cpu_only = q8_narrow_cpu_only &&
+            (std::strcmp(argv[i], "--q8-narrow-cpu") == 0 ||
+             std::strcmp(argv[i], "--q4-expert-ids") == 0 || std::strcmp(argv[i], "--swiglu-schedule") == 0 ||
+             std::strcmp(argv[i], "--device-timing-schedule") == 0);
         if (std::strcmp(argv[i], "--q8-gemv") == 0) {
             q8_selected = true;
         } else if (std::strcmp(argv[i], "--mtp-hc-projection") == 0) {
             mtp_hc_projection_selected = true;
         } else if (std::strcmp(argv[i], "--dense-f32-accum") == 0) {
             dense_f32_accum_selected = true;
+        } else if (std::strcmp(argv[i], "--device-timing") == 0) {
+            device_timing_selected = true;
+        } else if (std::strcmp(argv[i], "--device-timing-schedule") == 0) {
+            device_timing_schedule_selected = true;
         } else if (std::strcmp(argv[i], "--q8-narrow") == 0) {
             q8_narrow_selected = true;
+        } else if (std::strcmp(argv[i], "--q8-narrow-cpu") == 0) {
+            q8_narrow_cpu_selected = true;
         } else if (std::strcmp(argv[i], "--q8-embedding") == 0) {
             q8_embedding_selected = true;
         } else if (std::strcmp(argv[i], "--q4-embedding") == 0) {
@@ -5770,7 +5927,7 @@ int main(int argc, char ** argv) {
             q8_selected = true;
             q8_benchmark = true;
         } else {
-            std::fprintf(stderr, "usage: %s [--q8-gemv] [--q8-narrow] [--q8-embedding] [--q4-embedding] [--mtp-hc-projection] [--dense-f32-accum] [--iq-experts] [--q4-experts] [--q4-expert-ids] [--moe-small-batch] [--hc-small-batch] [--small-batch-glue] [--swiglu] [--swiglu-schedule] [--q8-benchmark]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--q8-gemv] [--q8-narrow] [--q8-narrow-cpu] [--q8-embedding] [--q4-embedding] [--mtp-hc-projection] [--dense-f32-accum] [--device-timing] [--device-timing-schedule] [--iq-experts] [--q4-experts] [--q4-expert-ids] [--moe-small-batch] [--hc-small-batch] [--small-batch-glue] [--swiglu] [--swiglu-schedule] [--q8-benchmark]\n", argv[0]);
             return 1;
         }
     }
@@ -5780,14 +5937,32 @@ int main(int argc, char ** argv) {
     if (!selected_only || swiglu_selected || swiglu_schedule_selected) {
         run_swiglu_scheduling_checks();
     }
+    if (!selected_only || device_timing_selected || device_timing_schedule_selected) {
+        run_device_timing_schedule_checks();
+    }
     if (swiglu_schedule_only) {
         std::fprintf(stderr, "SwiGLU scheduling checks passed (no device initialization)\n");
+        return 0;
+    }
+    if (device_timing_schedule_only) {
+        std::fprintf(stderr, "Device timing schedule checks passed (flag-off path performs no HIP calls)\n");
         return 0;
     }
     if (!selected_only || q4_experts_selected || q4_ids_selected) {
         run_q4_expert_id_validation_checks();
     }
     if (q4_ids_only) {
+        REQUIRE(ggml_backend_hrx_shutdown());
+        return 0;
+    }
+    if (q8_narrow_cpu_selected) {
+        std::fprintf(stderr, "Q8 narrow CPU-only scheduling checks\n");
+        run_q8_narrow_scheduling_checks();
+        std::fprintf(stderr, "Q8 narrow CPU-only numerical checks\n");
+        run_q8_narrow_reference_checks(false);
+    }
+    if (q8_narrow_cpu_selected && q8_narrow_cpu_only) {
+        std::fprintf(stderr, "Q8 narrow T1..8 scheduling and CPU/reference/alias checks passed (no device initialization)\n");
         REQUIRE(ggml_backend_hrx_shutdown());
         return 0;
     }
@@ -5856,6 +6031,9 @@ int main(int argc, char ** argv) {
         }
         if (dense_f32_accum_selected) {
             run_dense_f32_accum_reference_checks();
+        }
+        if (device_timing_selected) {
+            run_device_timing_gpu_checks();
         }
         if (mtp_hc_projection_selected) {
             run_mtp_hc_projection_reference_checks();

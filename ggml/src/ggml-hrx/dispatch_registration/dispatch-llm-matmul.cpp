@@ -32,6 +32,10 @@ static constexpr KernelCatalogRef kLlmQ8NarrowPackKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_pack");
 static constexpr KernelCatalogRef kLlmQ8NarrowDotKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_dot");
+static constexpr KernelCatalogRef kLlmQ8NarrowPackBatchedKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_pack_batched");
+static constexpr KernelCatalogRef kLlmQ8NarrowDotBatchedKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_dot_batched");
 
 static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
@@ -243,15 +247,20 @@ static bool match_llm_q8_narrow_dispatch(const DispatchMatchContext & context, D
     }
 
     const ValueId packed = context.next_plan_value;
-    const size_t packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, input->ne[0]);
+    const int64_t tokens = input->ne[1];
+    const size_t packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, input->ne[0]) * static_cast<size_t>(tokens);
     Dispatch pack;
-    pack.kernel = make_kernel_specialization(kLlmQ8NarrowPackKernel);
+    pack.kernel = make_kernel_specialization(tokens == 1 ? kLlmQ8NarrowPackKernel : kLlmQ8NarrowPackBatchedKernel);
     pack.kernel.integer_parameters.emplace("input_size", input->ne[0]);
     pack.bindings = { { input->id, 0, input->byte_count }, { packed, 0, packed_bytes } };
     Dispatch dot;
-    dot.kernel = make_kernel_specialization(kLlmQ8NarrowDotKernel);
+    dot.kernel = make_kernel_specialization(tokens == 1 ? kLlmQ8NarrowDotKernel : kLlmQ8NarrowDotBatchedKernel);
     dot.kernel.integer_parameters.emplace("input_size", input->ne[0]);
     dot.kernel.integer_parameters.emplace("output_size", output->ne[0]);
+    if (tokens > 1) {
+        pack.kernel.integer_parameters.emplace("token_count", tokens);
+        dot.kernel.integer_parameters.emplace("token_count", tokens);
+    }
     dot.bindings = { { packed, 0, packed_bytes }, { weight->id, 0, weight->byte_count },
                      { output->id, 0, output->byte_count } };
     match.transients.push_back({ packed, "llm.q8_narrow.activation", packed_bytes, 256 });

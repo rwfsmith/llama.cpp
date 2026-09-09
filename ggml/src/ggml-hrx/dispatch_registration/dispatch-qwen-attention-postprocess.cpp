@@ -669,6 +669,36 @@ static AttentionPostprocessMatch match_qwen_attention_postprocess(const Graph & 
     return match;
 }
 
+static bool input_ready(const DispatchMatchContext & context, ValueId id) {
+    // Fused dispatches execute at the root; aliases must not hide a later producer.
+    for (size_t hop = 0; hop <= context.graph.values().size(); ++hop) {
+        const GraphNode * producer = context.graph.index().producer(id);
+        if (producer == nullptr) {
+            return true;
+        }
+        size_t index = 0;
+        if (!context.graph.index().node_index(producer, index) || index >= context.root_index) {
+            return false;
+        }
+        if (!is_layout_alias_node(context.graph, *producer) || producer->inputs.empty()) {
+            return true;
+        }
+        id = producer->inputs[0];
+    }
+    return false;
+}
+
+static bool postprocess_inputs_ready(const DispatchMatchContext & context,
+                                     const AttentionPostprocessMatch & match) {
+    for (const Value * input : { match.query.positions, match.key.cache_indices, match.value.cache_indices,
+                                match.query.norm_weight, match.key.key.norm_weight }) {
+        if (!input_ready(context, input->id)) {
+            return false;
+        }
+    }
+    return match.query.inverse_freqs == nullptr || input_ready(context, match.query.inverse_freqs->id);
+}
+
 static bool append_postprocess_covered_nodes(const DispatchMatchContext &      context,
                                              const AttentionPostprocessMatch & postprocess,
                                              DispatchMatch &                   dispatch_match,
@@ -818,6 +848,15 @@ static bool match_qwen_attention_qkv_postprocess_fused_decode_dispatch(const Dis
         !is_qwen_attention_projection_weight(*value_weight, hidden_size, key_value_size)) {
         return false;
     }
+    // Raw Q/K/V are outputs of the fused projections, not inputs to this kernel.
+    if (!postprocess_inputs_ready(context, match)) {
+        return false;
+    }
+    for (const Value * input : { match.query.projection_input, query_weight, key_weight, value_weight }) {
+        if (!input_ready(context, input->id)) {
+            return false;
+        }
+    }
 
     const size_t                      q8_input_bytes = q8_1_x4_byte_count(match.query.token_count, hidden_size);
     const CommandPlanAlternateValue * q8_input =
@@ -906,8 +945,13 @@ static bool match_qwen_attention_postprocess_dispatch(const DispatchMatchContext
                                                       DispatchMatch &              dispatch_match) {
     const AttentionPostprocessMatch match =
         match_qwen_attention_postprocess(context.graph, context.root_node, &dispatch_match.status);
-    if (!match.matched()) {
+    if (!match.matched() || !postprocess_inputs_ready(context, match)) {
         return false;
+    }
+    for (const Value * input : { match.query.raw_input, match.key.key.raw_input, match.value.raw_input }) {
+        if (!input_ready(context, input->id)) {
+            return false;
+        }
     }
     if (!append_postprocess_covered_nodes(context, match, dispatch_match, &dispatch_match.status)) {
         return false;
