@@ -52,6 +52,25 @@ try {
     Assert-Test ($configuration.Environment.HRX_ENABLE_Q8_GEMV -eq '0') 'Q8 GEMV stays disabled'
     Assert-Test ($configuration.Environment.HRX_MUL_CLAIM_MASK -eq '0x7F') 'known-good claim mask'
     Assert-Test ($configuration.Models.Count -eq 1) 'MTP is opt-in'
+    # A present-but-empty LLAMA_ARG_API_KEY_FILE makes llama.cpp try to open '' and fail
+    # startup outright; these must be absent from the child environment, not blanked.
+    Assert-Test (-not $configuration.Environment.ContainsKey('LLAMA_API_KEY')) 'LLAMA_API_KEY is removed, not blanked'
+    Assert-Test (-not $configuration.Environment.ContainsKey('LLAMA_ARG_API_KEY_FILE')) 'LLAMA_ARG_API_KEY_FILE is removed, not blanked'
+    $previousApiKey = $env:LLAMA_API_KEY; $previousApiKeyFile = $env:LLAMA_ARG_API_KEY_FILE
+    try {
+        $env:LLAMA_API_KEY = 'leaked-inherited-key'
+        $env:LLAMA_ARG_API_KEY_FILE = 'C:\leaked\inherited\path.txt'
+        $leakedConfiguration = New-HrxStartupConfiguration $base
+        Assert-Test (-not $leakedConfiguration.Environment.ContainsKey('LLAMA_API_KEY')) 'inherited LLAMA_API_KEY is stripped'
+        Assert-Test (-not $leakedConfiguration.Environment.ContainsKey('LLAMA_ARG_API_KEY_FILE')) 'inherited LLAMA_ARG_API_KEY_FILE is stripped'
+    } finally {
+        $env:LLAMA_API_KEY = $previousApiKey; $env:LLAMA_ARG_API_KEY_FILE = $previousApiKeyFile
+    }
+    $withKey = $base.Clone(); $withKey.ApiKeyFile = Join-Path $fixture 'api-key.txt'
+    $withKeyConfiguration = New-HrxStartupConfiguration $withKey
+    Assert-Test (($withKeyConfiguration.Arguments -join ' ') -match
+        [regex]::Escape("--api-key-file $($withKey.ApiKeyFile)")) 'api key file is passed via argument'
+    Assert-Test (-not $withKeyConfiguration.Environment.ContainsKey('LLAMA_ARG_API_KEY_FILE')) 'api key file argument does not leak into environment'
     foreach ($flag in @('MOE_SMALL_BATCH', 'HC_SMALL_BATCH', 'SMALL_BATCH_GLUE')) {
         Assert-Test ($configuration.Environment["HRX_ENABLE_$flag"] -eq '1') "$flag enabled for non-MTP microbatch > 1"
     }

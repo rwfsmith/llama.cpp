@@ -252,8 +252,11 @@ function New-HrxStartupConfiguration($Options) {
         $environment[$key.ToUpperInvariant()] = [string]$Options.Env[$key]
     }
     # Do not accidentally authorize extra inherited keys alongside the private key file.
-    $environment.LLAMA_API_KEY = ''
-    $environment.LLAMA_ARG_API_KEY_FILE = ''
+    # Removing (not blanking) matters: llama.cpp treats a present-but-empty
+    # LLAMA_ARG_API_KEY_FILE as "use this (empty) path", which fails startup outright
+    # instead of falling back to the --api-key-file argument below.
+    $environment.Remove('LLAMA_API_KEY')
+    $environment.Remove('LLAMA_ARG_API_KEY_FILE')
     $arguments = @('-m', $Options.Model, '-ngl', '99', '-fit', 'off', '--no-warmup', '-fa', 'on',
         '-b', '512', '-ub', "$($Options.MicroBatch)", '-c', "$($Options.Context)",
         '-np', '1', '--host', '127.0.0.1', '--port', "$($Options.Port)", '--jinja')
