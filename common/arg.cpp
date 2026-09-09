@@ -1302,10 +1302,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
                 ctx_arg.print_usage(argc, argv);
             }
             common_log_flush(common_log_main());
+            llama_backend_free();
             exit(0);
         }
         if (ctx_arg.params.completion) {
             common_params_print_completion(ctx_arg);
+            llama_backend_free();
             exit(0);
         }
         params.lr.init();
@@ -1315,6 +1317,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         return false;
     } catch (std::exception & ex) {
         fprintf(stderr, "%s\n", ex.what());
+        llama_backend_free();
         exit(1); // for other exceptions, we exit with status code 1
     }
 
@@ -1454,6 +1457,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "show version and build info",
         [](common_params &) {
             llama_print_build_info(llama_version());
+            llama_backend_free();
             exit(0);
         }
     ));
@@ -1466,6 +1470,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             for (size_t i = 0; i < models.size(); i++) {
                 printf("%4zu. %s\n", i + 1, models[i].to_string().c_str());
             }
+            llama_backend_free();
             exit(0);
         }
     ));
@@ -2774,6 +2779,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "print list of available devices and exit",
         [](common_params &) {
             common_print_available_devices();
+            llama_backend_free();
             exit(0);
         }
     ));
@@ -3235,7 +3241,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.parse_special = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--ids"},
         string_format("only print the token IDs, in a Python-parseable list form like [1, 2, 3] (default: %s)", params.tokenize_ids ? "true" : "false"),
@@ -3263,7 +3269,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.parse_special = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_TOKENIZE}));
+    ).set_examples({LLAMA_EXAMPLE_TOKENIZE, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
         {"--show-count"},
         string_format("print the total number of tokens (default: %s)", params.tokenize_show_count ? "true" : "false"),

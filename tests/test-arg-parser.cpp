@@ -231,6 +231,19 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    {
+        common_params debug_params;
+        argv = {"binary_name", "-m", "model_file.gguf"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), debug_params, LLAMA_EXAMPLE_DEBUG));
+        assert(!debug_params.parse_special);
+        argv = {"binary_name", "-m", "model_file.gguf", "--parse-special"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), debug_params, LLAMA_EXAMPLE_DEBUG));
+        assert(debug_params.parse_special);
+        argv = {"binary_name", "-m", "model_file.gguf", "--parse-special", "--no-parse-special"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), debug_params, LLAMA_EXAMPLE_DEBUG));
+        assert(!debug_params.parse_special);
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
@@ -398,11 +411,13 @@ static void test(void) {
 }
 
 int main(void) {
+    int result = 0;
     try {
         test();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
-        return 1;
+        result = 1;
     }
-    return 0;
+    llama_backend_free();
+    return result;
 }

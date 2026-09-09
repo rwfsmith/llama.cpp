@@ -1,0 +1,35 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_swiglu_split_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_swiglu_split_wave64) export("ggml_swiglu_split_f32") @ggml_swiglu_split_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %tiles = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%tiles, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%element_count: index, %gate: buffer, %up: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 262144)] : index
+  %tile = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %tile, %threads : index
+  %linear = index.add %base, %lane : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero = index.constant 0 : offset
+  // Inputs may be overlapping views or the same tensor.
+  %gv = buffer.view %gate[%zero] : buffer -> view<[%count]xf32>
+  %uv = buffer.view %up[%zero] : buffer -> view<[%count]xf32>
+  %ov = buffer.view %output[%zero] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %i = index.assume %linear [lt(%linear, %count)] : index
+    %g = view.load %gv[%i] : view<[%count]xf32> -> f32
+    %u = view.load %uv[%i] : view<[%count]xf32> -> f32
+    %s = scalar.siluf %g : f32
+    %result = scalar.mulf %s, %u : f32
+    view.store %result, %ov[%i] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}

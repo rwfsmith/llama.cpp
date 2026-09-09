@@ -256,7 +256,6 @@ int llama_batched_bench(int argc, char ** argv) {
     llama_free(ctx);
     llama_model_free(model);
 
-    llama_backend_free();
 
     return 0;
 }

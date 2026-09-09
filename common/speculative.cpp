@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
@@ -19,6 +20,11 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <set>
+#include <sstream>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -29,6 +35,323 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+struct common_mtp_eval_scope;
+static thread_local const common_mtp_eval_scope * mtp_active_eval = nullptr;
+
+using common_mtp_host_trace_fn = void (*)(const char *, uint64_t);
+
+static common_mtp_host_trace_fn common_mtp_host_trace(size_t call) {
+    const char * enabled = std::getenv("LLAMA_MTP_TRACE_HOST");
+    if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
+        return nullptr;
+    }
+    long calls = 4;
+    if (const char * value = std::getenv("LLAMA_MTP_TRACE_HOST_CALLS")) {
+        char * end = nullptr;
+        calls = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || calls < 1 || calls > 8) {
+            LOG_WRN("MTP host trace: LLAMA_MTP_TRACE_HOST_CALLS must be 1..8; disabled\n");
+            return nullptr;
+        }
+    }
+    if (call >= static_cast<size_t>(calls)) {
+        return nullptr;
+    }
+    auto * registry = ggml_backend_reg_by_name("HRX");
+    if (registry == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<common_mtp_host_trace_fn>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_hrx_set_mtp_host_trace_scope"));
+}
+
+struct common_mtp_eval_scope {
+    const char * phase;
+    size_t call;
+    const llama_batch & batch;
+    int32_t width;
+    const common_mtp_eval_scope * previous;
+    common_mtp_host_trace_fn host_trace;
+    bool host_trace_active;
+
+    common_mtp_eval_scope(const char * phase, size_t call, const llama_batch & batch, int32_t width) :
+        phase(phase), call(call), batch(batch), width(width), previous(mtp_active_eval),
+        host_trace(common_mtp_host_trace(call)), host_trace_active(host_trace != nullptr) {
+        mtp_active_eval = this;
+        if (host_trace == nullptr && previous != nullptr) {
+            host_trace = previous->host_trace;
+        }
+        if (host_trace != nullptr) {
+            host_trace(host_trace_active ? phase : nullptr, call);
+        }
+    }
+    ~common_mtp_eval_scope() {
+        if (host_trace != nullptr) {
+            host_trace(previous != nullptr && previous->host_trace_active ? previous->phase : nullptr,
+                       previous != nullptr ? previous->call : 0);
+        }
+        mtp_active_eval = previous;
+    }
+};
+
+// Installed only on an opt-in MTP context. Never request individual RMS/MoE internals:
+// ask=true partitions GGML execution and would remove consumers required by HRX fusions.
+struct common_mtp_snapshots {
+    struct deferred_tensor {
+        ggml_tensor * tensor;
+        bool overwritten = false;
+    };
+    std::string prefix;
+    std::set<std::string> names;
+    std::map<std::string, size_t> occurrences;
+    std::set<size_t> input_calls;
+    std::ofstream manifest;
+    size_t calls = 1;
+    size_t files = 0;
+    size_t bytes = 0;
+    bool failed = false;
+    size_t deferred_call = std::numeric_limits<size_t>::max();
+    std::vector<deferred_tensor> deferred;
+
+    explicit common_mtp_snapshots(const char * path) : prefix(path), manifest(prefix + ".tsv") {
+        if (!manifest) {
+            throw std::runtime_error("cannot open MTP snapshot manifest: " + prefix + ".tsv");
+        }
+        if (const char * value = std::getenv("LLAMA_MTP_SNAPSHOT_CALLS")) {
+            char * end = nullptr;
+            const long count = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || count < 1 || count > 8) {
+                throw std::runtime_error("LLAMA_MTP_SNAPSHOT_CALLS must be 1..8");
+            }
+            calls = static_cast<size_t>(count);
+        }
+        const std::set<std::string> allowed = {
+            "mtp_tok_embd", "mtp_hnorm", "mtp_enorm", "mtp_concat", "mtp_eh_proj",
+            "mtp_hc_attn_pre", "mtp_hc_attn_post", "mtp_hc_ffn_pre", "h_nextn",
+            "mtp_hc_head", "result_output",
+            "ffn_moe_weights_norm", "ffn_moe_weights_scaled", "ffn_moe_swiglu", "ffn_moe_out",
+            "ffn_swiglu", "ffn_shexp", "shared_expert_gate_sigmoid", "ffn_shexp_gated", "mtp_ffn_out",
+        };
+        const char * selection = std::getenv("LLAMA_MTP_SNAPSHOT_TENSORS");
+        std::istringstream list(selection ? selection :
+            "mtp_tok_embd,mtp_hnorm,mtp_enorm,mtp_concat,mtp_eh_proj");
+        for (std::string name; std::getline(list, name, ',');) {
+            if (allowed.count(name) == 0) {
+                throw std::runtime_error("unsupported MTP snapshot boundary: " + name);
+            }
+            names.insert(name);
+        }
+        if (names.empty()) {
+            throw std::runtime_error("LLAMA_MTP_SNAPSHOT_TENSORS must not be empty");
+        }
+        manifest << "key\tname\top\tbuffer\tne0\tne1\tne2\tne3\tfile\tcount\tnonfinite\tmin\tmax\tmean\trms\n";
+        LOG_WRN("MTP snapshots: draft-only prefix=%s first %zu driver decode calls; "
+                "bounded to 64 files/128 MiB, 16 MiB per tensor. Named boundaries change execution partitions.\n",
+                prefix.c_str(), calls);
+    }
+
+    static bool named(const char * actual, const char * name) {
+        const size_t n = std::strlen(name);
+        return std::strncmp(actual, name, n) == 0 &&
+               (actual[n] == '\0' || (actual[n] == '-' && actual[n + 1] >= '0' && actual[n + 1] <= '9'));
+    }
+
+    static const char * published_name(const ggml_tensor * t) {
+        // The router fusion includes the terminal reshape after DIV. Stopping at
+        // the named DIV itself would orphan that required consumer.
+        if (named(t->name, "ffn_moe_weights_norm")) {
+            return nullptr;
+        }
+        if (t->op == GGML_OP_RESHAPE && t->src[0] != nullptr &&
+            named(t->src[0]->name, "ffn_moe_weights_norm") &&
+            t->ne[0] == 1 && t->ne[1] == 10 && t->ne[3] == 1) {
+            return t->src[0]->name;
+        }
+        return t->name;
+    }
+
+    bool selected(const ggml_tensor * t) const {
+        if (failed || mtp_active_eval == nullptr || mtp_active_eval->call >= calls ||
+            files >= 64 || t->type != GGML_TYPE_F32 || ggml_is_empty(t)) {
+            return false;
+        }
+        const char * actual = published_name(t);
+        if (actual == nullptr) {
+            return false;
+        }
+        for (const auto & name : names) {
+            if (named(actual, name.c_str())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void save(const std::string & name, const char * op, const char * buffer,
+              const int64_t * ne, const std::vector<float> & values) {
+        const size_t size = values.size() * sizeof(float);
+        if (failed || files >= 64 || size > 16 * 1024 * 1024 || bytes + size > 128 * 1024 * 1024) {
+            return;
+        }
+        const auto & scope = *mtp_active_eval;
+        const std::string stem = std::string(scope.phase) + "." + std::to_string(scope.call) + "." + name;
+        const std::string key = stem + "." + std::to_string(occurrences[stem]++);
+        const std::string file = prefix + "." + key + ".f32";
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(values.data()), size);
+        out.close();
+        if (!out) {
+            LOG_ERR("MTP snapshots: cannot write %s; disabling capture\n", file.c_str());
+            failed = true;
+            return;
+        }
+        size_t nonfinite = 0;
+        double sum = 0.0, squares = 0.0;
+        float minimum = std::numeric_limits<float>::infinity();
+        float maximum = -minimum;
+        for (float value : values) {
+            if (!std::isfinite(value)) {
+                ++nonfinite;
+                continue;
+            }
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+            sum += value;
+            squares += static_cast<double>(value) * value;
+        }
+        const size_t finite = values.size() - nonfinite;
+        manifest << key << '\t' << name << '\t' << op << '\t' << buffer;
+        for (int i = 0; i < 4; ++i) { manifest << '\t' << ne[i]; }
+        manifest << '\t' << file << '\t' << values.size() << '\t' << nonfinite << '\t'
+                 << std::setprecision(10) << minimum << '\t' << maximum << '\t'
+                 << (finite ? sum / finite : 0.0) << '\t' << (finite ? std::sqrt(squares / finite) : 0.0) << '\n';
+        manifest.flush();
+        if (!manifest) {
+            LOG_ERR("MTP snapshots: manifest write failed; disabling capture\n");
+            failed = true;
+        }
+        LOG_INF("MTP snapshot %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64
+                "] buffer=%s nonfinite=%zu range=[%g,%g]\n",
+                key.c_str(), ne[0], ne[1], ne[2], ne[3], buffer, nonfinite, minimum, maximum);
+        ++files;
+        bytes += size;
+    }
+
+    void inputs() {
+        const auto & scope = *mtp_active_eval;
+        if (!input_calls.insert(scope.call).second || scope.batch.n_tokens <= 0 || scope.width <= 0) {
+            return;
+        }
+        const int64_t ne[4] = { scope.width, scope.batch.n_tokens, 1, 1 };
+        const size_t count = static_cast<size_t>(scope.width) * scope.batch.n_tokens;
+        if (scope.batch.embd && count <= 4 * 1024 * 1024) {
+            save("batch_hidden", "INPUT", "host", ne,
+                 std::vector<float>(scope.batch.embd, scope.batch.embd + count));
+        }
+        const int64_t ids_ne[4] = { scope.batch.n_tokens, 1, 1, 1 };
+        std::vector<float> ids(scope.batch.n_tokens);
+        if (scope.batch.token) {
+            std::copy_n(scope.batch.token, ids.size(), ids.begin());
+            save("batch_tokens", "INPUT", "host", ids_ne, ids);
+        }
+        if (scope.batch.pos) {
+            std::copy_n(scope.batch.pos, ids.size(), ids.begin());
+            save("batch_positions", "INPUT", "host", ids_ne, ids);
+        }
+    }
+
+    static bool eval(ggml_tensor * t, bool ask, void * data) {
+        auto & self = *static_cast<common_mtp_snapshots *>(data);
+        if (mtp_active_eval == nullptr || self.failed || mtp_active_eval->call >= self.calls) {
+            self.deferred.clear();
+            return !ask;
+        }
+        if (self.deferred_call != mtp_active_eval->call) {
+            self.deferred.clear();
+            self.deferred_call = mtp_active_eval->call;
+        }
+        if (ask) {
+            // A routed SwiGLU stop would hide its down consumer from the gate/up
+            // matcher. Defer until the complete down+weight+fold boundary, and
+            // never read it if GGML recycled its bytes into a later output.
+            if (t->op != GGML_OP_NONE && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE &&
+                t->op != GGML_OP_PERMUTE && t->op != GGML_OP_TRANSPOSE) {
+                for (auto & pending : self.deferred) {
+                    if (t == pending.tensor || t->buffer != pending.tensor->buffer) {
+                        continue;
+                    }
+                    const uintptr_t a = reinterpret_cast<uintptr_t>(t->data);
+                    const uintptr_t b = reinterpret_cast<uintptr_t>(pending.tensor->data);
+                    if (a == 0 || b == 0 ||
+                        (a <= b ? b - a < ggml_nbytes(t) : a - b < ggml_nbytes(pending.tensor))) {
+                        pending.overwritten = true;
+                    }
+                }
+            }
+            if (self.selected(t) && named(t->name, "ffn_moe_swiglu")) {
+                self.deferred.push_back({ t, false });
+                return false;
+            }
+            if (!self.deferred.empty() &&
+                (named(t->name, "ffn_moe_out") || named(t->name, "mtp_ffn_out"))) {
+                return true;
+            }
+            return self.selected(t);
+        }
+        for (const auto & pending : self.deferred) {
+            if (pending.overwritten) {
+                LOG_WRN("MTP snapshots: skipping deferred %s: later GGML output overlaps its bytes; "
+                        "use the focused Q4 expert fixture for an unrecycled SwiGLU result\n", pending.tensor->name);
+            } else if (!self.dump(pending.tensor)) {
+                self.deferred.clear();
+                return false;
+            }
+        }
+        self.deferred.clear();
+        if (!self.selected(t)) {
+            return true;
+        }
+        return self.dump(t);
+    }
+
+    bool dump(ggml_tensor * t) {
+        auto & self = *this;
+        self.inputs();
+        const size_t size = ggml_nbytes(t);
+        if (size > 16 * 1024 * 1024 || ggml_nelements(t) > 4 * 1024 * 1024) {
+            LOG_WRN("MTP snapshots: skipping oversized tensor %s (%zu bytes)\n", t->name, size);
+            return true;
+        }
+        std::vector<uint8_t> raw(size);
+        ggml_backend_tensor_get(t, raw.data(), 0, size);
+        std::vector<float> values;
+        values.reserve(ggml_nelements(t));
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+        for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+            const size_t offset = i3 * t->nb[3] + i2 * t->nb[2] + i1 * t->nb[1] + i0 * t->nb[0];
+            if (offset > size || size - offset < sizeof(float)) {
+                LOG_ERR("MTP snapshots: invalid span for %s; disabling capture\n", t->name);
+                self.failed = true;
+                return true;
+            }
+            float value;
+            std::memcpy(&value, raw.data() + offset, sizeof(value));
+            values.push_back(value);
+        }
+        const char * selected_name = published_name(t);
+        std::string name(selected_name != nullptr ? selected_name : t->name);
+        for (char & c : name) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '-')) { c = '_'; }
+        }
+        self.save(name, ggml_op_name(t->op), t->buffer ? ggml_backend_buffer_name(t->buffer) : "alias",
+                  t->ne, values);
+        return true;
+    }
+};
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -1323,6 +1646,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+    size_t snapshot_call = 0;
 
     llama_batch batch;
 
@@ -1414,7 +1738,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        char arch[64] = {0};
+        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         if (chain_heads) {
@@ -1555,6 +1881,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const common_mtp_eval_scope snapshot_scope("prefill", snapshot_call++, batch, n_embd);
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
@@ -1644,6 +1971,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const common_mtp_eval_scope snapshot_scope("draft", snapshot_call++, batch, n_embd);
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -2509,6 +2837,7 @@ struct common_speculative_init_result::impl {
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
     llama_model_ptr   model;
+    std::unique_ptr<common_mtp_snapshots> snapshots;
     llama_context_ptr context;
 };
 
@@ -2527,6 +2856,15 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        const char * prefix = std::getenv("LLAMA_MTP_SNAPSHOT_PREFIX");
+        if (prefix != nullptr && prefix[0] != '\0') {
+            if (cparams.cb_eval != nullptr) {
+                throw std::runtime_error("MTP snapshots cannot be combined with another eval callback");
+            }
+            pimpl->snapshots = std::make_unique<common_mtp_snapshots>(prefix);
+            cparams.cb_eval = common_mtp_snapshots::eval;
+            cparams.cb_eval_user_data = pimpl->snapshots.get();
+        }
     }
 
     // the draft context holds as many tokens per sequence as the target context

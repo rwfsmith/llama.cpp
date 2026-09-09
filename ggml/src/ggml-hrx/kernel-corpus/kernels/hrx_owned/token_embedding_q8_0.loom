@@ -1,0 +1,62 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Raw Q8_0 rows: f16 scale followed by 32 signed bytes, with no repacking.
+// Host ID validation is required before every launch; device guards also prevent OOB.
+
+amdgpu.target<gfx11-generic> @ggml_token_embedding_q8_wave32 {subgroup_size = 32}
+
+kernel.def target(@ggml_token_embedding_q8_wave32) export("ggml_token_embedding_q8_0_f32") @ggml_token_embedding_q8_0_f32(%hidden_size: index, %vocabulary_count: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%token_count, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%hidden_size: index, %vocabulary_count: index, %token_count: index, %weight: buffer, %ids: buffer, %output: buffer) {
+  %width = index.assume %hidden_size [range(%hidden_size, 32, 32768), mul(%hidden_size, 32)] : index
+  %vocabulary = index.assume %vocabulary_count [range(%vocabulary_count, 1, 262144)] : index
+  %tokens = index.assume %token_count [range(%token_count, 1, 2048)] : index
+  %token0 = kernel.workgroup.id<x> : index
+  %token = index.assume %token0 [lt(%token0, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %c32 = index.constant 32 : index
+  %threads = index.constant 256 : index
+  %zero_offset = index.constant 0 : offset
+  %block_bytes = index.constant 34 : offset
+  %code_offset = index.constant 2 : offset
+  %iv = buffer.view %ids[%zero_offset] : buffer -> view<[%tokens]xi32>
+  %id32 = view.load %iv[%token] : view<[%tokens]xi32> -> i32
+  %zero32 = scalar.constant 0 : i32
+  %limit32 = index.cast %vocabulary : index to i32
+  %nonnegative = scalar.cmpi sge, %id32, %zero32 : i32
+  %below_limit = scalar.cmpi slt, %id32, %limit32 : i32
+  %valid = scalar.andi %nonnegative, %below_limit : i1
+  scf.if %valid {
+    %id0 = index.cast %id32 : i32 to index
+    %id = index.assume %id0 [range(%id0, 0, 262143), lt(%id0, %vocabulary)] : index
+    %blocks = index.div %width, %c32 : index
+    %row_block = index.mul %id, %blocks : index
+    %extent = index.mul %tokens, %width : index
+    %row_output = index.mul %token, %width : index
+    %ov = buffer.view %output[%zero_offset] : buffer -> view<[%extent]xf32>
+    scf.for %column0 = [%lane to %width step %threads] {
+      %column = index.assume %column0 [lt(%column0, %width)] : index
+      %block = index.div %column, %c32 : index
+      %code = index.rem %column, %c32 : index
+      %flat_block0 = index.add %row_block, %block : index
+      // Paired matcher caps the complete raw weight span to UINT32_MAX.
+      %flat_block = index.assume %flat_block0 [range(%flat_block0, 0, 126322566)] : index
+      %block_base = index.scale %flat_block, %block_bytes : index, offset -> offset
+      %code_base = index.add %block_base, %code_offset : offset
+      %sv = buffer.view %weight[%block_base] : buffer -> view<1xf16>
+      %qv = buffer.view %weight[%code_base] : buffer -> view<32xi8>
+      %scale16 = view.load %sv[0] : view<1xf16> -> f16
+      %scale = scalar.extf %scale16 : f16 to f32
+      %quant = view.load %qv[%code] : view<32xi8> -> i8
+      %quant32 = scalar.extsi %quant : i8 to i32
+      %qfloat = scalar.sitofp %quant32 : i32 to f32
+      %value = scalar.mulf %scale, %qfloat : f32
+      %position = index.add %row_output, %column : index
+      view.store %value, %ov[%position] : f32, view<[%extent]xf32>
+    }
+  }
+  kernel.return
+}

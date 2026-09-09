@@ -662,7 +662,6 @@ int llama_quantize(int argc, char ** argv) {
         printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0);
     }
 
-    llama_backend_free();
 
     return 0;
 }

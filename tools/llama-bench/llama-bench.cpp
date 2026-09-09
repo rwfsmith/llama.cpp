@@ -2537,7 +2537,6 @@ int llama_bench(int argc, char ** argv) {
         p_err->print_footer();
     }
 
-    llama_backend_free();
 
     return 0;
 }

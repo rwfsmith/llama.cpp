@@ -6,6 +6,8 @@
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -18,6 +20,18 @@ static constexpr KernelCatalogRef kLlmDenseLinearQ6KF16WmmaKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_dense_linear_q6k_f16_wmma");
 static constexpr KernelCatalogRef kLlmDenseLinearQ8_0F16WmmaKernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_dense_linear_q8_0_f16_wmma");
+static constexpr KernelCatalogRef kLlmDenseQ4KF32AccumKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q4k_f32_accum");
+static constexpr KernelCatalogRef kLlmDenseQ6KF32AccumKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q6k_f32_accum");
+static constexpr KernelCatalogRef kLlmDenseQ8_0F32AccumKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q8_0_f32_accum");
+static constexpr KernelCatalogRef kLlmDenseQ8_0GemvKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q8_0_gemv_f32");
+static constexpr KernelCatalogRef kLlmQ8NarrowPackKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_pack");
+static constexpr KernelCatalogRef kLlmQ8NarrowDotKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_dot");
 
 static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
@@ -33,6 +47,26 @@ static bool is_supported_dense_input_size(int64_t input_size) {
 
 static bool is_supported_dense_output_size(int64_t output_size) {
     return output_size >= 1 && output_size <= 262144;
+}
+
+static bool dense_f32_accum_enabled() {
+    const char * flag = std::getenv("HRX_ENABLE_DENSE_F32_ACCUM");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+static KernelCatalogRef dense_accumulation_kernel(KernelCatalogRef kernel) {
+    if (dense_f32_accum_enabled()) {
+        if (kernel.id == kLlmDenseLinearQ4KF16WmmaKernel.id) {
+            return kLlmDenseQ4KF32AccumKernel;
+        }
+        if (kernel.id == kLlmDenseLinearQ6KF16WmmaKernel.id) {
+            return kLlmDenseQ6KF32AccumKernel;
+        }
+        if (kernel.id == kLlmDenseLinearQ8_0F16WmmaKernel.id) {
+            return kLlmDenseQ8_0F32AccumKernel;
+        }
+    }
+    return kernel;
 }
 
 enum class LlmDenseMatmulRoute {
@@ -90,7 +124,11 @@ static LlmDenseMatmulMatch match_llm_dense_matmul(const Graph &       graph,
     } else if (route == LlmDenseMatmulRoute::Q6K && weight->type == GGML_TYPE_Q6_K) {
         match.kernel = kLlmDenseLinearQ6KF16WmmaKernel;
     } else if (route == LlmDenseMatmulRoute::Q8_0 && weight->type == GGML_TYPE_Q8_0) {
-        match.kernel = kLlmDenseLinearQ8_0F16WmmaKernel;
+        const char * enable_gemv = std::getenv("HRX_ENABLE_Q8_GEMV");
+        // Explicit F32 WMMA selection takes precedence over the independent raw-F32 GEMV experiment.
+        match.kernel = !dense_f32_accum_enabled() && token_count == 1 && weight->byte_count <= UINT32_MAX &&
+                               enable_gemv != nullptr && std::strcmp(enable_gemv, "1") == 0 ?
+                           kLlmDenseQ8_0GemvKernel : kLlmDenseLinearQ8_0F16WmmaKernel;
     } else {
         return {};
     }
@@ -110,14 +148,22 @@ static void build_llm_dense_matmul_dispatch(const LlmDenseMatmulMatch & match,
                                             DispatchMatch &             dispatch_match,
                                             size_t                      root_index) {
     Dispatch dispatch;
-    dispatch.kernel = make_kernel_specialization(match.kernel);
-    dispatch.kernel.integer_parameters.emplace("token_count", match.token_count);
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity", to_config_value(match.token_count));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.input_size",
-                                               to_config_value(match.input_size));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.output_size",
-                                               to_config_value(match.output_size));
-    dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.output_accumulation", "0");
+    const KernelCatalogRef kernel = dense_accumulation_kernel(match.kernel);
+    dispatch.kernel = make_kernel_specialization(kernel);
+    if (match.kernel.id == kLlmDenseQ8_0GemvKernel.id) {
+        dispatch.kernel.integer_parameters.emplace("input_size", match.input_size);
+        dispatch.kernel.integer_parameters.emplace("output_size", match.output_size);
+    } else {
+        dispatch.kernel.integer_parameters.emplace("token_count", match.token_count);
+        dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity", to_config_value(match.token_count));
+        dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.input_size",
+                                                   to_config_value(match.input_size));
+        dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.output_size",
+                                                   to_config_value(match.output_size));
+        if (kernel.id == match.kernel.id) {
+            dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.output_accumulation", "0");
+        }
+    }
     dispatch.bindings.push_back({ match.input->id, 0, match.input->byte_count });
     dispatch.bindings.push_back({ match.weight->id, 0, match.weight->byte_count });
     dispatch.bindings.push_back({ match.output->id, 0, match.output->byte_count });
@@ -156,7 +202,82 @@ static bool match_llm_dense_q8_0_dispatch(const DispatchMatchContext & context, 
     return true;
 }
 
+static bool match_llm_mtp_hc_projection_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * weight = graph_value(context.graph, node->inputs[0]);
+    const Value * input = graph_value(context.graph, node->inputs[1]);
+    const Value * output = graph_value(context.graph, node->output);
+    if (weight == nullptr || input == nullptr || output == nullptr ||
+        !llm_mtp_hc_projection_supported(*weight, *input, *output) ||
+        !weight->contiguous || !input->contiguous || !output->contiguous ||
+        weight->byte_count != weight->nb[3] || input->byte_count != input->nb[3] ||
+        output->byte_count != output->nb[3]) {
+        return false;
+    }
+    // No tensor rewrite or repack: [K,4,T] has the same bytes as [K,4*T].
+    const LlmDenseMatmulMatch dense = {
+        input, weight, output, kLlmDenseLinearQ4KF16WmmaKernel, weight->ne[0], weight->ne[1],
+        input->ne[1] * input->ne[2],
+    };
+    build_llm_dense_matmul_dispatch(dense, match, context.root_index);
+    return true;
+}
+
+static bool match_llm_q8_narrow_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * weight = graph_value(context.graph, node->inputs[0]);
+    const Value * input = graph_value(context.graph, node->inputs[1]);
+    const Value * output = graph_value(context.graph, node->output);
+    if (weight == nullptr || input == nullptr || output == nullptr ||
+        !llm_q8_narrow_supported(*weight, *input, *output) ||
+        !weight->contiguous || !input->contiguous || !output->contiguous ||
+        weight->byte_count != weight->nb[2] || input->byte_count != input->nb[2] ||
+        output->byte_count != output->nb[2]) {
+        return false;
+    }
+
+    const ValueId packed = context.next_plan_value;
+    const size_t packed_bytes = ggml_row_size(GGML_TYPE_Q8_0, input->ne[0]);
+    Dispatch pack;
+    pack.kernel = make_kernel_specialization(kLlmQ8NarrowPackKernel);
+    pack.kernel.integer_parameters.emplace("input_size", input->ne[0]);
+    pack.bindings = { { input->id, 0, input->byte_count }, { packed, 0, packed_bytes } };
+    Dispatch dot;
+    dot.kernel = make_kernel_specialization(kLlmQ8NarrowDotKernel);
+    dot.kernel.integer_parameters.emplace("input_size", input->ne[0]);
+    dot.kernel.integer_parameters.emplace("output_size", output->ne[0]);
+    dot.bindings = { { packed, 0, packed_bytes }, { weight->id, 0, weight->byte_count },
+                     { output->id, 0, output->byte_count } };
+    match.transients.push_back({ packed, "llm.q8_narrow.activation", packed_bytes, 256 });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(pack));
+    match.dispatches.push_back(std::move(dot));
+    return true;
+}
+
 void register_llm_matmul_dispatches(DispatchRegistryBuilder & registry) {
+    registry.add({
+        "llm.matmul.mtp_hc_projection",
+        GGML_OP_MUL_MAT,
+        DispatchMatchKind::SingleOp,
+        110,
+        DispatchSource::Llm,
+        match_llm_mtp_hc_projection_dispatch,
+    });
+    registry.add({
+        "llm.matmul.q8_narrow",
+        GGML_OP_MUL_MAT,
+        DispatchMatchKind::SingleOp,
+        110,
+        DispatchSource::Llm,
+        match_llm_q8_narrow_dispatch,
+    });
     registry.add({
         "llm.matmul.dense_q4k_f16_wmma",
         GGML_OP_MUL_MAT,

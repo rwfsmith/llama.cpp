@@ -29,7 +29,7 @@ CommandProgramBindings CommandProgramBindings::from_value_map(const ValueMap & v
             continue;
         }
         bindings.push_back({ value->id, buffer->buffer, buffer->offset, buffer->length, buffer->identity,
-                             buffer->generation, buffer->capacity, buffer->host_data, buffer->weight });
+                             buffer->generation, buffer->capacity, buffer->host_data, buffer->weight, value->tensor });
     }
     return from_bindings(std::move(bindings), result.status);
 }

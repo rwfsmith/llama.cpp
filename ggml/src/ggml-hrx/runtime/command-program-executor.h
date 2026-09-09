@@ -76,11 +76,34 @@ struct PreparedCommandProgram {
     std::vector<HostStagingBuffer>             host_staging;
     std::vector<HostWeightLease>               resident_host_weights;
     std::vector<PreparedProgramConstantBuffer> program_constants;
+    // Refreshed from live graph bindings on every diagnostic execution, not owned by the cache.
+    struct HostTraceTensor {
+        int32_t value;
+        const ggml_tensor * tensor;
+    };
+    std::vector<HostTraceTensor> host_trace_tensors;
     Status                                     status;
     uint64_t                                   bound_transient_arena_allocation_id = kInvalidTransientArenaAllocationId;
+    bool                                       graph_bindings_dirty = false;
 
     bool valid() const { return status.success(); }
 };
+
+void set_mtp_host_trace_scope(const char * phase, uint64_t call);
+
+struct HostStagingSlice {
+    int32_t value;
+    uintptr_t address;
+    size_t length;
+};
+
+struct HostStagingGroup {
+    uintptr_t base;
+    size_t length;
+    std::vector<HostStagingSlice> slices;
+};
+
+Status plan_host_staging_groups(std::vector<HostStagingSlice> slices, std::vector<HostStagingGroup> & groups);
 
 struct RecordedCommandGraph {
     hrx_graph_t      graph                               = nullptr;

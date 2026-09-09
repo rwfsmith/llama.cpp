@@ -531,6 +531,10 @@ static RouterProjectionMatch match_moe_router_projection_f32(const DispatchMatch
 
 }  // namespace
 
+bool is_moe_router_top8_kernel(uint64_t kernel_id) {
+    return kernel_id == kQwenRouterTop8F32Kernel.id;
+}
+
 static bool match_moe_router_projection_f32_dispatch(const DispatchMatchContext & context,
                                                      DispatchMatch &              dispatch_match) {
     const RouterProjectionMatch match = match_moe_router_projection_f32(context);

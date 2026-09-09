@@ -508,6 +508,11 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    if (n_keep_tail > 0 && n_ubatch <= n_keep_tail) {
+        LLAMA_LOG_ERROR("%s: n_ubatch=%u must exceed n_keep_tail=%u for recurrent rollback; increase --ubatch-size\n",
+                        __func__, n_ubatch, n_keep_tail);
+        return {};
+    }
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -606,8 +611,6 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
     //   of each seq are never split across ubatches
     if (n_keep_tail > 0) {
-        GGML_ASSERT(n_ubatch > n_keep_tail);
-
         auto n_remaining = [&](uint32_t s) {
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
         };

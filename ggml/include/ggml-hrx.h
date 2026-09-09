@@ -21,6 +21,11 @@ GGML_BACKEND_API bool                       ggml_backend_hrx_get_cache_stats(ggm
                                                                              struct ggml_backend_hrx_cache_stats * stats);
 GGML_BACKEND_API ggml_backend_reg_t         ggml_backend_hrx_reg(void);
 
+// Release registry resources on a normal application thread, before unloading the backend or exiting.
+// Returns false without releasing resources if any HRX backend or buffer is still live.
+// Idempotent; device/buffer-type handles remain valid and subsequent allocation or init reopens the runtime.
+GGML_BACKEND_API bool ggml_backend_hrx_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

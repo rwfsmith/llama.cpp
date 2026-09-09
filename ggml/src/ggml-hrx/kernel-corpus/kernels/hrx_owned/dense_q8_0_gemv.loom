@@ -1,0 +1,203 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Raw GGUF Q8_0: one f16 scale and 32 signed bytes per 34-byte block.
+// Four wave32 rows per workgroup; each lane contracts four adjacent F32 inputs.
+// No activation quantization, FP16 products, WMMA tile, or LDS staging.
+
+amdgpu.target<gfx11-generic> @ggml_dense_q8_0_gemv_wave32 {subgroup_size = 32}
+
+kernel.def target(@ggml_dense_q8_0_gemv_wave32) export("ggml_dense_q8_0_gemv_f32") @ggml_dense_q8_0_gemv_f32(
+    %input_size: index, %output_size: index) {
+  %one = index.constant 1 : index
+  %three = index.constant 3 : index
+  %four = index.constant 4 : index
+  %threads = index.constant 128 : index
+  %rounded = index.add %output_size, %three : index
+  %groups = index.div %rounded, %four : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.assume %input_size [range(%input_size, 256, 32768), mul(%input_size, 256)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %tile = kernel.workgroup.id<x> : index
+  %wave0 = kernel.subgroup.id : index
+  %wave = index.assume %wave0 [range(%wave0, 0, 3)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %zero_offset = index.constant 0 : offset
+  %block_bytes = index.constant 34 : offset
+  %code_offset = index.constant 2 : offset
+  %row_base = index.mul %tile, %c4 : index
+  %row = index.add %row_base, %wave : index
+  %valid = index.cmp ult, %row, %outputs : index
+  %blocks = index.div %width, %c32 : index
+  %packets = index.div %width, %c4 : index
+  %input_noalias, %weight_noalias, %output_noalias = buffer.assume.noalias %input, %weight, %output : buffer, buffer, buffer
+  %input_view = buffer.view %input_noalias[%zero_offset] : buffer -> view<[%packets]x4xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%outputs]xf32>
+  %zero = scalar.constant 0.0 : f32
+  %zero_vector = vector.constant 0.0 : vector<4xf32>
+  %sign_mask = vector.constant -2139062144 : vector<1xi32>
+  %bias = vector.constant 128.0 : vector<4xf32>
+  %lane_sum = scf.if %valid -> (f32) {
+    %safe_row = index.assume %row [lt(%row, %outputs)] : index
+    %row_block = index.mul %safe_row, %blocks : index
+    %accumulated = scf.for %packet0 = [%lane to %packets step %c32](%acc = %zero_vector : vector<4xf32>) -> (vector<4xf32>) {
+      %packet = index.assume %packet0 [lt(%packet0, %packets)] : index
+      %block = index.div %packet, %c8 : index
+      %word = index.rem %packet, %c8 : index
+      %flat_block0 = index.add %row_block, %block : index
+      // The dispatch limits the raw weight span to UINT32_MAX bytes.
+      %flat_block = index.assume %flat_block0 [range(%flat_block0, 0, 126322566)] : index
+      %block_byte_base = index.scale %flat_block, %block_bytes : index, offset -> offset
+      %code_byte_base = index.add %block_byte_base, %code_offset : offset
+      %scale_view = buffer.view %weight_noalias[%block_byte_base] : buffer -> view<1xf16>
+      %code_view = buffer.view %weight_noalias[%code_byte_base] : buffer -> view<8xi32>
+      %half_scale = view.load %scale_view[0] : view<1xf16> -> f16
+      %scale = scalar.extf %half_scale : f16 to f32
+      // Q8 code words are only two-byte aligned on alternating blocks.
+      %packed = vector.load %code_view[%word] : view<8xi32> -> vector<1xi32>
+      %flipped = vector.xori %packed, %sign_mask : vector<1xi32>
+      %bytes = vector.bitcast %flipped : vector<1xi32> to vector<4xi8>
+      %unsigned = vector.uitofp %bytes : vector<4xi8> to vector<4xf32>
+      %signed = vector.subf %unsigned, %bias : vector<4xf32>
+      %scales = vector.splat %scale : vector<4xf32>
+      %weights = vector.mulf %signed, %scales : vector<4xf32>
+      %inputs = vector.load %input_view[%packet, %c0] : view<[%packets]x4xf32> -> vector<4xf32>
+      %products = vector.mulf %weights, %inputs : vector<4xf32>
+      %next = vector.addf %acc, %products : vector<4xf32>
+      scf.yield %next : vector<4xf32>
+    }
+    %sum = vector.reduce<addf> %accumulated, %zero : vector<4xf32>, f32
+    scf.yield %sum : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %lane_sum : f32
+  %leader = index.cmp eq, %lane, %c0 : index
+  %writer = scalar.andi %valid, %leader : i1
+  scf.if %writer {
+    %safe_row = index.assume %row [lt(%row, %outputs)] : index
+    view.store %sum, %output_view[%safe_row] : f32, view<[%outputs]xf32>
+  }
+  kernel.return
+}
+
+// Test-only scale initialization preserves the nonuniform signed code bytes.
+kernel.def target(@ggml_dense_q8_0_gemv_wave32) @ggml_dense_q8_0_test_scales(%input_size: index, %output_size: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%output_size, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %weight: buffer) {
+  %width = index.assume %input_size [range(%input_size, 256, 32768), mul(%input_size, 256)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 65)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %outputs)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %c1 = index.constant 1 : index
+  %c7 = index.constant 7 : index
+  %c32 = index.constant 32 : index
+  %block_bytes = index.constant 34 : offset
+  %blocks = index.div %width, %c32 : index
+  %row_block = index.mul %row, %blocks : index
+  %unit = scalar.constant 0.00390625 : f32
+  scf.for %block = [%lane to %blocks step %c32] {
+    %flat_block = index.add %row_block, %block : index
+    %byte_base = index.scale %flat_block, %block_bytes : index, offset -> offset
+    %scale_view = buffer.view %weight[%byte_base] : buffer -> view<1xf16>
+    %pattern = index.add %row, %block : index
+    %mod = index.rem %pattern, %c7 : index
+    %scale_index = index.add %mod, %c1 : index
+    %scale_i32 = index.cast %scale_index : index to i32
+    %scale_f32 = scalar.sitofp %scale_i32 : i32 to f32
+    %scaled = scalar.mulf %scale_f32, %unit : f32
+    %half = scalar.fptrunc %scaled : f32 to f16
+    view.store %half, %scale_view[0] : f16, view<1xf16>
+  }
+  kernel.return
+}
+
+// Independent serial oracle: scalar signed-byte decode, no packed-word helper.
+kernel.def target(@ggml_dense_q8_0_gemv_wave32) @ggml_dense_q8_0_test_reference(%input_size: index, %output_size: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%output_size, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.assume %input_size [range(%input_size, 256, 32768), mul(%input_size, 256)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 65)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %outputs)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %zero_offset = index.constant 0 : offset
+  %block_bytes = index.constant 34 : offset
+  %code_offset = index.constant 2 : offset
+  %blocks = index.div %width, %c32 : index
+  %row_block = index.mul %row, %blocks : index
+  %input_view = buffer.view %input[%zero_offset] : buffer -> view<[%width]xf32>
+  %output_view = buffer.view %output[%zero_offset] : buffer -> view<[%outputs]xf32>
+  %leader = index.cmp eq, %lane, %c0 : index
+  scf.if %leader {
+    %zero = scalar.constant 0.0 : f32
+    %sum = scf.for %column0 = [%c0 to %width step %c1](%acc = %zero : f32) -> (f32) {
+      %column = index.assume %column0 [lt(%column0, %width)] : index
+      %block = index.div %column, %c32 : index
+      %code = index.rem %column, %c32 : index
+      %flat_block = index.add %row_block, %block : index
+      %byte_base = index.scale %flat_block, %block_bytes : index, offset -> offset
+      %code_base = index.add %byte_base, %code_offset : offset
+      %scale_view = buffer.view %weight[%byte_base] : buffer -> view<1xf16>
+      %code_view = buffer.view %weight[%code_base] : buffer -> view<32xi8>
+      %half = view.load %scale_view[0] : view<1xf16> -> f16
+      %scale = scalar.extf %half : f16 to f32
+      %byte = view.load %code_view[%code] : view<32xi8> -> i8
+      %quant = scalar.sitofp %byte : i8 to f32
+      %decoded = scalar.mulf %quant, %scale : f32
+      %x = view.load %input_view[%column] : view<[%width]xf32> -> f32
+      %product = scalar.mulf %decoded, %x : f32
+      %next = scalar.addf %acc, %product : f32
+      scf.yield %next : f32
+    }
+    view.store %sum, %output_view[%row] : f32, view<[%outputs]xf32>
+  }
+  kernel.return
+}
+
+check.case public @ggml_dense_q8_0_gemv_differential_case {
+  %width = check.param.choice values([256, 2560, 32768]) name("input_size") : index
+  %outputs = check.param.choice values([1, 3, 4, 5, 65]) name("output_size") : index
+  %c32 = index.constant 32 : index
+  %blocks = index.div %width, %c32 : index
+  %input = check.generate.iota offset(-0.03125) step(0.0001220703125) period(509) : tensor<[%width]xf32>
+  %weight = check.generate.iota offset(-128) step(1) period(256) : tensor<[%outputs]x[%blocks]x34xi8>
+  %output = check.generate.fill value(123.0) : tensor<[%outputs]xf32>
+  %expected = check.generate.fill value(0.0) : tensor<[%outputs]xf32>
+  kernel.launch @ggml_dense_q8_0_test_scales[%width, %outputs](%width, %outputs, %weight) : [index, index](index, index, tensor<[%outputs]x[%blocks]x34xi8>)
+  kernel.launch @ggml_dense_q8_0_test_reference[%width, %outputs](%width, %outputs, %input, %weight, %expected) : [index, index](index, index, tensor<[%width]xf32>, tensor<[%outputs]x[%blocks]x34xi8>, tensor<[%outputs]xf32>)
+  kernel.launch @ggml_dense_q8_0_gemv_f32[%width, %outputs](%width, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<[%width]xf32>, tensor<[%outputs]x[%blocks]x34xi8>, tensor<[%outputs]xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0005) rtol(0.00001) nan(same) : tensor<[%outputs]xf32>
+  check.return
+}
+
+check.case public @ggml_dense_q8_0_gemv_benchmark_case {
+  %width = check.literal value(2560) : index
+  %outputs = check.param.choice values([512, 2560, 9728, 248320]) name("output_size") : index
+  %input = check.generate.iota offset(-0.25) step(0.001) period(509) : tensor<2560xf32>
+  // 0x2424 is a finite nonzero half scale, and each code is +36.
+  %weight = check.generate.fill value(36) : tensor<[%outputs]x80x34xi8>
+  %output = check.generate.fill value(0.0) : tensor<[%outputs]xf32>
+  %expected = check.generate.fill value(3.805169677734375) : tensor<[%outputs]xf32>
+  kernel.launch @ggml_dense_q8_0_gemv_f32[%width, %outputs](%width, %outputs, %input, %weight, %output) : [index, index](index, index, tensor<2560xf32>, tensor<[%outputs]x80x34xi8>, tensor<[%outputs]xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0001) rtol(0.00001) nan(same) : tensor<[%outputs]xf32>
+  check.return
+}
+
+check.benchmark<@ggml_dense_q8_0_gemv_benchmark_case> @ggml_dense_q8_0_gemv_2560x512 {output_size = 512}
+check.benchmark<@ggml_dense_q8_0_gemv_benchmark_case> @ggml_dense_q8_0_gemv_2560x2560 {output_size = 2560}
+check.benchmark<@ggml_dense_q8_0_gemv_benchmark_case> @ggml_dense_q8_0_gemv_2560x9728 {output_size = 9728}
+check.benchmark<@ggml_dense_q8_0_gemv_benchmark_case> @ggml_dense_q8_0_gemv_2560x248320 {output_size = 248320}

@@ -38,9 +38,7 @@ static bool hrx_prepared_fast_path_disabled() {
     return disabled;
 }
 
-// Companion to the HRX_TIME_COMPUTE accounting in graph_compute(): that shows submission dominates GPU
-// occupancy, this attributes the submission cost to the four phases it is actually made of, so the
-// expensive one can be identified instead of guessed at.
+// Attribute executor wall time to its four phases. Execution includes host-staging transfers and synchronization.
 static bool hrx_time_compute_enabled() {
     static const bool enabled = hrx_environment_flag("HRX_TIME_COMPUTE");
     return enabled;
@@ -88,6 +86,7 @@ CommandProgramBindings GraphExecutor::bind_external_value_buffers(const GraphPro
         ValueBufferBinding    value_binding;
         CommandProgramBinding binding;
         binding.value = external.value;
+        binding.tensor = external.tensor;
         if (ggml_backend_hrx_resolve_value_buffer(external.tensor, value_binding)) {
             binding.buffer     = value_binding.buffer;
             binding.host_data  = value_binding.host_data;

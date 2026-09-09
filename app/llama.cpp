@@ -139,7 +139,9 @@ int main(int argc, char ** argv) {
 #else
             setenv("LLAMA_APP_CMD", cmd.name, 1);
 #endif
-            return cmd.func(argc - 1, argv + 1);
+            const int result = cmd.func(argc - 1, argv + 1);
+            llama_backend_free();
+            return result;
         }
     }
 

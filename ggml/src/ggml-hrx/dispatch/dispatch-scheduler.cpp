@@ -1,12 +1,16 @@
 #include "dispatch-scheduler.h"
 
+#include "backend-buffer-binding.h"
 #include "ggml.h"
 #include "graph/graph-traversal.h"
+#include "kernel-corpus/kernel-corpus.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -118,6 +122,128 @@ static bool match_binds_value_produced_after_root(const Graph &         graph,
         return false;
     };
     return scan(match.initialization_dispatches) || scan(match.dispatches);
+}
+
+struct FusionStorageSpan {
+    hrx_buffer_t buffer = nullptr;
+    size_t begin = 0;
+    size_t end = 0;
+};
+
+static bool fusion_resident_span(const Graph & graph, ValueId id, size_t offset, size_t length,
+                                FusionStorageSpan & span) {
+    const Value * value = graph.values().find(id);
+    ValueBufferBinding binding;
+    if (value == nullptr || value->tensor == nullptr || value->tensor->data == nullptr || length == 0 ||
+        !ggml_backend_hrx_resolve_value_buffer(value->tensor, binding) ||
+        binding.buffer == nullptr || binding.host_data != nullptr ||
+        offset > binding.length || length > binding.length - offset ||
+        binding.offset > std::numeric_limits<size_t>::max() - offset) {
+        return false;
+    }
+    const size_t begin = binding.offset + offset;
+    if (length > std::numeric_limits<size_t>::max() - begin) {
+        return false;
+    }
+    // Same resident-buffer resolution as command-program-resolver: no host staging
+    // or logical ValueStorageId is substituted for the actual buffer and offset.
+    span = { binding.buffer, begin, begin + length };
+    return true;
+}
+
+static const char * fusion_tensor_name(const Graph & graph, ValueId value) {
+    const Value * found = graph.values().find(value);
+    return found != nullptr && found->tensor != nullptr ? found->tensor->name : "<synthetic>";
+}
+
+static void trace_fusion_storage(const Graph & graph, const DispatchTarget & target,
+                                 const DispatchMatch & match, size_t root_index,
+                                 const std::vector<bool> & covered_nodes,
+                                 const DispatchMatchDiagnostics & diagnostics) {
+    const char * enabled = std::getenv("HRX_TRACE_FUSION_STORAGE");
+    static std::atomic<unsigned> reports{0};
+    constexpr unsigned limit = 64;
+    if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0' ||
+        reports.load(std::memory_order_relaxed) >= limit) {
+        return;
+    }
+    const char * rule = "<unknown>";
+    for (const auto & attempt : diagnostics.attempts) {
+        if (attempt.matched) {
+            rule = attempt.name.c_str();
+            break;
+        }
+    }
+    const auto covered = [&](size_t index) {
+        return covered_nodes[index] ||
+               std::find(match.covered_nodes.begin(), match.covered_nodes.end(), index) != match.covered_nodes.end();
+    };
+    const auto scan = [&](const std::vector<Dispatch> & dispatches) {
+        for (const Dispatch & dispatch : dispatches) {
+            const auto kernel = resolve_kernel_definition(get_qwen_kernel_corpus(), target.architecture,
+                                                          dispatch.kernel.kernel_id);
+            if (!kernel.found() || kernel.definition->bindings.size() != dispatch.bindings.size()) {
+                continue;
+            }
+            for (size_t slot = 0; slot < dispatch.bindings.size(); ++slot) {
+                if (kernel.definition->bindings[slot].access == ResourceAccess::Read) {
+                    continue;
+                }
+                const DispatchBinding & write = dispatch.bindings[slot];
+                const GraphNode * producer = graph.index().producer(write.value);
+                size_t producer_index = 0;
+                FusionStorageSpan written;
+                if (producer == nullptr || !graph.index().node_index(producer, producer_index) ||
+                    producer_index <= root_index ||
+                    std::find(match.covered_nodes.begin(), match.covered_nodes.end(), producer_index) ==
+                        match.covered_nodes.end() ||
+                    !fusion_resident_span(graph, write.value, write.offset, write.length, written)) {
+                    continue;
+                }
+                for (size_t i = root_index + 1; i < producer_index; ++i) {
+                    const GraphNode & node = graph.nodes()[i];
+                    if (covered(i) || node.op == GGML_OP_NONE || is_layout_alias_node(graph, node)) {
+                        continue;
+                    }
+                    const auto inspect = [&](ValueId value_id, const char * role) {
+                        const Value * value = graph.values().find(value_id);
+                        FusionStorageSpan other;
+                        if (value == nullptr ||
+                            !fusion_resident_span(graph, value_id, 0, value->byte_count, other) ||
+                            written.buffer != other.buffer || written.begin >= other.end ||
+                            other.begin >= written.end) {
+                            return;
+                        }
+                        const unsigned report = reports.fetch_add(1, std::memory_order_relaxed);
+                        if (report >= limit) {
+                            return;
+                        }
+                        std::fprintf(stderr,
+                            "HRX fusion-storage candidate=%u rule=%s root=%zu/%s/%s "
+                            "write=%d/%s producer=%zu buffer=%p span=[%zu,%zu) "
+                            "intervening=%zu/%s/%s role=%s value=%d/%s span=[%zu,%zu)\n",
+                            report + 1, rule, root_index, ggml_op_name(graph.nodes()[root_index].op),
+                            fusion_tensor_name(graph, graph.nodes()[root_index].output),
+                            write.value.value, fusion_tensor_name(graph, write.value), producer_index,
+                            static_cast<void *>(written.buffer), written.begin, written.end,
+                            i, ggml_op_name(node.op), fusion_tensor_name(graph, node.output), role,
+                            value_id.value, fusion_tensor_name(graph, value_id), other.begin, other.end);
+                    };
+                    for (const ValueId input : node.inputs) {
+                        inspect(input, "input");
+                    }
+                    inspect(node.output, "output");
+                    if (reports.load(std::memory_order_relaxed) >= limit) {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    // Diagnostic only: overlaps are candidates, not sufficient grounds to reject
+    // a match. A later fusion can subsume one of these still-uncovered nodes.
+    scan(match.initialization_dispatches);
+    scan(match.dispatches);
 }
 
 static bool try_match_registration(const Graph &              graph,
@@ -343,6 +469,7 @@ bool DispatchScheduler::schedule_graph(Graph &                       graph,
             clear_plan_results(plan_);
             return false;
         }
+        trace_fusion_storage(graph, target, match, i, covered_nodes, match_diagnostics);
         for (Dispatch & dispatch : match.initialization_dispatches) {
             plan_.initialization_dispatches.push_back(std::move(dispatch));
         }

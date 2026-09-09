@@ -15,6 +15,7 @@
 #include "dispatch-rmsnorm.h"
 #include "dispatch-routed-ffn.h"
 #include "dispatch-scale.h"
+#include "dispatch-swiglu.h"
 
 #include <algorithm>
 #include <utility>
@@ -56,6 +57,7 @@ static DispatchRegistry build_llm_registry() {
     register_scale_dispatch(builder);
     register_copy_dispatch(builder);
     register_elementwise_dispatches(builder);
+    register_swiglu_dispatch(builder);
     register_llm_dispatches(builder);
     return builder.build();
 }

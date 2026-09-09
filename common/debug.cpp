@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <regex>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@ struct common_debug_cb_user_data::impl {
     std::vector<uint8_t>    data;
     std::vector<std::regex> tensor_filters;
     bool                    abort_on_nan{false};
+    bool                    selected_only{false};
 };
 
 common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {}
@@ -29,6 +31,8 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
         }
     }
     pimpl->abort_on_nan = abort_on_nan;
+    const char * selected_only = std::getenv("LLAMA_DEBUG_SELECTED_ONLY");
+    pimpl->selected_only = selected_only != nullptr && std::string(selected_only) == "1";
 
     params.cb_eval           = common_debug_cb_eval;
     params.cb_eval_user_data = this;
@@ -147,7 +151,7 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
 
-    if (ask) {
+    if (ask && !pimpl->selected_only) {
         return true;  // Always retrieve data
     }
 
@@ -160,6 +164,9 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
                 break;
             }
         }
+    }
+    if (ask) {
+        return matches_filter;
     }
 
     char src1_str[128] = { 0 };

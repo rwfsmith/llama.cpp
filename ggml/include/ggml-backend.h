@@ -204,6 +204,10 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
+    // Optional "ggml_backend_reg_shutdown": release registry resources before DLL unload/process exit.
+    // Call on an application thread after freeing all resources. False leaves live resources intact.
+    typedef bool (*ggml_backend_reg_shutdown_t)(ggml_backend_reg_t reg);
+
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
@@ -236,6 +240,11 @@ extern "C" {
     GGML_API size_t             ggml_backend_reg_count(void);
     GGML_API ggml_backend_reg_t ggml_backend_reg_get(size_t index);
     GGML_API ggml_backend_reg_t ggml_backend_reg_by_name(const char * name);
+
+    // Shut down already-registered backends through their optional registry shutdown hooks.
+    // Does not initialize backends. Call after freeing all resources, before unloading libraries/exiting.
+    // Returns false if any hook failed; busy backends can be retried after their resources are freed.
+    GGML_API bool ggml_backend_shutdown(void);
 
     // Device enumeration
     GGML_API size_t             ggml_backend_dev_count(void);

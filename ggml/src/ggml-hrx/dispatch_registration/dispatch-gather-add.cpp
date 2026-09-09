@@ -4,12 +4,14 @@
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 namespace ggml::hrx {
 namespace {
 
 static constexpr KernelCatalogRef kGatherAddF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_gather_add_f32");
+static constexpr KernelCatalogRef kGetRowsF32Kernel = GGML_HRX_KERNEL_REF("hrx_owned", "ggml_get_rows_f32");
 
 static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
@@ -159,6 +161,63 @@ static GatherAddMatch match_gather_add_f32(const Graph & graph, const GraphNode 
 
 }  // namespace
 
+bool is_f32_get_rows_kernel(uint64_t kernel_id) {
+    return kernel_id == kGetRowsF32Kernel.id;
+}
+
+bool supports_f32_get_rows_dispatch(const ggml_tensor * op) {
+    const char * enabled = std::getenv("HRX_ENABLE_F32_GET_ROWS");
+    if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0' ||
+        op == nullptr || op->op != GGML_OP_GET_ROWS || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * source = op->src[0];
+    const ggml_tensor * ids = op->src[1];
+    if (source->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32 ||
+        source->ne[2] != 1 || source->ne[3] != 1 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        op->ne[2] != 1 || op->ne[3] != 1 || op->view_src != nullptr ||
+        !ggml_is_contiguous(source) || !ggml_is_contiguous(ids) || !ggml_is_contiguous(op) ||
+        source->nb[0] != sizeof(float) || ids->nb[0] != sizeof(int32_t) || op->nb[0] != sizeof(float) ||
+        source->view_offs % sizeof(float) != 0 || ids->view_offs % sizeof(int32_t) != 0) {
+        return false;
+    }
+    const int64_t width = source->ne[0];
+    const int64_t capacity = source->ne[1];
+    const int64_t count = ids->ne[0];
+    return width > 0 && width <= kF32GetRowsMaxWidth &&
+           capacity > 0 && capacity <= kF32GetRowsMaxRows && count > 0 && count <= kF32GetRowsMaxRows &&
+           width <= kF32GetRowsMaxElements / capacity && width <= kF32GetRowsMaxElements / count &&
+           op->ne[0] == width && op->ne[1] == count;
+}
+
+static bool match_get_rows_f32_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_GET_ROWS || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * source = graph_value(context.graph, node->inputs[0]);
+    const Value * ids = graph_value(context.graph, node->inputs[1]);
+    const Value * output = graph_value(context.graph, node->output);
+    if (source == nullptr || ids == nullptr || output == nullptr ||
+        !supports_f32_get_rows_dispatch(output->tensor) ||
+        source->storage == output->storage || ids->storage == output->storage) {
+        return false;
+    }
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kGetRowsF32Kernel);
+    dispatch.kernel.integer_parameters = {
+        { "hidden_size", source->ne[0] },
+        { "vocabulary_count", source->ne[1] },
+        { "token_count", ids->ne[0] },
+    };
+    dispatch.bindings.push_back({ source->id, 0, source->byte_count });
+    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
 static bool match_gather_add_f32_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
     const GatherAddMatch gather_add = match_gather_add_f32(context.graph, context.root_node, context.root_index);
     if (!gather_add.matched() || gather_add.first_get_rows_index >= context.covered_nodes.size() ||
@@ -187,6 +246,14 @@ static bool match_gather_add_f32_dispatch(const DispatchMatchContext & context, 
 }
 
 void register_gather_add_dispatch(DispatchRegistryBuilder & registry) {
+    registry.add({
+        "common.get_rows_f32",
+        GGML_OP_GET_ROWS,
+        DispatchMatchKind::SingleOp,
+        -100,
+        DispatchSource::Common,
+        match_get_rows_f32_dispatch,
+    });
     registry.add({
         "common.gather_add_f32",
         GGML_OP_GET_ROWS,

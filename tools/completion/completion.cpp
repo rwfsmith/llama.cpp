@@ -950,7 +950,5 @@ int llama_completion(int argc, char ** argv) {
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
-    llama_backend_free();
-
     return 0;
 }

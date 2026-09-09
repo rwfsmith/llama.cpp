@@ -148,6 +148,7 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 
 void llama_backend_free(void) {
     ggml_quantize_free();
+    ggml_backend_shutdown();
 }
 
 int64_t llama_time_us(void) {
@@ -617,4 +618,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

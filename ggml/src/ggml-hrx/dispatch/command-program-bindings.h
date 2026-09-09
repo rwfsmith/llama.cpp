@@ -22,6 +22,7 @@ struct CommandProgramBinding {
     size_t       capacity   = 0;
     void *       host_data  = nullptr;
     bool         weight     = false;
+    const ggml_tensor * tensor = nullptr; // Diagnostic metadata; never part of a binding fingerprint.
 
     bool requires_materialization() const { return host_data != nullptr; }
 };

@@ -7,10 +7,30 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <utility>
 
 namespace ggml::hrx {
+
+bool qwen4exp_hc_grouped_norm_token_count_supported(int64_t tokens) {
+    const char * flag = std::getenv("HRX_ENABLE_HC_SMALL_BATCH");
+    return tokens == 1 || (tokens >= 2 && tokens <= 8 && flag != nullptr && std::strcmp(flag, "1") == 0);
+}
+
+bool qwen4exp_hc_grouped_norm_rms_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_RMS_NORM || op->src[0] == nullptr) {
+        return false;
+    }
+    float epsilon;
+    std::memcpy(&epsilon, op->op_params, sizeof(epsilon));
+    return qwen4exp_hc_grouped_norm_layout_supported(*op) &&
+           qwen4exp_hc_grouped_norm_layout_supported(*op->src[0]) &&
+           ggml_are_same_shape(op, op->src[0]) &&
+           std::fabs(epsilon - kQwen4ExpMoeDispatchProfile.rms_norm_epsilon) <= 1.0e-12f;
+}
+
 namespace {
 
 static constexpr KernelCatalogRef kQwenRmsNormF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "qwen3_moe_rmsnorm_f32");
@@ -298,7 +318,8 @@ static bool is_hc_weight_shape(const Value & weight) {
 
 static HcGroupedNormMatch match_qwen4exp_hc_grouped_rmsnorm_f32(const Graph &     graph,
                                                                 const GraphNode * node,
-                                                                size_t            node_index) {
+                                                                size_t            node_index,
+                                                                const DispatchMatchContext & context) {
     HcGroupedNormMatch match;
     if (node == nullptr || node->op != GGML_OP_RMS_NORM || node->inputs.size() != 1 || !graph.has_index()) {
         return match;
@@ -313,6 +334,7 @@ static HcGroupedNormMatch match_qwen4exp_hc_grouped_rmsnorm_f32(const Graph &   
     // qwen.rmsnorm_f32.mul_weight / qwen4exp.gdn_norm_gate_decode matchers.
     const std::vector<const GraphNode *> & direct_consumers = graph.index().consumers(node->output);
     if (direct_consumers.size() != 1 || direct_consumers.front() == nullptr ||
+        direct_consumers.front()->op != GGML_OP_RESHAPE ||
         !is_layout_alias_node(graph, *direct_consumers.front())) {
         return {};
     }
@@ -323,17 +345,32 @@ static HcGroupedNormMatch match_qwen4exp_hc_grouped_rmsnorm_f32(const Graph &   
     if (mul_node == nullptr || mul_node->inputs.size() != 2 || !graph.index().node_index(mul_node, mul_node_index)) {
         return {};
     }
+    // Only the weighted result is materialized. A sibling consumer (including a
+    // layout alias) would otherwise read the unmaterialized RMS/RESHAPE output.
+    const auto & flat_consumers = graph.index().consumers(reshape_node->output);
+    if (flat_consumers.size() != 1 || flat_consumers.front() != mul_node) {
+        return {};
+    }
 
     const Value * weight = nullptr;
+    bool consumes_reshape = false;
     for (ValueId input : mul_node->inputs) {
         if (input != reshape_node->output) {
             weight = graph_value(graph, input);
+        } else {
+            consumes_reshape = true;
         }
     }
     const Value * input  = graph_value(graph, node->inputs[0]);
     const Value * rms    = graph_value(graph, node->output);
     const Value * output = graph_value(graph, mul_node->output);
-    if (input == nullptr || rms == nullptr || weight == nullptr || output == nullptr) {
+    const Value * flat = graph_value(graph, reshape_node->output);
+    if (!consumes_reshape || input == nullptr || rms == nullptr || weight == nullptr || output == nullptr ||
+        flat == nullptr) {
+        return {};
+    }
+    if ((rms->tensor != nullptr && (rms->tensor->flags & GGML_TENSOR_FLAG_OUTPUT)) ||
+        (flat->tensor != nullptr && (flat->tensor->flags & GGML_TENSOR_FLAG_OUTPUT))) {
         return {};
     }
     if (input->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 ||
@@ -347,14 +384,16 @@ static HcGroupedNormMatch match_qwen4exp_hc_grouped_rmsnorm_f32(const Graph &   
         return {};
     }
 
-    // qwen4exp HC geometry: RMS_NORM operates on [n_embd, hc, n_tokens] groups. Scoped to
-    // decode (n_tokens==1) like every other qwen4exp HRX kernel; prefill (n_tokens>1) falls
-    // back to CPU.
-    if (input->ne[0] != kQwen4ExpHiddenSize || input->ne[1] != kQwen4ExpHcMultiplier || input->ne[3] != 1) {
+    // Each token is four adjacent independent 2560-element RMS rows.
+    if (!qwen4exp_hc_grouped_norm_layout_supported(*input) ||
+        !qwen4exp_hc_grouped_norm_layout_supported(*rms)) {
         return {};
     }
     const int64_t token_count = input->ne[2];
-    if (!is_llm_decode_query_length(token_count)) {
+    if (flat->type != GGML_TYPE_F32 || !flat->contiguous ||
+        flat->ne[0] != kQwen4ExpHcDim || flat->ne[1] != token_count ||
+        flat->ne[2] != 1 || flat->ne[3] != 1 ||
+        flat->storage_root != rms->storage_root || flat->storage_offset != rms->storage_offset) {
         return {};
     }
     if (!is_hc_weight_shape(*weight)) {
@@ -363,6 +402,53 @@ static HcGroupedNormMatch match_qwen4exp_hc_grouped_rmsnorm_f32(const Graph &   
     if (output->ne[0] != kQwen4ExpHcDim || output->ne[1] != token_count || output->ne[2] != 1 ||
         output->ne[3] != 1) {
         return {};
+    }
+    // Gamma is consumed by a later MUL but this fused dispatch executes at RMS_NORM.
+    // Covered producers (e.g. another earlier fusion) are already ready; aliases
+    // must otherwise be traced to their actual producer.
+    const Value * source = weight;
+    while (source != nullptr) {
+        const GraphNode * producer = graph.index().producer(source->id);
+        if (producer == nullptr) {
+            break;
+        }
+        size_t producer_index = 0;
+        if (!graph.index().node_index(producer, producer_index)) {
+            return {};
+        }
+        if (producer_index < context.covered_nodes.size() && context.covered_nodes[producer_index]) {
+            break;
+        }
+        if (is_layout_alias_node(graph, *producer)) {
+            source = producer->inputs.empty() ? nullptr : graph_value(graph, producer->inputs[0]);
+            if (source == nullptr) {
+                return {};
+            }
+        } else {
+            if (producer_index >= node_index) {
+                return {};
+            }
+            break;
+        }
+    }
+    if (token_count > 1 && weight->tensor != nullptr && output->tensor != nullptr &&
+        weight->tensor->data != nullptr && output->tensor->data != nullptr &&
+        weight->tensor->buffer == output->tensor->buffer) {
+        const uintptr_t weight_begin = reinterpret_cast<uintptr_t>(weight->tensor->data);
+        const uintptr_t output_begin = reinterpret_cast<uintptr_t>(output->tensor->data);
+        if (weight_begin < output_begin + output->byte_count && output_begin < weight_begin + weight->byte_count) {
+            return {};
+        }
+    }
+    if (token_count > 1 && input->tensor != nullptr && output->tensor != nullptr &&
+        input->tensor->data != nullptr && output->tensor->data != nullptr &&
+        input->tensor->buffer == output->tensor->buffer) {
+        const uintptr_t input_begin = reinterpret_cast<uintptr_t>(input->tensor->data);
+        const uintptr_t output_begin = reinterpret_cast<uintptr_t>(output->tensor->data);
+        if (input_begin != output_begin && input_begin < output_begin + output->byte_count &&
+            output_begin < input_begin + input->byte_count) {
+            return {};
+        }
     }
 
     match.rms_node       = node;
@@ -421,23 +507,27 @@ static bool match_qwen4exp_hc_grouped_rmsnorm_f32_dispatch(const DispatchMatchCo
         return false;
     }
     const HcGroupedNormMatch hc_match =
-        match_qwen4exp_hc_grouped_rmsnorm_f32(context.graph, &nodes[context.root_index], context.root_index);
+        match_qwen4exp_hc_grouped_rmsnorm_f32(context.graph, &nodes[context.root_index], context.root_index, context);
     if (!hc_match.matched() || hc_match.rms_node_index >= context.covered_nodes.size() ||
         hc_match.mul_node_index >= context.covered_nodes.size() || context.covered_nodes[hc_match.rms_node_index] ||
         context.covered_nodes[hc_match.mul_node_index]) {
         return false;
     }
 
-    Dispatch dispatch;
-    dispatch.kernel = make_kernel_specialization(kQwen4ExpHcGroupedNormDecodeKernel);
-    dispatch.kernel.compile_parameters.emplace("qwen4exp.model.rms_epsilon", "0.000001");
-    dispatch.bindings.push_back({ hc_match.input->id, 0, hc_match.input->byte_count });
-    dispatch.bindings.push_back({ hc_match.weight->id, 0, hc_match.weight->byte_count });
-    dispatch.bindings.push_back({ hc_match.output->id, 0, hc_match.output->byte_count });
+    constexpr size_t token_bytes = kQwen4ExpHcDim * sizeof(float);
+    for (int64_t token = 0; token < hc_match.token_count; ++token) {
+        Dispatch dispatch;
+        dispatch.kernel = make_kernel_specialization(kQwen4ExpHcGroupedNormDecodeKernel);
+        dispatch.kernel.compile_parameters.emplace("qwen4exp.model.rms_epsilon", "0.000001");
+        const size_t offset = static_cast<size_t>(token) * token_bytes;
+        dispatch.bindings.push_back({ hc_match.input->id, offset, token_bytes });
+        dispatch.bindings.push_back({ hc_match.weight->id, 0, token_bytes });
+        dispatch.bindings.push_back({ hc_match.output->id, offset, token_bytes });
+        match.dispatches.push_back(std::move(dispatch));
+    }
 
     match.covered_nodes.push_back(hc_match.rms_node_index);
     match.covered_nodes.push_back(hc_match.mul_node_index);
-    match.dispatches.push_back(std::move(dispatch));
     return true;
 }
 

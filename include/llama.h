@@ -480,7 +480,8 @@ extern "C" {
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
-    // Call once at the end of the program - currently only used for MPI
+    // Call on an application thread after freeing all models, contexts, and backend resources,
+    // before unloading libraries or exiting. May be called again after a later initialization.
     LLAMA_API void llama_backend_free(void);
 
     //optional:

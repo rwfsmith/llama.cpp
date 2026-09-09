@@ -1,0 +1,48 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Raw bits preserve NaN payloads, subnormals and signed zero. Host ID validation
+// reports invalid IDs before launch; device guards also prevent invalid reads.
+
+amdgpu.target<gfx11-generic> @ggml_get_rows_f32_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_get_rows_f32_wave64) export("ggml_get_rows_f32") @ggml_get_rows_f32(%hidden_size: index, %vocabulary_count: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %hidden_size, %rounding : index
+  %tiles = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%tiles, %token_count, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%hidden_size: index, %vocabulary_count: index, %token_count: index, %source: buffer, %ids: buffer, %output: buffer) {
+  %width = index.assume %hidden_size [range(%hidden_size, 1, 1048576)] : index
+  %capacity = index.assume %vocabulary_count [range(%vocabulary_count, 1, 4096)] : index
+  %count = index.assume %token_count [range(%token_count, 1, 4096)] : index
+  %tile = kernel.workgroup.id<x> : index
+  %row0 = kernel.workgroup.id<y> : index
+  %row = index.assume %row0 [lt(%row0, %count)] : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %tile, %threads : index
+  %column = index.add %base, %lane : index
+  %in_bounds = index.cmp ult, %column, %width : index
+  %zero_offset = index.constant 0 : offset
+  %iv = buffer.view %ids[%zero_offset] : buffer -> view<[%count]xi32>
+  scf.if %in_bounds {
+    %id32 = view.load %iv[%row] : view<[%count]xi32> -> i32
+    %zero32 = scalar.constant 0 : i32
+    %capacity32 = index.cast %capacity : index to i32
+    %nonnegative = scalar.cmpi sge, %id32, %zero32 : i32
+    %below_limit = scalar.cmpi slt, %id32, %capacity32 : i32
+    %valid = scalar.andi %nonnegative, %below_limit : i1
+    scf.if %valid {
+      %id0 = index.cast %id32 : i32 to index
+      %id = index.assume %id0 [range(%id0, 0, 4095), lt(%id0, %capacity)] : index
+      %col = index.assume %column [lt(%column, %width)] : index
+      %sv = buffer.view %source[%zero_offset] : buffer -> view<[%capacity]x[%width]xi32>
+      %ov = buffer.view %output[%zero_offset] : buffer -> view<[%count]x[%width]xi32>
+      %bits = view.load %sv[%id, %col] : view<[%capacity]x[%width]xi32> -> i32
+      view.store %bits, %ov[%row, %col] : i32, view<[%count]x[%width]xi32>
+    }
+  }
+  kernel.return
+}

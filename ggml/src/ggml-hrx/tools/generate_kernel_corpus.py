@@ -300,6 +300,104 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def with_owned_kernels(manifest: dict, corpus_dir: pathlib.Path) -> dict:
+    # Owned sources are registered here, without changing pinned vendor provenance.
+    iq_parameters = ["input_size", "output_size", "expert_count", "route_count",
+                     "token_count", "route_id_stride"]
+    iq_bindings = ["weight", "input", "ids", "tables", "output"]
+    iq_access = ["read", "read", "read", "read", "write"]
+    owned_sources = [
+        ("../hrx_owned/swiglu_split_f32.loom", [
+            ("ggml_swiglu_split_f32", ["element_count"],
+             ["gate", "up", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/get_rows_f32.loom", [
+            ("ggml_get_rows_f32", ["hidden_size", "vocabulary_count", "token_count"],
+             ["source", "ids", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/token_embedding_q4_k.loom", [
+            ("ggml_token_embedding_q4_k_f32", ["hidden_size", "vocabulary_count", "token_count"],
+             ["weight", "ids", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/token_embedding_q8_0.loom", [
+            ("ggml_token_embedding_q8_0_f32", ["hidden_size", "vocabulary_count", "token_count"],
+             ["weight", "ids", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/set_rows_f32.loom", [
+            ("ggml_set_rows_f32",
+             ["row_length", "row_count", "cache_rows", "source_stride", "output_stride",
+              "index_stride", "output_f16", "index_i64"],
+             ["source", "ids", "output"], ["read", "read", "read_write"]),
+        ]),
+        ("../hrx_owned/dense_q8_0_gemv.loom", [
+            ("ggml_dense_q8_0_gemv_f32", ["input_size", "output_size"],
+             ["input", "weight", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/dense_q8_narrow.loom", [
+            ("ggml_q8_narrow_pack", ["input_size"],
+             ["input", "packed"], ["read", "write"]),
+            ("ggml_q8_narrow_dot", ["input_size", "output_size"],
+             ["packed", "weight", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/dense_quantized_f32_accum.loom", [
+            (name, ["token_count"], ["input", "weight", "output"], ["read", "read", "write"])
+            for name in ("ggml_dense_q4k_f32_accum", "ggml_dense_q6k_f32_accum",
+                         "ggml_dense_q8_0_f32_accum")
+        ]),
+        ("../hrx_owned/mul_mat_id_iq.loom", [
+            ("ggml_mul_mat_id_iq3_xxs_f32", iq_parameters, iq_bindings, iq_access),
+            ("ggml_mul_mat_id_iq4_xs_f32", iq_parameters, iq_bindings, iq_access),
+        ]),
+        ("../hrx_owned/moe_small_down.loom", [
+            (name, ["token_count", "input_size", "route_count", "route_id_stride",
+                    "expert_count", "output_size"],
+             ["input", "ids", "route_weights", "weight", "output"],
+             ["read", "read", "read", "read", "read_write"])
+            for name in ("ggml_moe_small_down_q8_0", "ggml_moe_small_down_iq4_nl")
+        ]),
+    ]
+    files = list(manifest["files"])
+    exports = list(manifest["exports"])
+    corpus_digest = manifest["corpus_sha256"]
+    for source, definitions in owned_sources:
+        dependencies = []
+        if source == "../hrx_owned/moe_small_down.loom":
+            dependencies = ["ggml/quantize_q8_1_x4.loom",
+                            "qwen3_moe/routed_down_q8_0.loom",
+                            "qwen3_moe/routed_down_iq4_nl.loom"]
+        elif source == "../hrx_owned/dense_quantized_f32_accum.loom":
+            dependencies = ["qwen3_moe/dense_linear_quantized_f16_wmma.loom",
+                            "ggml/linear_q6k_q8_1_x4.loom"]
+        digest = sha256(read_bytes(corpus_dir / source))
+        files.append({"path": source, "sha256": digest})
+        corpus_digest = sha256((corpus_digest + source + digest).encode("utf-8"))
+        for name, parameter_names, bindings, access in definitions:
+            parameters = [{"name": parameter, "type": "index"} for parameter in parameter_names]
+            exports.append({
+                "family": "hrx_owned",
+                "name": name,
+                "symbol": name,
+                "source": source,
+                "target_selector": "",
+                "workload_parameters": parameters,
+                "launch_parameters": parameters,
+                "bindings": bindings,
+                "binding_access": access,
+                "compile_dependencies": dependencies,
+                "compile_recipe": {
+                    "mode": "direct",
+                    "primary_sources": [source],
+                    "library_sources": dependencies,
+                },
+            })
+    return {
+        **manifest,
+        "files": files,
+        "exports": exports,
+        "corpus_sha256": corpus_digest,
+    }
+
+
 def kernel_catalog_id(family: str, name: str) -> int:
     hash_value = 1469598103934665603
     for byte in family.encode("utf-8"):
@@ -311,6 +409,43 @@ def kernel_catalog_id(family: str, name: str) -> int:
         hash_value ^= byte
         hash_value = (hash_value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return hash_value
+
+
+def with_qsa_launch_only_parameters(manifest: dict, corpus_dir: pathlib.Path) -> dict:
+    # The pinned catalog incorrectly lists token_count as a root specialization
+    # parameter. Both kernels have kernel.def @symbol(), with indices ONLY in
+    # launch(...). Keep those runtime scalar arguments; do not edit vendor files.
+    launch_only = {
+        "qwen38_attention_decode_split_reduce": ["token_count", "token_ordinal"],
+        "qwen38_attention_decode_split_wmma_partial": ["token_count", "token_ordinal", "control_position_index"],
+    }
+    exports = []
+    corrections = []
+    for export in manifest["exports"]:
+        names = launch_only.get(export["name"]) if export.get("family") == "qwen4exp" else None
+        if names is not None:
+            source = read_text(corpus_dir / export["source"])
+            root = r"kernel\.def\b[^\n]*@" + re.escape(export["symbol"]) + r"\s*\(\s*\)\s*\{"
+            parameters = [{"name": name, "type": "index"} for name in names]
+            if not re.search(root, source) or export["launch_parameters"] != parameters:
+                raise RuntimeError(f"QSA launch-only ABI changed: {export['name']}")
+            if export["workload_parameters"]:
+                export = {**export, "workload_parameters": []}
+                corrections.append({
+                    "family": export["family"],
+                    "name": export["name"],
+                    "workload_parameters": [],
+                    "launch_parameters": parameters,
+                })
+        exports.append(export)
+    if not corrections:
+        return manifest
+    correction_digest = json.dumps(corrections, sort_keys=True, separators=(",", ":"))
+    return {
+        **manifest,
+        "exports": exports,
+        "corpus_sha256": sha256((manifest["corpus_sha256"] + correction_digest).encode("utf-8")),
+    }
 
 
 def generate_corpus_records(manifest: dict, source_records: Dict[str, str]) -> Tuple[str, str, int]:
@@ -401,6 +536,8 @@ def generate_includes(args: argparse.Namespace, manifest: dict) -> Tuple[str, st
         raise RuntimeError("binary source format requires --loom-link and --loom-format")
 
     corpus_dir = args.corpus_dir
+    manifest = with_owned_kernels(manifest, corpus_dir)
+    manifest = with_qsa_launch_only_parameters(manifest, corpus_dir)
     sources, source_dependencies = collect_sources(manifest)
     digests = manifest_file_digests(manifest)
     source_bytes: Dict[str, bytes] = {}

@@ -117,6 +117,9 @@ class HostWeightCache {
         size_t operator()(const SourceKey & key) const;
     };
 
+    void trace_acquire_locked(const HostTransferManager & transfers, const HostWeightSource & source,
+                              const HostWeightLease & lease, const char * event) const;
+
     mutable std::mutex                                                                    mutex_;
     std::unordered_map<SourceKey, std::shared_ptr<HostWeightLease::Entry>, SourceKeyHash> entries_;
     HostWeightCacheStats                                                                  stats_;
@@ -136,6 +139,7 @@ struct HostStagingBuffer {
     void *       host_data = nullptr;
     int32_t      value     = -1;
     size_t       length    = 0;
+    size_t       offset    = 0; // This value's slice within a shared device allocation.
     bool         upload    = false;
     bool         download  = false;
 

@@ -417,7 +417,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 models_routes->models.unload_all();
             }
             mcp_mgr.shutdown();
-            llama_backend_free();
         };
 
         if (!ctx_http.start()) {
@@ -457,7 +456,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
             ctx_http.stop();
             ctx_server.terminate();
             mcp_mgr.shutdown();
-            llama_backend_free();
         };
 
         // start the HTTP server before loading the model to be able to serve /health requests

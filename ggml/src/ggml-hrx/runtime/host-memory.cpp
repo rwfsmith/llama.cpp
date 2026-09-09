@@ -6,16 +6,15 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <map>
 #include <sstream>
 #include <utility>
 
 namespace ggml::hrx {
 namespace {
 
-// The synchronous readback in download_synchronous() blocks on the compute stream before it copies, so its
-// wall time bundles together two very different costs: waiting for the split's kernels to finish, and the
-// device-to-host transfer itself. Only the first is real GPU work; the second is pure cost of crossing the
-// HRX/CPU boundary. Splitting them is what says whether eliminating CPU fallback would actually buy anything.
+// Separate host synchronization and copy-call wall time. Neither interval measures active GPU execution.
 static bool hrx_time_compute_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("HRX_TIME_COMPUTE");
@@ -25,6 +24,23 @@ static bool hrx_time_compute_enabled() {
 }
 
 static constexpr size_t kMaxInlineUploadBytes = 63 * 1024;
+
+static bool trace_weight_residency_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_TRACE_WEIGHT_RESIDENCY");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void trace_weight_cache_stats(const void * cache, const char * event, const HostWeightCacheStats & stats) {
+    GGML_LOG_INFO("HRX weight residency: event=%s cache=%p hits=%llu misses=%llu layout_conflicts=%llu "
+                  "allocations=%zu resident_bytes=%zu\n",
+                  event, cache, static_cast<unsigned long long>(stats.hits),
+                  static_cast<unsigned long long>(stats.misses),
+                  static_cast<unsigned long long>(stats.layout_conflicts),
+                  stats.allocation_count, stats.resident_bytes);
+}
 
 static Status allocate_device_buffer(hrx_device_t device, size_t size, hrx_buffer_t & buffer) {
     Status status;
@@ -179,6 +195,13 @@ HostTransferStats HostTransferManager::stats() const {
 
 void HostTransferManager::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (trace_weight_residency_enabled() && (stats_.uploads != 0 || stats_.downloads != 0)) {
+        // These totals include activations and constants, not only weights.
+        GGML_LOG_INFO("HRX weight residency: event=transfers_clear transfers=%p uploads=%llu upload_bytes=%zu "
+                      "downloads=%llu download_bytes=%zu\n",
+                      static_cast<void *>(this), static_cast<unsigned long long>(stats_.uploads), stats_.upload_bytes,
+                      static_cast<unsigned long long>(stats_.downloads), stats_.download_bytes);
+    }
     stats_ = {};
 }
 
@@ -231,6 +254,36 @@ size_t HostWeightCache::SourceKeyHash::operator()(const SourceKey & key) const {
     return static_cast<size_t>(hash);
 }
 
+void HostWeightCache::trace_acquire_locked(const HostTransferManager & transfers, const HostWeightSource & source,
+                                          const HostWeightLease & lease, const char * event) const {
+    if (!trace_weight_residency_enabled()) {
+        return;
+    }
+    // Bound key records to 64 admissions and 64 concurrent duplicate uploads per cache epoch.
+    if ((std::strcmp(event, "miss") == 0 && stats_.misses <= 64) ||
+        (std::strcmp(event, "race_upload") == 0 && stats_.hits <= 64)) {
+        GGML_LOG_INFO("HRX weight residency: event=%s cache=%p transfers=%p identity=%llu generation=%llu "
+                      "capacity=%zu offset=%zu length=%zu layout=%s buffer=%p\n",
+                      event, static_cast<const void *>(this), static_cast<const void *>(&transfers),
+                      static_cast<unsigned long long>(source.identity),
+                      static_cast<unsigned long long>(source.generation), source.capacity, source.offset,
+                      source.length, source.layout.c_str(), static_cast<void *>(lease.buffer()));
+    }
+    // Powers of two give at most 64 snapshots without adding or changing accounting counters.
+    const uint64_t acquisitions = stats_.hits + stats_.misses;
+    if (acquisitions == 0 || (acquisitions & (acquisitions - 1)) != 0) {
+        return;
+    }
+    trace_weight_cache_stats(this, "acquire_snapshot", stats_);
+    const HostTransferStats transfer_stats = transfers.stats();
+    GGML_LOG_INFO("HRX weight residency: event=transfer_snapshot cache=%p transfers=%p acquisitions=%llu "
+                  "uploads=%llu upload_bytes=%zu downloads=%llu download_bytes=%zu\n",
+                  static_cast<const void *>(this), static_cast<const void *>(&transfers),
+                  static_cast<unsigned long long>(acquisitions),
+                  static_cast<unsigned long long>(transfer_stats.uploads), transfer_stats.upload_bytes,
+                  static_cast<unsigned long long>(transfer_stats.downloads), transfer_stats.download_bytes);
+}
+
 HostWeightAcquireResult HostWeightCache::acquire(hrx_device_t             device,
                                                  hrx_stream_t             stream,
                                                  HostTransferManager &    transfers,
@@ -263,6 +316,7 @@ HostWeightAcquireResult HostWeightCache::acquire(hrx_device_t             device
             }
             ++stats_.hits;
             result.lease = HostWeightLease(found->second);
+            trace_acquire_locked(transfers, source, result.lease, "hit");
             return result;
         }
     }
@@ -286,11 +340,13 @@ HostWeightAcquireResult HostWeightCache::acquire(hrx_device_t             device
         if (!inserted.second) {
             ++stats_.hits;
             result.lease = HostWeightLease(inserted.first->second);
+            trace_acquire_locked(transfers, source, result.lease, "race_upload");
             return result;
         }
         ++stats_.misses;
         stats_.allocation_count = entries_.size();
         stats_.resident_bytes += source.length;
+        trace_acquire_locked(transfers, source, HostWeightLease(entry), "miss");
     }
     result.lease = HostWeightLease(std::move(entry));
     return result;
@@ -303,6 +359,23 @@ HostWeightCacheStats HostWeightCache::stats() const {
 
 void HostWeightCache::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (trace_weight_residency_enabled() && (stats_.hits != 0 || stats_.misses != 0 || stats_.layout_conflicts != 0)) {
+        trace_weight_cache_stats(this, "clear", stats_);
+        // Size groups cover large weights even when small tensors exhaust the initial key-log budget.
+        std::map<size_t, size_t> counts_by_size;
+        for (const auto & entry : entries_) {
+            ++counts_by_size[entry.second->length];
+        }
+        size_t reported = 0;
+        for (auto it = counts_by_size.rbegin(); it != counts_by_size.rend() && reported < 64; ++it, ++reported) {
+            GGML_LOG_INFO("HRX weight residency: event=resident_size cache=%p length=%zu entries=%zu total_bytes=%zu\n",
+                          static_cast<void *>(this), it->first, it->second, it->first * it->second);
+        }
+        if (counts_by_size.size() > reported) {
+            GGML_LOG_INFO("HRX weight residency: event=resident_sizes_truncated cache=%p omitted_size_groups=%zu\n",
+                          static_cast<void *>(this), counts_by_size.size() - reported);
+        }
+    }
     entries_.clear();
     stats_ = {};
 }
@@ -324,12 +397,14 @@ HostStagingBuffer & HostStagingBuffer::operator=(HostStagingBuffer && other) noe
     host_data       = other.host_data;
     value           = other.value;
     length          = other.length;
+    offset          = other.offset;
     upload          = other.upload;
     download        = other.download;
     other.buffer    = nullptr;
     other.host_data = nullptr;
     other.value     = -1;
     other.length    = 0;
+    other.offset    = 0;
     other.upload    = false;
     other.download  = false;
     return *this;
@@ -343,6 +418,7 @@ void HostStagingBuffer::clear() {
     host_data = nullptr;
     value     = -1;
     length    = 0;
+    offset    = 0;
     upload    = false;
     download  = false;
 }

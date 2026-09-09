@@ -20,6 +20,7 @@
 struct ggml_tensor;
 
 struct ggml_backend_hrx_device_context;
+struct ggml_backend_hrx_reg_context;
 
 struct ggml_backend_hrx_buffer_type_context {
     ggml_backend_hrx_device_context * device;
@@ -37,6 +38,8 @@ struct ggml_backend_hrx_buffer_context {
 };
 
 struct ggml_backend_hrx_device_context {
+    ggml_backend_hrx_reg_context *                  registry = nullptr;
+    int                                            ordinal = 0;
     hrx_device_t                                   device = nullptr;
     std::string                                    name;
     std::string                                    description;
@@ -67,9 +70,17 @@ struct ggml_backend_hrx_context {
 };
 
 struct ggml_backend_hrx_reg_context {
+    std::mutex                                                    mutex;
+    std::once_flag                                                discovery;
     bool                                                          initialized = false;
+    bool                                                          runtime_active = false;
+    size_t                                                        live_backends = 0;
+    size_t                                                        live_buffers = 0;
     std::vector<std::unique_ptr<ggml_backend_hrx_device_context>> device_contexts;
     std::vector<ggml_backend_device>                              devices;
 
     ~ggml_backend_hrx_reg_context();
+    bool ensure_runtime_locked();
+    bool shutdown();
+    bool release_runtime_locked();
 };

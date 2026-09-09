@@ -1268,7 +1268,7 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft, spec_mtp);
         }
 
         if (spec) {

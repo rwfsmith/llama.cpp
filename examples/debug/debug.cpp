@@ -21,6 +21,9 @@ static void print_usage(int /*argc*/, char ** argv) {
           {prog} -m model.gguf -p "Hello my name is" --verbose
 
           The tensors to be printed can be filtered with --tensor-filter option.
+          Set LLAMA_DEBUG_SELECTED_ONLY=1 to request callbacks only for matching tensors.
+          This avoids splitting unselected fused operations for debug collection.
+          Use --parse-special for a rendered chat prompt containing control tokens.
 
           Save logits/embeddings:
 
@@ -56,7 +59,7 @@ struct output_data {
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-        tokens = common_tokenize(ctx, params.prompt, add_bos);
+        tokens = common_tokenize(ctx, params.prompt, add_bos, params.parse_special);
         prompt = params.prompt;
 
         if (params.embedding) {
@@ -187,7 +190,7 @@ static bool run(llama_context * ctx, const common_params & params) {
 
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos);
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, params.parse_special);
 
     if (tokens.empty()) {
         LOG_ERR("%s : there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);
@@ -215,7 +218,7 @@ static bool run(llama_context * ctx, const common_params & params) {
     return true;
 }
 
-int main(int argc, char ** argv) {
+static int main_impl(int argc, char ** argv) {
     common_params params;
 
     common_init();
@@ -255,7 +258,11 @@ int main(int argc, char ** argv) {
     LOG("\n");
     llama_perf_context_print(ctx);
 
-    llama_backend_free();
-
     return 0;
+}
+
+int main(int argc, char ** argv) {
+    const int result = main_impl(argc, argv);
+    llama_backend_free();
+    return result;
 }

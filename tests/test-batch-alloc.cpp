@@ -462,6 +462,21 @@ static void test_keep_tail(testing & t) {
         return bb.make();
     };
 
+    t.test("rejects_small_ubatch_without_consuming_tokens", [&](testing & t) {
+        for (bool sequential : { false, true }) {
+            batch_builder bb;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, {6}), vocab, nullptr, bb.n_embd, 1, false));
+            for (uint32_t capacity : { 1u, 2u }) {
+                t.assert_equal(0u, ba.split_equal(capacity, sequential, 2).n_tokens);
+                t.assert_equal(0u, ba.get_n_used());
+            }
+            t.assert_equal(4u, ba.split_equal(4, sequential, 2).n_tokens);
+            t.assert_equal(2u, ba.split_equal(4, sequential, 2).n_tokens);
+            t.assert_equal(6u, ba.get_n_used());
+        }
+    });
+
     t.test("noop_when_seqs_complete", [&](testing & t) {
         batch_builder bb;
 

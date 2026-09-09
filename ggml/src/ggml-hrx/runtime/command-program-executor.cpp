@@ -2,20 +2,50 @@
 
 #include "dispatch/command-program-diagnostics.h"
 #include "dispatch/command-program-resolver.h"
+#include "dispatch_registration/dispatch-copy.h"
+#include "dispatch_registration/dispatch-gather-add.h"
+#include "dispatch_registration/dispatch-moe-router.h"
+#include "dispatch_registration/dispatch-qwen-preamble.h"
+#include "dispatch_registration/dispatch-routed-ffn.h"
 #include "ggml-impl.h"
 #include "hrx-interop-utils.h"
+#include "kernel-corpus/kernel-corpus-catalog-verify.h"
 #include "runtime/kernel-executable-cache.h"
 #include "runtime/transient-arena.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace ggml::hrx {
+
+struct MtpHostTrace {
+    const char * phase = nullptr;
+    uint64_t call = 0;
+    size_t program = 0;
+    size_t events = 0;
+    size_t bytes = 0;
+};
+
+static thread_local MtpHostTrace mtp_host_trace;
+
+void set_mtp_host_trace_scope(const char * phase, uint64_t call) {
+    mtp_host_trace = {};
+    mtp_host_trace.phase = phase;
+    mtp_host_trace.call = call;
+    if (phase != nullptr) {
+        GGML_LOG_INFO("HRX MTP host trace: phase=%s call=%llu; existing transfer boundaries only, "
+                      "512 events/64 MiB per call, 1 MiB per tensor; no callback cuts or extra device sync\n",
+                      phase, static_cast<unsigned long long>(call));
+    }
+}
 
 static bool hrx_environment_flag(const char * name) {
     const char * value = std::getenv(name);
@@ -27,12 +57,7 @@ static bool trace_launch_enabled() {
     return enabled;
 }
 
-// Third level of the HRX_TIME_COMPUTE breakdown. graph_compute() shows the submit/GPU split and
-// GraphExecutor::execute() shows nearly all submission is command recording; this last split attributes the
-// recording to the vendored hrx_stream_dispatch()/hrx_graph_exec_launch() entry points versus the
-// per-dispatch work this file does around them. Measured on qwen4exp decode the vendored launch is under 1%
-// and the cost is overwhelmingly download_prepared_host_staging(), whose blocking readback is where the GPU
-// wait actually hides.
+// Separate direct dispatch and graph replay wall time, including staging. Readbacks may wait for queued work.
 static bool hrx_time_compute_enabled() {
     static const bool enabled = hrx_environment_flag("HRX_TIME_COMPUTE");
     return enabled;
@@ -374,6 +399,84 @@ static std::unordered_map<int32_t, GraphValueAccess> collect_graph_value_access(
     return access_by_value;
 }
 
+}  // namespace
+
+Status plan_host_staging_groups(std::vector<HostStagingSlice> slices, std::vector<HostStagingGroup> & groups) {
+    groups.clear();
+    Status status;
+    std::unordered_set<int32_t> values;
+    for (const auto & slice : slices) {
+        if (slice.address == 0 || slice.length == 0 ||
+            slice.length > std::numeric_limits<uintptr_t>::max() - slice.address ||
+            !values.insert(slice.value).second) {
+            status.log("invalid or duplicate host staging range for value %d", slice.value);
+            return status;
+        }
+    }
+    std::sort(slices.begin(), slices.end(), [](const auto & a, const auto & b) {
+        return a.address != b.address ? a.address < b.address : a.value < b.value;
+    });
+    uintptr_t end = 0;
+    for (const auto & slice : slices) {
+        const uintptr_t slice_end = slice.address + slice.length;
+        if (groups.empty() || slice.address >= end) {
+            // Preserve the original host address's alignment without copying the
+            // padding prefix. Adjacent, nonoverlapping allocations stay separate.
+            const uintptr_t base = slice.address & ~uintptr_t{255};
+            groups.push_back({ base, static_cast<size_t>(slice_end - base), { slice } });
+            end = slice_end;
+        } else {
+            auto & group = groups.back();
+            end = std::max(end, slice_end);
+            group.length = static_cast<size_t>(end - group.base);
+            group.slices.push_back(slice);
+        }
+    }
+    return status;
+}
+
+namespace {
+
+static const HostStagingBuffer * find_host_staging(const std::vector<HostStagingBuffer> & staging, int32_t value) {
+    for (const auto & entry : staging) {
+        if (entry.value == value) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static Status allocate_host_staging_groups(hrx_device_t device, const std::vector<HostStagingBuffer> & sources,
+                                           const std::vector<HostStagingGroup> & groups,
+                                           std::vector<HostStagingBuffer> & output) {
+    Status status;
+    for (const auto & group : groups) {
+        HostStagingBuffer allocation;
+        status.append(allocate_host_staging_buffer(device, group.length, allocation));
+        if (!status.success()) {
+            return status;
+        }
+        for (const auto & slice : group.slices) {
+            const auto * source = find_host_staging(sources, slice.value);
+            if (source == nullptr) {
+                status.log("missing host staging source for value %d", slice.value);
+                return status;
+            }
+            HostStagingBuffer view;
+            hrx_buffer_retain(allocation.buffer);
+            view.buffer = allocation.buffer;
+            view.host_data = reinterpret_cast<void *>(slice.address);
+            view.value = slice.value;
+            view.length = slice.length;
+            view.offset = static_cast<size_t>(slice.address - group.base);
+            view.upload = source->upload;
+            view.download = source->download;
+            output.push_back(std::move(view));
+        }
+    }
+    return status;
+}
+
 static CommandProgramBindings materialize_host_bindings(const CommandProgramExecutionContext & context,
                                                         const CommandProgram &                 commands,
                                                         const CommandProgramBindings &         bindings,
@@ -382,6 +485,8 @@ static CommandProgramBindings materialize_host_bindings(const CommandProgramExec
     Status                             status;
     materialized.reserve(bindings.bindings().size());
     const std::unordered_map<int32_t, GraphValueAccess> access_by_value = collect_graph_value_access(commands);
+    std::vector<HostStagingBuffer> staging_sources;
+    std::vector<HostStagingSlice> slices;
     for (const CommandProgramBinding & binding : bindings.bindings()) {
         if (!binding.requires_materialization()) {
             materialized.push_back(binding);
@@ -390,7 +495,31 @@ static CommandProgramBindings materialize_host_bindings(const CommandProgramExec
         const auto             found_access = access_by_value.find(binding.value.value);
         const GraphValueAccess access =
             found_access != access_by_value.end() ? found_access->second : GraphValueAccess{};
+        const uintptr_t host_base = reinterpret_cast<uintptr_t>(binding.host_data);
+        if (binding.offset > binding.capacity || binding.length > binding.capacity - binding.offset ||
+            binding.offset > std::numeric_limits<uintptr_t>::max() - host_base ||
+            binding.length > std::numeric_limits<uintptr_t>::max() - (host_base + binding.offset)) {
+            status.log("invalid host binding range for value %d", binding.value.value);
+            materialized.push_back(binding);
+            continue;
+        }
+        const uintptr_t address = host_base + binding.offset;
+        bool overlaps_writer = false;
         if (binding.weight && access.read && !access.write) {
+            for (const auto & other : bindings.bindings()) {
+                const auto writer = access_by_value.find(other.value.value);
+                if (other.host_data == nullptr || writer == access_by_value.end() || !writer->second.write) {
+                    continue;
+                }
+                const uintptr_t base = reinterpret_cast<uintptr_t>(other.host_data);
+                if (other.offset > std::numeric_limits<uintptr_t>::max() - base) {
+                    continue;
+                }
+                const uintptr_t at = base + other.offset;
+                overlaps_writer |= address <= at ? at - address < binding.length : address - at < other.length;
+            }
+        }
+        if (binding.weight && access.read && !access.write && !overlaps_writer) {
             HostWeightSource source;
             source.host_data  = binding.host_data;
             source.identity   = binding.identity;
@@ -417,24 +546,33 @@ static CommandProgramBindings materialize_host_bindings(const CommandProgramExec
         }
 
         HostStagingBuffer staging;
-        Status            allocation_status = allocate_host_staging_buffer(context.device, binding.length, staging);
-        if (!allocation_status.success()) {
-            status.log("allocate host staging for value %d failed", binding.value.value);
-            status.append(allocation_status);
-            materialized.push_back(binding);
-            continue;
-        }
         staging.value                        = binding.value.value;
-        staging.host_data                    = static_cast<uint8_t *>(binding.host_data) + binding.offset;
+        staging.host_data                    = reinterpret_cast<void *>(address);
+        staging.length                       = binding.length;
         staging.upload                       = access.read;
         staging.download                     = access.write;
-        CommandProgramBinding device_binding = binding;
-        device_binding.buffer                = staging.buffer;
-        device_binding.host_data             = nullptr;
-        device_binding.offset                = 0;
-        device_binding.capacity              = binding.length;
-        materialized.push_back(device_binding);
-        prepared.host_staging.push_back(std::move(staging));
+        if (mtp_host_trace.phase != nullptr && binding.tensor != nullptr) {
+            prepared.host_trace_tensors.push_back({ staging.value, binding.tensor });
+        }
+        slices.push_back({ staging.value, address, binding.length });
+        staging_sources.push_back(std::move(staging));
+        materialized.push_back(binding);
+    }
+    std::vector<HostStagingGroup> groups;
+    status.append(plan_host_staging_groups(std::move(slices), groups));
+    if (status.success()) {
+        status.append(allocate_host_staging_groups(context.device, staging_sources, groups, prepared.host_staging));
+    }
+    if (status.success()) {
+        for (auto & binding : materialized) {
+            const auto * staging = find_host_staging(prepared.host_staging, binding.value.value);
+            if (staging != nullptr) {
+                binding.buffer = staging->buffer;
+                binding.host_data = nullptr;
+                binding.offset = staging->offset;
+                binding.capacity = staging->offset + staging->length;
+            }
+        }
     }
     return CommandProgramBindings::from_bindings(std::move(materialized), status);
 }
@@ -620,8 +758,11 @@ static Status prepare_program_constant_buffers(const CommandProgramExecutionCont
     return status;
 }
 
-static Status rebind_prepared_host_staging(const CommandProgramBindings & bindings, PreparedCommandProgram & prepared) {
+static Status rebind_prepared_host_staging(const CommandProgramExecutionContext & context,
+                                           const CommandProgramBindings & bindings, PreparedCommandProgram & prepared) {
     Status status;
+    prepared.host_trace_tensors.clear();
+    std::vector<HostStagingSlice> slices;
     for (HostStagingBuffer & staging : prepared.host_staging) {
         const CommandProgramBinding * binding = bindings.find(ValueId(staging.value));
         if (binding == nullptr || binding->host_data == nullptr || binding->length != staging.length ||
@@ -629,7 +770,51 @@ static Status rebind_prepared_host_staging(const CommandProgramBindings & bindin
             status.log("live host binding does not match prepared value %d", staging.value);
             continue;
         }
-        staging.host_data = static_cast<uint8_t *>(binding->host_data) + binding->offset;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(binding->host_data);
+        if (binding->offset > std::numeric_limits<uintptr_t>::max() - base) {
+            status.log("overflowed live host address for value %d", staging.value);
+            continue;
+        }
+        slices.push_back({ staging.value, base + binding->offset, staging.length });
+        if (mtp_host_trace.phase != nullptr && binding->tensor != nullptr) {
+            prepared.host_trace_tensors.push_back({ staging.value, binding->tensor });
+        }
+    }
+    std::vector<HostStagingGroup> groups;
+    status.append(plan_host_staging_groups(std::move(slices), groups));
+    if (!status.success()) {
+        return status;
+    }
+    bool compatible = true;
+    std::unordered_set<hrx_buffer_t> used;
+    for (const auto & group : groups) {
+        const auto * first = find_host_staging(prepared.host_staging, group.slices.front().value);
+        compatible &= first != nullptr && first->buffer != nullptr && used.insert(first->buffer).second;
+        for (const auto & slice : group.slices) {
+            const auto * existing = find_host_staging(prepared.host_staging, slice.value);
+            compatible &= existing != nullptr && first != nullptr && existing->buffer == first->buffer &&
+                          existing->offset == slice.address - group.base;
+        }
+    }
+    if (compatible) {
+        for (auto & staging : prepared.host_staging) {
+            const auto * binding = bindings.find(ValueId(staging.value));
+            staging.host_data = static_cast<uint8_t *>(binding->host_data) + binding->offset;
+        }
+    } else {
+        // A cached graph shape can acquire a different physical alias topology.
+        // Finish prior uses before replacing their shared allocations; updated
+        // command references below also invalidate any recorded graph.
+        if (ErrorResult error = take_status(hrx_stream_synchronize(context.stream))) {
+            status.log("synchronize changed host staging layout: %s", error->c_str());
+            return status;
+        }
+        std::vector<HostStagingBuffer> rebound;
+        status.append(allocate_host_staging_groups(context.device, prepared.host_staging, groups, rebound));
+        if (status.success()) {
+            prepared.host_staging = std::move(rebound);
+            prepared.graph_bindings_dirty = true;
+        }
     }
     return status;
 }
@@ -642,6 +827,7 @@ static Status rebind_prepared_host_staging(const CommandProgramBindings & bindin
 // destination untouched. Returns true through `changed` when any address moved, so a recorded graph that baked
 // these references in can be re-recorded.
 static Status rebind_prepared_graph_value_list(const CommandProgramBindings & bindings,
+                                               const std::vector<HostStagingBuffer> & host_staging,
                                                std::vector<PreparedCommand> & commands,
                                                bool &                         changed) {
     Status status;
@@ -651,9 +837,10 @@ static Status rebind_prepared_graph_value_list(const CommandProgramBindings & bi
                 continue;
             }
             const CommandProgramBinding * concrete = bindings.find(binding.binding.value);
-            // Host-staged and resident-weight values were materialized onto runtime-owned buffers at prepare
-            // time and are refreshed by their own rebind paths; only true device bindings are refreshed here.
-            if (concrete == nullptr || concrete->buffer == nullptr) {
+            const auto * staged = find_host_staging(host_staging, binding.binding.value.value);
+            // Immutable resident weights keep their cache lease. Mutable host
+            // aliases and direct device values both need live buffer/offsets.
+            if (concrete == nullptr || (concrete->buffer == nullptr && staged == nullptr)) {
                 continue;
             }
             if (binding.binding.offset > concrete->length ||
@@ -663,8 +850,8 @@ static Status rebind_prepared_graph_value_list(const CommandProgramBindings & bi
                 continue;
             }
             const ResolvedBufferRef ref = {
-                concrete->buffer,
-                concrete->offset + binding.binding.offset,
+                staged != nullptr ? staged->buffer : concrete->buffer,
+                (staged != nullptr ? staged->offset : concrete->offset) + binding.binding.offset,
                 binding.binding.length,
             };
             if (ref.buffer != binding.ref.buffer || ref.offset != binding.ref.offset ||
@@ -681,8 +868,9 @@ static Status rebind_prepared_graph_values(const CommandProgramBindings & bindin
                                            PreparedCommandProgram &       prepared,
                                            bool &                         changed) {
     Status status;
-    status.append(rebind_prepared_graph_value_list(bindings, prepared.initialization_commands, changed));
-    status.append(rebind_prepared_graph_value_list(bindings, prepared.commands, changed));
+    status.append(rebind_prepared_graph_value_list(bindings, prepared.host_staging, prepared.initialization_commands, changed));
+    status.append(rebind_prepared_graph_value_list(bindings, prepared.host_staging, prepared.commands, changed));
+    prepared.graph_bindings_dirty |= changed;
     return status;
 }
 
@@ -712,16 +900,121 @@ static void trace_prepared_program(const char * label, const PreparedCommandProg
         }
     }
     for (const HostStagingBuffer & staging : prepared.host_staging) {
-        GGML_LOG_ERROR("HRX program   staging value=%d upload=%d download=%d buffer=%p host=%p len=%zu\n", staging.value,
+        GGML_LOG_ERROR("HRX program   staging value=%d upload=%d download=%d buffer=%p host=%p offset=%zu len=%zu\n", staging.value,
                        static_cast<int>(staging.upload), static_cast<int>(staging.download),
                        static_cast<const void *>(staging.buffer), static_cast<const void *>(staging.host_data),
-                       staging.length);
+                       staging.offset, staging.length);
+    }
+}
+
+static const ggml_tensor * host_trace_tensor(const PreparedCommandProgram & prepared, int32_t value) {
+    for (const auto & entry : prepared.host_trace_tensors) {
+        if (entry.value == value) {
+            return entry.tensor;
+        }
+    }
+    return nullptr;
+}
+
+static void trace_mtp_host_boundary(const PreparedCommandProgram & prepared, const HostStagingBuffer & staging,
+                                    const char * boundary) {
+    auto & trace = mtp_host_trace;
+    if (trace.phase == nullptr || trace.events >= 512 || staging.host_data == nullptr) {
+        return;
+    }
+    const auto * tensor = host_trace_tensor(prepared, staging.value);
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+        staging.length != ggml_nbytes(tensor) || staging.length > 1024 * 1024 ||
+        staging.length > 64 * 1024 * 1024 - trace.bytes) {
+        return;
+    }
+    ++trace.events;
+    trace.bytes += staging.length;
+    const size_t count = staging.length / sizeof(float);
+    size_t nonfinite = 0, first_bad = count;
+    uint32_t first_bits = 0;
+    float minimum = 0.0f, maximum = 0.0f;
+    size_t finite = 0;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < count; ++i) {
+        float value;
+        uint32_t bits;
+        const auto * data = static_cast<const uint8_t *>(staging.host_data) + i * sizeof(value);
+        std::memcpy(&value, data, sizeof(value));
+        std::memcpy(&bits, data, sizeof(bits));
+        hash = (hash ^ bits) * UINT64_C(1099511628211);
+        if (std::isfinite(value)) {
+            minimum = finite == 0 ? value : std::min(minimum, value);
+            maximum = finite == 0 ? value : std::max(maximum, value);
+            ++finite;
+        } else {
+            if (nonfinite++ == 0) {
+                first_bad = i;
+                first_bits = bits;
+            }
+        }
+    }
+    GGML_LOG_ERROR("HRX MTP host %s phase=%s call=%llu program=%zu event=%zu value=%d name=%s op=%s "
+                   "host=%p device=%p device_offset=%zu bytes=%zu ne=[%lld,%lld,%lld,%lld] "
+                   "nonfinite=%zu first_bad=%zu bits=%08x min=%g max=%g hash=%016llx\n",
+                   boundary, trace.phase, static_cast<unsigned long long>(trace.call), trace.program, trace.events,
+                   staging.value, tensor->name, ggml_op_name(tensor->op), staging.host_data,
+                   static_cast<const void *>(staging.buffer), staging.offset, staging.length,
+                   static_cast<long long>(tensor->ne[0]), static_cast<long long>(tensor->ne[1]),
+                   static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]),
+                   nonfinite, first_bad, first_bits, minimum, maximum, static_cast<unsigned long long>(hash));
+    if (nonfinite != 0 && std::strcmp(boundary, "upload") == 0) {
+        for (size_t i = 0; i < 6; ++i) {
+            const auto * source = tensor->src[i];
+            if (source != nullptr) {
+                GGML_LOG_ERROR("HRX MTP host CPU-producer edge: output=%s src[%zu]=%s op=%s type=%s "
+                               "data=%p ne=[%lld,%lld,%lld,%lld] (metadata only; source may be overwritten)\n",
+                               tensor->name, i, source->name, ggml_op_name(source->op), ggml_type_name(source->type),
+                               source->data, static_cast<long long>(source->ne[0]), static_cast<long long>(source->ne[1]),
+                               static_cast<long long>(source->ne[2]), static_cast<long long>(source->ne[3]));
+            }
+        }
+    }
+    size_t printed = 0;
+    for (const auto & command : prepared.commands) {
+        for (size_t i = 0; i < command.kernel.bindings.size() && printed < 8; ++i) {
+            const auto & binding = command.kernel.bindings[i];
+            if (binding.binding.origin == CommandBindingOrigin::GraphValue &&
+                binding.binding.value.value == staging.value) {
+                ++printed;
+                GGML_LOG_ERROR("HRX MTP host use: value=%d ord=%u kernel=%llu binding=%zu access=%d "
+                               "buffer=%p offset=%zu span=%zu\n",
+                               staging.value, command.ordinal,
+                               static_cast<unsigned long long>(command.kernel.specialization.kernel_id),
+                               i, static_cast<int>(binding.binding.access), static_cast<const void *>(binding.ref.buffer),
+                               binding.ref.offset, binding.ref.length);
+            }
+        }
+    }
+    printed = 0;
+    for (const auto & other : prepared.host_staging) {
+        if (other.value == staging.value || other.host_data == nullptr || (!other.upload && !other.download)) {
+            continue;
+        }
+        const uintptr_t a = reinterpret_cast<uintptr_t>(staging.host_data);
+        const uintptr_t b = reinterpret_cast<uintptr_t>(other.host_data);
+        if ((a <= b ? b - a < staging.length : a - b < other.length) && printed++ < 8) {
+            const auto * alias = host_trace_tensor(prepared, other.value);
+            GGML_LOG_ERROR("HRX MTP host overlapping range: value=%d other=%d name=%s host=%p bytes=%zu "
+                           "device=%p device_offset=%zu upload=%d download=%d (overlap alone does not establish a live alias)\n",
+                           staging.value, other.value, alias == nullptr ? "?" : alias->name, other.host_data,
+                           other.length, static_cast<const void *>(other.buffer), other.offset, static_cast<int>(other.upload),
+                           static_cast<int>(other.download));
+        }
     }
 }
 
 static Status upload_prepared_host_staging(const CommandProgramExecutionContext & context,
                                            const PreparedCommandProgram &         prepared) {
     Status status;
+    if (mtp_host_trace.phase != nullptr) {
+        ++mtp_host_trace.program;
+    }
     if (prepared.host_staging.empty()) {
         return status;
     }
@@ -733,8 +1026,9 @@ static Status upload_prepared_host_staging(const CommandProgramExecutionContext 
         if (!staging.upload) {
             continue;
         }
+        trace_mtp_host_boundary(prepared, staging, "upload");
         Status upload_status =
-            context.host_transfers->upload_async(context.stream, staging.host_data, staging.buffer, 0, staging.length);
+            context.host_transfers->upload_async(context.stream, staging.host_data, staging.buffer, staging.offset, staging.length);
         status.append(upload_status);
     }
     return status;
@@ -755,8 +1049,11 @@ static Status download_prepared_host_staging(const CommandProgramExecutionContex
             continue;
         }
         Status download_status = context.host_transfers->download_synchronous(
-            context.stream, staging.buffer, 0, staging.host_data, staging.length);
+            context.stream, staging.buffer, staging.offset, staging.host_data, staging.length);
         status.append(download_status);
+        if (download_status.success()) {
+            trace_mtp_host_boundary(prepared, staging, "download");
+        }
     }
     return status;
 }
@@ -807,6 +1104,183 @@ static Status prepare_kernel_command(const CommandProgramExecutionContext & cont
     return status;
 }
 
+static bool validate_q4_routed_ids(const CommandProgramExecutionContext & context, const PreparedCommand & command) {
+    const auto & bindings = command.kernel.bindings;
+    const auto & parameters = command.kernel.specialization.integer_parameters;
+    const auto parameter = [&parameters](const char * name) -> int64_t {
+        const auto found = parameters.find(name);
+        return found == parameters.end() ? -1 : found->second;
+    };
+    const int64_t tokens = parameter("token_count");
+    const int64_t routes = parameter("route_count");
+    const int64_t stride = parameter("route_stride");
+    const int64_t experts = parameter("expert_count");
+    const int64_t outputs = parameter("output_size");
+    const size_t required = q4_routed_gate_up_id_byte_count(tokens, routes, stride, experts);
+    if (required == 0 || outputs < 1 || outputs > 4096 ||
+        (bindings.size() != 5 && bindings.size() != 7) || context.host_transfers == nullptr) {
+        GGML_LOG_ERROR("HRX Q4 routed gate/up: invalid validation layout at ord=%u\n", command.ordinal);
+        return false;
+    }
+    const auto & config = command.kernel.specialization.compile_parameters;
+    const auto input_config = config.find("qwen3_moe.routed_gate_up.input_size");
+    char * end = nullptr;
+    const int64_t width = input_config == config.end() ? 0 : std::strtoll(input_config->second.c_str(), &end, 10);
+    if (width < 512 || width > 32768 || width % 512 != 0 || end == nullptr || *end != '\0') {
+        GGML_LOG_ERROR("HRX Q4 routed gate/up: invalid input width at ord=%u\n", command.ordinal);
+        return false;
+    }
+    const auto & ids = bindings[1].ref;
+    const size_t weight_bytes = static_cast<size_t>(experts * outputs * (width / 256)) * 144;
+    const size_t input_bytes = static_cast<size_t>(tokens * (width / 128)) * 144;
+    const size_t output_bytes = static_cast<size_t>(tokens * routes * outputs) * sizeof(float);
+    if (ids.offset % sizeof(int32_t) != 0 || ids.length < required ||
+        bindings[0].ref.length < input_bytes || bindings[2].ref.length < weight_bytes ||
+        bindings[3].ref.length < weight_bytes || bindings[4].ref.length < output_bytes ||
+        bindings[0].ref.offset % 2 != 0 || bindings[2].ref.offset % 2 != 0 ||
+        bindings[3].ref.offset % 2 != 0 || bindings[4].ref.offset % sizeof(float) != 0) {
+        GGML_LOG_ERROR("HRX Q4 routed gate/up: misaligned or undersized binding at ord=%u\n", command.ordinal);
+        return false;
+    }
+    if (bindings.size() == 7) {
+        const size_t groups = static_cast<size_t>(tokens * routes * (outputs / 128));
+        if (tokens != 1 || outputs % 128 != 0 || bindings[5].ref.offset % 16 != 0 ||
+            bindings[5].ref.length < groups * sizeof(int32_t) || bindings[6].ref.offset % 2 != 0 ||
+            bindings[6].ref.length < groups * 144) {
+            GGML_LOG_ERROR("HRX Q4 routed gate/up: invalid next-Q8/counter span at ord=%u\n", command.ordinal);
+            return false;
+        }
+    }
+    // Check actual bound ranges, not GGML storage identities: gallocr can reuse
+    // one physical allocation for distinct values inside a fused graph.
+    for (size_t write = 4; write < bindings.size(); ++write) {
+        const auto & output = bindings[write].ref;
+        for (size_t other = 0; other < write; ++other) {
+            const auto & input = bindings[other].ref;
+            if (input.buffer == nullptr || output.buffer == nullptr ||
+                (input.buffer == output.buffer &&
+                 (input.offset <= output.offset ? output.offset - input.offset < input.length :
+                                                  input.offset - output.offset < output.length))) {
+                GGML_LOG_ERROR("HRX Q4 routed gate/up: overlapping/missing bindings %zu/%zu at ord=%u\n",
+                               other, write, command.ordinal);
+                return false;
+            }
+        }
+    }
+    std::vector<uint8_t> bytes(required);
+    // Commands are submitted in producer order. This readback waits for router
+    // writes on the same stream, on every invocation (including cached plans).
+    const Status status = context.host_transfers->download_synchronous(
+        context.stream, ids.buffer, ids.offset, bytes.data(), bytes.size());
+    if (!status.success()) {
+        GGML_LOG_ERROR("HRX Q4 routed gate/up: ordered ID readback failed at ord=%u: %s\n",
+                       command.ordinal, status_first_error(status));
+        return false;
+    }
+    const auto checked = validate_q4_routed_gate_up_id_bytes(bytes.data(), bytes.size(), tokens, routes, stride, experts);
+    if (!checked.valid) {
+        GGML_LOG_ERROR("HRX Q4 routed gate/up: invalid expert ID=%lld token=%lld route=%lld "
+                       "experts=%lld stride=%lld ord=%u IDs buffer=%p offset=%zu span=%zu\n",
+                       static_cast<long long>(checked.invalid_id), static_cast<long long>(checked.token),
+                       static_cast<long long>(checked.route), static_cast<long long>(experts),
+                       static_cast<long long>(stride), command.ordinal,
+                       static_cast<const void *>(ids.buffer), ids.offset, bytes.size());
+        return false;
+    }
+    if (hrx_environment_flag("HRX_TRACE_PROGRAM")) {
+        GGML_LOG_ERROR("HRX Q4 routed gate/up: validated ord=%u experts=%lld stride=%lld token0 IDs:",
+                       command.ordinal, static_cast<long long>(experts), static_cast<long long>(stride));
+        for (int64_t route = 0; route < routes; ++route) {
+            int32_t id;
+            std::memcpy(&id, bytes.data() + route * sizeof(id), sizeof(id));
+            GGML_LOG_ERROR(" %d", id);
+        }
+        GGML_LOG_ERROR("\n");
+    }
+    return true;
+}
+
+static bool validate_row_ids(const CommandProgramExecutionContext & context, const PreparedCommand & command) {
+    if (is_q4_routed_gate_up_kernel(command.kernel.specialization.kernel_id)) {
+        return validate_q4_routed_ids(context, command);
+    }
+    const bool set_rows = is_set_rows_kernel(command.kernel.specialization.kernel_id);
+    const bool f32_get_rows = is_f32_get_rows_kernel(command.kernel.specialization.kernel_id);
+    const bool q4_embedding = is_q4_embedding_kernel(command.kernel.specialization.kernel_id);
+    const bool embedding = q4_embedding || is_q8_embedding_kernel(command.kernel.specialization.kernel_id);
+    if (!set_rows && !embedding && !f32_get_rows) {
+        return true;
+    }
+    const char * operation = set_rows ? "SET_ROWS" :
+                            f32_get_rows ? "F32 GET_ROWS" : (q4_embedding ? "Q4 GET_ROWS" : "Q8 GET_ROWS");
+    if (command.kernel.bindings.size() != 3 || context.host_transfers == nullptr) {
+        GGML_LOG_ERROR("HRX %s: missing validation bindings\n", operation);
+        return false;
+    }
+    const auto & source = command.kernel.bindings[0].ref;
+    const auto & ids = command.kernel.bindings[1].ref;
+    const auto & output = command.kernel.bindings[2].ref;
+    const auto overlaps_output = [&output](const auto & input) {
+        return input.buffer == output.buffer &&
+               (input.offset <= output.offset ? output.offset - input.offset < input.length :
+                                                input.offset - output.offset < output.length);
+    };
+    // Allocator reuse can overlap distinct GGML storage roots. Check the bound ranges on every replay.
+    if (overlaps_output(source) || overlaps_output(ids)) {
+        GGML_LOG_ERROR("HRX %s: source or IDs overlap the destination\n", operation);
+        return false;
+    }
+    const auto & parameters = command.kernel.specialization.integer_parameters;
+    const size_t count = static_cast<size_t>(parameters.at(set_rows ? "row_count" : "token_count"));
+    const size_t index_size = set_rows && parameters.at("index_i64") ? sizeof(int64_t) : sizeof(int32_t);
+    const size_t stride = set_rows ? static_cast<size_t>(parameters.at("index_stride")) * index_size : index_size;
+    const int64_t capacity = parameters.at(set_rows ? "cache_rows" : "vocabulary_count");
+    if (embedding || f32_get_rows) {
+        const size_t width = static_cast<size_t>(parameters.at("hidden_size"));
+        const size_t row_bytes = f32_get_rows ? width * sizeof(float) :
+                                q4_embedding ? width / 256 * 144 : width / 32 * 34;
+        const size_t source_alignment = f32_get_rows ? sizeof(float) : sizeof(uint16_t);
+        if (source.offset % source_alignment != 0 || ids.offset % sizeof(int32_t) != 0 ||
+            output.offset % sizeof(float) != 0 ||
+            source.length < row_bytes * static_cast<size_t>(capacity) ||
+            output.length < width * count * sizeof(float)) {
+            GGML_LOG_ERROR("HRX %s: misaligned or undersized binding\n", operation);
+            return false;
+        }
+    }
+    if (count == 0 || stride == 0 || ids.length < index_size ||
+        (count - 1) > (ids.length - index_size) / stride) {
+        GGML_LOG_ERROR("HRX %s: index binding is too small\n", operation);
+        return false;
+    }
+    std::vector<uint8_t> bytes((count - 1) * stride + index_size);
+    // This waits on preceding producers, including GPU-generated top-k IDs.
+    Status status = context.host_transfers->download_synchronous(
+        context.stream, ids.buffer, ids.offset, bytes.data(), bytes.size());
+    if (!status.success()) {
+        GGML_LOG_ERROR("HRX %s: index validation readback failed: %s\n", operation, status_first_error(status));
+        return false;
+    }
+    std::unordered_set<int64_t> seen;
+    for (size_t row = 0; row < count; ++row) {
+        int64_t id = 0;
+        if (index_size == sizeof(int64_t)) {
+            std::memcpy(&id, bytes.data() + row * stride, sizeof(id));
+        } else {
+            int32_t narrow = 0;
+            std::memcpy(&narrow, bytes.data() + row * stride, sizeof(narrow));
+            id = narrow;
+        }
+        if (id < 0 || id >= capacity || (set_rows && !seen.insert(id).second)) {
+            GGML_LOG_ERROR("HRX %s: invalid%s row ID %lld at source row %zu (capacity %lld)\n",
+                           operation, set_rows ? " or duplicate" : "",
+                           static_cast<long long>(id), row, static_cast<long long>(capacity));
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool execute_prepared_kernel_command(const CommandProgramExecutionContext & context,
                                             const PreparedCommand &                command) {
     const bool timing = hrx_time_compute_enabled();
@@ -819,6 +1293,9 @@ static bool execute_prepared_kernel_command(const CommandProgramExecutionContext
     }
     if (command.kernel.executable == nullptr) {
         GGML_LOG_ERROR("%s: missing kernel executable for %s\n", __func__, command_context.c_str());
+        return false;
+    }
+    if (!validate_row_ids(context, command)) {
         return false;
     }
 
@@ -932,10 +1409,131 @@ static bool bind_prepared_command_list_transients(const CommandProgram &        
     return true;
 }
 
+static void report_router_logits(const char * label, const void * data, size_t count) {
+    size_t finite = 0, nan = 0, positive_inf = 0, negative_inf = 0;
+    size_t first_nonfinite = count;
+    float minimum = 0.0f, maximum = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        float value;
+        std::memcpy(&value, static_cast<const uint8_t *>(data) + i * sizeof(value), sizeof(value));
+        if (std::isfinite(value)) {
+            minimum = finite == 0 ? value : std::min(minimum, value);
+            maximum = finite == 0 ? value : std::max(maximum, value);
+            ++finite;
+        } else if (std::isnan(value)) {
+            ++nan;
+        } else if (value > 0.0f) {
+            ++positive_inf;
+        } else {
+            ++negative_inf;
+        }
+        if (!std::isfinite(value) && first_nonfinite == count) {
+            first_nonfinite = i;
+        }
+    }
+    GGML_LOG_ERROR("HRX router failure %s: count=%zu finite=%zu nan=%zu +inf=%zu -inf=%zu min=%g max=%g\n",
+                   label, count, finite, nan, positive_inf, negative_inf, minimum, maximum);
+    if (first_nonfinite < count) {
+        uint32_t bits;
+        std::memcpy(&bits, static_cast<const uint8_t *>(data) + first_nonfinite * sizeof(float), sizeof(bits));
+        GGML_LOG_ERROR("HRX router failure %s: first_nonfinite=%zu bits=%08x\n", label, first_nonfinite, bits);
+    }
+    for (size_t i = 0; i < std::min(count, size_t{16}); ++i) {
+        float value;
+        uint32_t bits;
+        const auto * at = static_cast<const uint8_t *>(data) + i * sizeof(value);
+        std::memcpy(&value, at, sizeof(value));
+        std::memcpy(&bits, at, sizeof(bits));
+        GGML_LOG_ERROR("HRX router failure %s[%zu]=%.9g bits=%08x\n", label, i, value, bits);
+    }
+}
+
+static void diagnose_router_input(const CommandProgramExecutionContext & context, const char * label,
+                                  const PreparedCommandBinding & binding,
+                                  const std::vector<HostStagingBuffer> & staging, size_t max_floats) {
+    const auto & input = binding.ref;
+    const size_t bytes = std::min(input.length, max_floats * sizeof(float));
+    if (input.buffer == nullptr || bytes == 0 || bytes % sizeof(float) != 0) {
+        return;
+    }
+    GGML_LOG_ERROR("HRX router failure %s: value=%d buffer=%p offset=%zu span=%zu\n",
+                   label, binding.binding.value.value, static_cast<const void *>(input.buffer),
+                   input.offset, input.length);
+    std::vector<uint8_t> device(bytes);
+    const Status status = context.host_transfers->download_synchronous(
+        context.stream, input.buffer, input.offset, device.data(), bytes);
+    if (!status.success()) {
+        GGML_LOG_ERROR("HRX router failure %s readback failed: %s\n", label, status_first_error(status));
+        return;
+    }
+    report_router_logits(label, device.data(), bytes / sizeof(float));
+    for (const auto & host : staging) {
+        if (host.buffer != input.buffer || host.host_data == nullptr || input.offset < host.offset ||
+            input.offset - host.offset > host.length || bytes > host.length - (input.offset - host.offset)) {
+            continue;
+        }
+        const auto * data = static_cast<const uint8_t *>(host.host_data) + (input.offset - host.offset);
+        GGML_LOG_ERROR("HRX router failure CPU mirror (%s): value=%d host=%p upload=%d download=%d equal=%d\n",
+                       label, host.value, static_cast<const void *>(data), static_cast<int>(host.upload),
+                       static_cast<int>(host.download), std::memcmp(data, device.data(), bytes) == 0);
+        report_router_logits("CPU staging mirror", data, bytes / sizeof(float));
+    }
+}
+
+static void diagnose_q4_router_failure(const CommandProgramExecutionContext & context,
+                                      const std::vector<PreparedCommand> & commands, size_t failed,
+                                      const std::vector<HostStagingBuffer> & staging) {
+    const PreparedCommand & consumer = commands[failed];
+    if (!is_q4_routed_gate_up_kernel(consumer.kernel.specialization.kernel_id) ||
+        consumer.kernel.bindings.size() < 2 || context.host_transfers == nullptr) {
+        return;
+    }
+    const auto & ids = consumer.kernel.bindings[1].ref;
+    for (size_t i = failed; i-- > 0;) {
+        const PreparedCommand & producer = commands[i];
+        if (!is_moe_router_top8_kernel(producer.kernel.specialization.kernel_id) ||
+            producer.kernel.bindings.size() != 3) {
+            continue;
+        }
+        const auto & output_ids = producer.kernel.bindings[1].ref;
+        if (output_ids.buffer != ids.buffer || output_ids.offset != ids.offset) {
+            continue;
+        }
+        GGML_LOG_ERROR("HRX router failure producer: %s\n", format_prepared_command_context(producer).c_str());
+        for (size_t binding = 0; binding < producer.kernel.bindings.size(); ++binding) {
+            const auto & bound = producer.kernel.bindings[binding];
+            GGML_LOG_ERROR("HRX router failure binding[%zu]: value=%d buffer=%p offset=%zu span=%zu\n",
+                           binding, bound.binding.value.value, static_cast<const void *>(bound.ref.buffer),
+                           bound.ref.offset, bound.ref.length);
+        }
+        // Failure-only: no extra synchronization or partition boundary before
+        // the error. These are post-router bytes, not a pre-launch snapshot.
+        diagnose_router_input(context, "post-router GPU logits", producer.kernel.bindings[0], staging, 512);
+        static constexpr KernelCatalogRef pack_kernel =
+            GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_quantize_q8_1_x4_f32");
+        for (size_t pack = i + 1; pack < failed; ++pack) {
+            const auto & command = commands[pack];
+            if (command.kernel.specialization.kernel_id != pack_kernel.id ||
+                command.kernel.bindings.size() != 2 || consumer.kernel.bindings.empty()) {
+                continue;
+            }
+            const auto & packed = command.kernel.bindings[1].ref;
+            const auto & gate_input = consumer.kernel.bindings[0].ref;
+            if (packed.buffer == gate_input.buffer && packed.offset == gate_input.offset) {
+                diagnose_router_input(context, "post-pack GPU FFN input", command.kernel.bindings[0], staging, 4096);
+            }
+        }
+        return;
+    }
+}
+
 static bool execute_prepared_command_list(const CommandProgramExecutionContext & context,
-                                          const std::vector<PreparedCommand> &   commands) {
-    for (const PreparedCommand & command : commands) {
+                                          const std::vector<PreparedCommand> &   commands,
+                                          const std::vector<HostStagingBuffer> & staging) {
+    for (size_t i = 0; i < commands.size(); ++i) {
+        const PreparedCommand & command = commands[i];
         if (!execute_prepared_kernel_command(context, command)) {
+            diagnose_q4_router_failure(context, commands, i, staging);
             return false;
         }
     }
@@ -1196,7 +1794,7 @@ bool bind_and_execute_prepared_command_program(const CommandProgramExecutionCont
     if (!prepared.valid()) {
         return execute_prepared_command_program(context, prepared);
     }
-    Status rebind_status = rebind_prepared_host_staging(bindings, prepared);
+    Status rebind_status = rebind_prepared_host_staging(context, bindings, prepared);
     if (!rebind_status.success()) {
         GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(rebind_status));
         return false;
@@ -1258,6 +1856,46 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     RecordedCommandGraph &                 recorded) {
     RecordedCommandGraphExecutionResult result;
     result.event = HrxGraphReplayEvent::Ineligible;
+    // Host validation is a dispatch boundary. A recorded graph must not bypass it or run consumers on failure.
+    const auto requires_validation = [](const PreparedCommand & command) {
+        return is_set_rows_kernel(command.kernel.specialization.kernel_id) ||
+               is_q4_routed_gate_up_kernel(command.kernel.specialization.kernel_id) ||
+               is_f32_get_rows_kernel(command.kernel.specialization.kernel_id) ||
+               is_q8_embedding_kernel(command.kernel.specialization.kernel_id) ||
+               is_q4_embedding_kernel(command.kernel.specialization.kernel_id);
+    };
+    if (std::any_of(prepared.commands.begin(), prepared.commands.end(), requires_validation) ||
+        std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), requires_validation)) {
+        const auto is_embedding = [](const PreparedCommand & command) {
+            return is_q8_embedding_kernel(command.kernel.specialization.kernel_id);
+        };
+        result.ineligible_reason =
+            std::any_of(prepared.commands.begin(), prepared.commands.end(), is_embedding) ||
+            std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), is_embedding) ?
+                "q8_embedding_requires_index_validation" : "set_rows_requires_index_validation";
+        const auto is_q4_embedding = [](const PreparedCommand & command) {
+            return is_q4_embedding_kernel(command.kernel.specialization.kernel_id);
+        };
+        if (std::any_of(prepared.commands.begin(), prepared.commands.end(), is_q4_embedding) ||
+            std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), is_q4_embedding)) {
+            result.ineligible_reason = "q4_embedding_requires_index_validation";
+        }
+        const auto is_f32_gather = [](const PreparedCommand & command) {
+            return is_f32_get_rows_kernel(command.kernel.specialization.kernel_id);
+        };
+        if (std::any_of(prepared.commands.begin(), prepared.commands.end(), is_f32_gather) ||
+            std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), is_f32_gather)) {
+            result.ineligible_reason = "f32_get_rows_requires_index_validation";
+        }
+        const auto is_q4_gate_up = [](const PreparedCommand & command) {
+            return is_q4_routed_gate_up_kernel(command.kernel.specialization.kernel_id);
+        };
+        if (std::any_of(prepared.commands.begin(), prepared.commands.end(), is_q4_gate_up) ||
+            std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), is_q4_gate_up)) {
+            result.ineligible_reason = "q4_routed_gate_up_requires_index_validation";
+        }
+        return result;
+    }
     const bool timing = hrx_time_compute_enabled();
     using clock       = std::chrono::steady_clock;
     const clock::time_point t_entry = timing ? clock::now() : clock::time_point{};
@@ -1275,7 +1913,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
         return result;
     }
 
-    Status rebind_status = rebind_prepared_host_staging(bindings, prepared);
+    Status rebind_status = rebind_prepared_host_staging(context, bindings, prepared);
     if (!rebind_status.success()) {
         result.status.append(rebind_status);
         result.event = HrxGraphReplayEvent::BuildFailed;
@@ -1325,7 +1963,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     const clock::time_point t_transient = timing ? clock::now() : clock::time_point{};
     result.transient_allocation_changed =
         had_recorded && recorded.bound_transient_arena_allocation_id != prepared.bound_transient_arena_allocation_id;
-    if (!had_recorded || result.transient_allocation_changed || graph_values_changed) {
+    if (!had_recorded || result.transient_allocation_changed || graph_values_changed || prepared.graph_bindings_dirty) {
         result.event =
             result.transient_allocation_changed ? HrxGraphReplayEvent::RebuildTransient : HrxGraphReplayEvent::MissBuild;
         const uint64_t build_start_ns = hrx_graph_replay_now_ns();
@@ -1337,6 +1975,7 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
             return result;
         }
         recorded = std::move(rebuilt);
+        prepared.graph_bindings_dirty = false;
     } else {
         result.event = HrxGraphReplayEvent::Hit;
     }
@@ -1422,8 +2061,8 @@ bool execute_prepared_command_program(const CommandProgramExecutionContext & con
         GGML_LOG_ERROR("%s: %s\n", __func__, status_first_error(upload_status));
         return false;
     }
-    if (!execute_prepared_command_list(context, commands.initialization_commands) ||
-        !execute_prepared_command_list(context, commands.commands)) {
+    if (!execute_prepared_command_list(context, commands.initialization_commands, commands.host_staging) ||
+        !execute_prepared_command_list(context, commands.commands, commands.host_staging)) {
         return false;
     }
     Status download_status = download_prepared_host_staging(context, commands);

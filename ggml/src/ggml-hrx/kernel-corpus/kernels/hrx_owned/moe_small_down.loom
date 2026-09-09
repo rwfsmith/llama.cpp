@@ -1,0 +1,119 @@
+// Owned small-T Qwen4Exp down projection. One wave owns one channel/token.
+// The activation packer and quant decode/dot helpers are linked, not duplicated.
+amdgpu.target<gfx11-generic> @ggml_moe_small_wave64 {subgroup_size = 64}
+
+func.decl @ggml_q8_1_x4_block(%input: buffer, %base: offset, %block: index) -> (vector<32xi8>, f32, f32)
+func.decl @qwen3_moe_q8_0_chunk_global(%weight: buffer, %base: offset, %block: index) -> (vector<16xi8>, vector<16xi8>, f32)
+func.decl @qwen3_moe_iq4_nl_chunk_global(%weight: buffer, %base: offset, %block: index) -> (vector<16xi8>, vector<16xi8>, f32)
+func.decl @qwen3_moe_q8_0_q8_1_dot(%weight: vector<16xi8>, %d: f32, %input: vector<16xi8>, %xd: f32) -> (f32)
+
+func.def inline @ggml_moe_small_down(%token_count: index, %route_id_stride: index, %input: buffer, %ids: buffer, %route_weights: buffer, %weight: buffer, %output: buffer, %q8: i1, %row_bytes: offset) {
+  %tokens = index.assume %token_count [range(%token_count, 2, 8)] : index
+  %stride = index.assume %route_id_stride [range(%route_id_stride, 10, 512)] : index
+  %token0 = kernel.workgroup.id<y> : index
+  %token, %ntokens = index.assume %token0, %tokens [lt(%token0, %tokens)] : index, index
+  %channel0 = kernel.workgroup.id<x> : index
+  %channel = index.assume %channel0 [range(%channel0, 0, 2559)] : index
+  %lane = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %ten = index.constant 10 : index
+  %twenty = index.constant 20 : index
+  %experts = index.constant 512 : index
+  %channels = index.constant 2560 : index
+  %zero_offset = index.constant 0 : offset
+  %four = index.constant 4 : offset
+  %packed_row_bytes = index.constant 720 : offset
+  %zero_f = scalar.constant 0.0 : f32
+  %true = scalar.constant true : i1
+  %nan = scalar.constant 2143289344 : i32
+  %id_row = index.mul %token, %stride : index
+  %id_base = index.scale %id_row, %four : index, offset -> offset
+  %id_view = buffer.view %ids[%id_base] : buffer -> view<10xi32>
+  %routes_view = buffer.view %route_weights[%zero_offset] : buffer -> view<[%ntokens]x10xf32>
+  %output_view = buffer.view %output[%zero_offset] : buffer -> view<[%ntokens]x2560xf32>
+  %output_bits = buffer.view %output[%zero_offset] : buffer -> view<[%ntokens]x2560xi32>
+  // Validate every ID before any weight read; invalid tokens publish NaN bits after reduction.
+  // Avoid an i1 loop-carried register-class phi on the pinned AMDGPU backend.
+  %valid = scf.for %r = [%zero to %ten step %one](%ok = %true : i1) -> (i1) unroll {
+    %route = index.assume %r [range(%r, 0, 9)] : index
+    %id = view.load %id_view[%route] : view<10xi32> -> i32
+    %expert = index.cast %id : i32 to index
+    %in_range = index.cmp ult, %expert, %experts : index
+    %next = scalar.andi %ok, %in_range : i1
+    scf.yield %next : i1
+  }
+  %active = index.cmp ult, %lane, %twenty : index
+  %compute = scalar.andi %valid, %active : i1
+  %partial = scf.if %compute -> (f32) {
+    %block = index.assume %lane [range(%lane, 0, 19)] : index
+    %sum = scf.for %r = [%zero to %ten step %one](%acc = %zero_f : f32) -> (f32) {
+      %route = index.assume %r [range(%r, 0, 9)] : index
+      %id = view.load %id_view[%route] : view<10xi32> -> i32
+      %expert0 = index.cast %id : i32 to index
+      %expert = index.assume %expert0 [range(%expert0, 0, 511)] : index
+      %expert_rows = index.mul %expert, %channels : index
+      %row = index.add %expert_rows, %channel : index
+      %wbase = index.scale %row, %row_bytes : index, offset -> offset
+      %token_routes = index.mul %token, %ten : index
+      %input_row = index.add %token_routes, %route : index
+      %xbase = index.scale %input_row, %packed_row_bytes : index, offset -> offset
+      %wl, %wh, %d = scf.if %q8 -> (vector<16xi8>, vector<16xi8>, f32) {
+        %lo, %hi, %scale = func.call @qwen3_moe_q8_0_chunk_global(%weight, %wbase, %block) : (buffer, offset, index) -> (vector<16xi8>, vector<16xi8>, f32)
+        scf.yield %lo, %hi, %scale : vector<16xi8>, vector<16xi8>, f32
+      } else {
+        %lo, %hi, %scale = func.call @qwen3_moe_iq4_nl_chunk_global(%weight, %wbase, %block) : (buffer, offset, index) -> (vector<16xi8>, vector<16xi8>, f32)
+        scf.yield %lo, %hi, %scale : vector<16xi8>, vector<16xi8>, f32
+      }
+      %x, %xd, %xs = func.call @ggml_q8_1_x4_block(%input, %xbase, %block) : (buffer, offset, index) -> (vector<32xi8>, f32, f32)
+      %xl = vector.slice %x[0] : vector<32xi8> -> vector<16xi8>
+      %xh = vector.slice %x[16] : vector<32xi8> -> vector<16xi8>
+      %lo = func.call @qwen3_moe_q8_0_q8_1_dot(%wl, %d, %xl, %xd) : (vector<16xi8>, f32, vector<16xi8>, f32) -> (f32)
+      %hi = func.call @qwen3_moe_q8_0_q8_1_dot(%wh, %d, %xh, %xd) : (vector<16xi8>, f32, vector<16xi8>, f32) -> (f32)
+      %dot = scalar.addf %lo, %hi : f32
+      %rw = view.load %routes_view[%token, %route] : view<[%ntokens]x10xf32> -> f32
+      %weighted = scalar.mulf %dot, %rw : f32
+      %next = scalar.addf %acc, %weighted : f32
+      scf.yield %next : f32
+    }
+    scf.yield %sum : f32
+  } else {
+    scf.yield %zero_f : f32
+  }
+  %sum = kernel.workgroup.reduce<addf> %partial : f32
+  %writer = index.cmp eq, %lane, %zero : index
+  scf.if %writer {
+    %bits = scf.if %valid -> (i32) {
+      %residual = view.load %output_view[%token, %channel] : view<[%ntokens]x2560xf32> -> f32
+      %result = scalar.addf %sum, %residual : f32
+      %value = scalar.bitcast %result : f32 to i32
+      scf.yield %value : i32
+    } else {
+      scf.yield %nan : i32
+    }
+    view.store %bits, %output_bits[%token, %channel] : i32, view<[%ntokens]x2560xi32>
+  }
+  func.return
+}
+
+kernel.def target(@ggml_moe_small_wave64) export("ggml_moe_small_down_q8_0") @ggml_moe_small_down_q8_0(%token_count: index, %input_size: index, %route_count: index, %route_id_stride: index, %expert_count: index, %output_size: index) {
+  %one = index.constant 1 : index
+  %wave = index.constant 64 : index
+  kernel.launch.config workgroups(%output_size, %token_count, %one) workgroup_size(%wave, %one, %one) : index
+} launch(%token_count: index, %input_size: index, %route_count: index, %route_id_stride: index, %expert_count: index, %output_size: index, %input: buffer, %ids: buffer, %route_weights: buffer, %weight: buffer, %output: buffer) {
+  %q8 = scalar.constant true : i1
+  %bytes = index.constant 680 : offset
+  func.call @ggml_moe_small_down(%token_count, %route_id_stride, %input, %ids, %route_weights, %weight, %output, %q8, %bytes) : (index, index, buffer, buffer, buffer, buffer, buffer, i1, offset)
+  kernel.return
+}
+
+kernel.def target(@ggml_moe_small_wave64) export("ggml_moe_small_down_iq4_nl") @ggml_moe_small_down_iq4_nl(%token_count: index, %input_size: index, %route_count: index, %route_id_stride: index, %expert_count: index, %output_size: index) {
+  %one = index.constant 1 : index
+  %wave = index.constant 64 : index
+  kernel.launch.config workgroups(%output_size, %token_count, %one) workgroup_size(%wave, %one, %one) : index
+} launch(%token_count: index, %input_size: index, %route_count: index, %route_id_stride: index, %expert_count: index, %output_size: index, %input: buffer, %ids: buffer, %route_weights: buffer, %weight: buffer, %output: buffer) {
+  %q8 = scalar.constant false : i1
+  %bytes = index.constant 360 : offset
+  func.call @ggml_moe_small_down(%token_count, %route_id_stride, %input, %ids, %route_weights, %weight, %output, %q8, %bytes) : (index, index, buffer, buffer, buffer, buffer, buffer, i1, offset)
+  kernel.return
+}

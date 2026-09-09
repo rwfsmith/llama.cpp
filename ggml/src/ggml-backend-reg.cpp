@@ -3,6 +3,7 @@
 #include "ggml-backend-dl.h"
 #include "ggml-impl.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -116,6 +117,9 @@ struct ggml_backend_reg_entry {
     dl_handle_ptr handle;
 };
 
+struct ggml_backend_registry;
+static std::atomic<ggml_backend_registry *> initialized_registry{nullptr};
+
 struct ggml_backend_registry {
     std::vector<ggml_backend_reg_entry> backends;
     std::vector<ggml_backend_dev_t> devices;
@@ -181,6 +185,7 @@ struct ggml_backend_registry {
     }
 
     ~ggml_backend_registry() {
+        initialized_registry.store(nullptr);
         // FIXME: backends cannot be safely unloaded without a function to destroy all the backend resources,
         // since backend threads may still be running and accessing resources from the dynamic library
         for (auto & entry : backends) {
@@ -285,6 +290,14 @@ struct ggml_backend_registry {
             GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
         }
 
+        auto shutdown = reinterpret_cast<ggml_backend_reg_shutdown_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_reg_shutdown"));
+        if (shutdown != nullptr && !shutdown(reg)) {
+            GGML_LOG_ERROR("%s: backend %s still has live resources or could not shut down\n",
+                           __func__, ggml_backend_reg_name(reg));
+            return;
+        }
+
         // remove devices
         devices.erase(
             std::remove_if(devices.begin(), devices.end(),
@@ -298,7 +311,26 @@ struct ggml_backend_registry {
 
 static ggml_backend_registry & get_reg() {
     static ggml_backend_registry reg;
+    initialized_registry.store(&reg);
     return reg;
+}
+
+bool ggml_backend_shutdown(void) {
+    auto * registry = initialized_registry.load();
+    if (registry == nullptr) {
+        return true;
+    }
+    bool success = true;
+    for (const auto & entry : registry->backends) {
+        auto shutdown = reinterpret_cast<ggml_backend_reg_shutdown_t>(
+            ggml_backend_reg_get_proc_address(entry.reg, "ggml_backend_reg_shutdown"));
+        if (shutdown != nullptr && !shutdown(entry.reg)) {
+            GGML_LOG_WARN("%s: backend %s still has live resources or could not shut down\n",
+                          __func__, ggml_backend_reg_name(entry.reg));
+            success = false;
+        }
+    }
+    return success;
 }
 
 // Internal API

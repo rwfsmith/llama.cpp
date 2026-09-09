@@ -7,6 +7,7 @@
 #include "dispatch/dispatch-scheduler.h"
 #include "dispatch_registration/dispatch-registry.h"
 #include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-hrx.h"
 #include "ggml-impl.h"
@@ -35,6 +36,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32) && defined(GGML_BACKEND_SHARED)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #define REQUIRE(condition)                                                                           \
     do {                                                                                             \
@@ -1230,8 +1238,8 @@ static void run_graph_traversal_checks() {
 
         const std::vector<size_t> order = traversal_indices(imported.graph);
         REQUIRE(order.size() == 2);
-        REQUIRE(order[0] == 1);
-        REQUIRE(order[1] == 0);
+        REQUIRE(order[0] == 0);
+        REQUIRE(order[1] == 1);
 
         ggml_free(ctx);
     }
@@ -1309,6 +1317,448 @@ static void run_graph_traversal_checks() {
 
         ggml_free(ctx);
     }
+}
+
+static auto resident_buffer_base_callback() -> decltype(&ggml_backend_hrx_buffer_base) {
+#if defined(_WIN32) && defined(GGML_BACKEND_SHARED)
+    // This internal C++ function has no dllimport annotation. Its address in the
+    // executable can be a linker thunk, which fails the DLL's buffer-kind check.
+    HMODULE module = GetModuleHandleA("ggml-hrx.dll");
+    REQUIRE(module != nullptr);
+#ifdef _WIN64
+    const char * symbol = "?ggml_backend_hrx_buffer_base@@YAPEAXPEAUggml_backend_buffer@@@Z";
+#else
+    const char * symbol = "?ggml_backend_hrx_buffer_base@@YAPAXPAUggml_backend_buffer@@@Z";
+#endif
+    const auto callback = reinterpret_cast<decltype(&ggml_backend_hrx_buffer_base)>(GetProcAddress(module, symbol));
+    REQUIRE(callback != nullptr);
+    return callback;
+#else
+    return &ggml_backend_hrx_buffer_base;
+#endif
+}
+
+static void run_repeat_allocation_order_case(ggml_backend_t cpu, bool reuse) {
+    const int64_t width = 2560;
+    ggml_init_params params = {};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    ggml_tensor * seed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    ggml_set_name(x, "order_x");
+    ggml_set_name(seed, "order_seed");
+    ggml_set_name(bias, "order_bias");
+    ggml_set_input(x);
+    ggml_set_input(seed);
+    ggml_set_input(bias);
+    ggml_set_output(x);
+    ggml_set_output(bias);
+    ggml_tensor * a = ggml_scale(ctx, x, 2.0f);
+    ggml_set_name(a, "order_scale");
+    // A retained side output prevents ADD from reusing a instead of the dead seed.
+    ggml_set_output(a);
+    ggml_tensor * shape = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 4);
+    ggml_tensor * b = ggml_repeat(ctx, seed, shape);
+    ggml_tensor * c = ggml_add(ctx, a, bias);
+    ggml_tensor * d = ggml_repeat(ctx, c, shape);
+    ggml_tensor * output = ggml_add(ctx, b, d);
+    ggml_set_name(b, "order_repeat_seed");
+    ggml_set_name(c, "order_add");
+    ggml_set_name(d, "order_repeat_add");
+    ggml_set_name(output, "order_output");
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, a);
+    ggml_build_forward_expand(graph, output);
+    REQUIRE(graph->n_nodes == 5);
+    REQUIRE(graph->nodes[0] == a && graph->nodes[1] == b && graph->nodes[2] == c &&
+            graph->nodes[3] == d && graph->nodes[4] == output);
+
+    ggml_gallocr_t allocator = nullptr;
+    ggml_backend_buffer_t context_buffer = nullptr;
+    if (reuse) {
+        allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+        REQUIRE(allocator != nullptr);
+        REQUIRE(ggml_gallocr_alloc_graph(allocator, graph));
+    } else {
+        context_buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+        REQUIRE(context_buffer != nullptr);
+    }
+    REQUIRE((seed->data == c->data) == reuse);
+    REQUIRE(seed->buffer == c->buffer);
+
+    ggml::hrx::GraphImportResult imported = ggml::hrx::import_ggml_graph(*graph);
+    REQUIRE(imported.valid());
+    ggml::hrx::DispatchScheduler scheduler;
+    REQUIRE(scheduler.schedule_graph(imported.graph, test_dispatch_target()));
+    const ggml::hrx::CommandProgram commands = ggml::hrx::build_command_program(
+        imported.graph, scheduler.plan(), ggml::hrx::get_qwen_kernel_corpus(), "gfx1151");
+    REQUIRE(commands.valid());
+    REQUIRE(commands.commands.size() == 5);
+    REQUIRE(commands.initialization_commands.empty());
+    REQUIRE(commands.transients.allocations.empty() && commands.transients.arena_size == 0);
+
+    // Exercise the production resident-buffer binding path without creating an HRX
+    // device. The driver handle and non-host buffer descriptor are mocked; base,
+    // offsets and overlapping ranges come from the real CPU gallocr allocation
+    // used by the numeric oracle. CPU host staging must not be a fallback.
+    ggml_backend_buffer_t physical = seed->buffer;
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(physical));
+    ggml_backend_hrx_buffer_context resident_context = {};
+    resident_context.buffer = dummy_hrx_buffer(reinterpret_cast<uintptr_t>(base));
+    resident_context.base = base;
+    resident_context.identity = 1;
+    resident_context.generation = 1;
+    ggml_backend_buffer_type resident_type = *physical->buft;
+    resident_type.iface.is_host = nullptr;
+    ggml_backend_buffer resident_buffer = *physical;
+    resident_buffer.buft = &resident_type;
+    resident_buffer.iface.get_base = resident_buffer_base_callback();
+    resident_buffer.context = &resident_context;
+    REQUIRE(!ggml_backend_buffer_is_host(&resident_buffer));
+    for (const ggml::hrx::ValueId id : imported.graph.values().external_value_ids()) {
+        const ggml::hrx::Value * value = imported.graph.values().find(id);
+        REQUIRE(value != nullptr && value->tensor != nullptr);
+        REQUIRE(value->tensor->buffer == physical && value->tensor->view_src == nullptr);
+        ggml_tensor resident_tensor = *value->tensor;
+        resident_tensor.buffer = &resident_buffer;
+        ggml_backend_hrx_buffer_context * recognized_context = nullptr;
+        size_t recognized_offset = 0;
+        const bool recognized = ggml_backend_hrx_tensor_binding(
+            &resident_tensor, &recognized_context, &recognized_offset);
+        if (!recognized) {
+            std::fprintf(stderr, "REPEAT resident descriptor rejected: value=%d tensor=%s data=%p base=%p size=%zu\n",
+                         id.value, resident_tensor.name, resident_tensor.data, static_cast<void *>(base),
+                         resident_buffer.size);
+        }
+        REQUIRE(recognized && recognized_context == &resident_context);
+        REQUIRE(base + recognized_offset == resident_tensor.data);
+        ggml::hrx::ValueBufferBinding binding;
+        REQUIRE(ggml_backend_hrx_resolve_value_buffer(&resident_tensor, binding));
+        if (binding.buffer != resident_context.buffer || binding.host_data != nullptr) {
+            std::fprintf(stderr, "REPEAT resident binding mismatch: value=%d tensor=%s buffer=%p host=%p\n",
+                         id.value, resident_tensor.name, static_cast<void *>(binding.buffer), binding.host_data);
+        }
+        REQUIRE(binding.buffer == resident_context.buffer && binding.host_data == nullptr);
+        REQUIRE(base + binding.offset == value->tensor->data);
+        REQUIRE(imported.graph.values().bind_buffer(id, binding));
+    }
+    const auto bindings = ggml::hrx::CommandProgramBindings::from_value_map(imported.graph.values());
+    REQUIRE(bindings.valid());
+    const auto resolved = ggml::hrx::resolve_command_program_bindings(commands, bindings);
+    REQUIRE(resolved.valid());
+    std::vector<size_t> scheduled_order;
+    for (const auto & command : resolved.commands) {
+        size_t writes = 0;
+        for (const auto & binding : command.bindings) {
+            REQUIRE(binding.binding.origin == ggml::hrx::CommandBindingOrigin::GraphValue);
+            REQUIRE(binding.ref.buffer == resident_context.buffer);
+            const auto * value = imported.graph.values().find(binding.binding.value);
+            REQUIRE(value != nullptr && value->tensor != nullptr);
+            REQUIRE(base + binding.ref.offset == value->tensor->data);
+            REQUIRE(binding.ref.length == ggml_nbytes(value->tensor));
+            if (binding.binding.access != ggml::hrx::ResourceAccess::Read) {
+                scheduled_order.push_back(producer_index_for_tensor(imported.graph, value->tensor));
+                ++writes;
+            }
+        }
+        REQUIRE(writes == 1);
+    }
+    const auto * seed_binding = bindings.find(imported.graph.values().find_tensor(seed)->id);
+    const auto * c_binding = bindings.find(imported.graph.values().find_tensor(c)->id);
+    REQUIRE(seed_binding != nullptr && c_binding != nullptr);
+    REQUIRE(seed_binding->buffer == c_binding->buffer);
+    REQUIRE((seed_binding->offset == c_binding->offset) == reuse);
+    const std::vector<size_t> original_order = { 0, 1, 2, 3, 4 };
+    // The former ADD/MUL-followup policy picked c immediately after a, before b.
+    const std::vector<size_t> unsafe_order = { 0, 2, 1, 3, 4 };
+    REQUIRE(scheduled_order == traversal_indices(imported.graph));
+    std::fprintf(stderr, "REPEAT order %s: seed=%p add=%p resident offsets=%zu/%zu arena=0\n",
+                 reuse ? "gallocr" : "context", seed->data, c->data, seed_binding->offset, c_binding->offset);
+
+    std::vector<float> xv(width), sv(width), bv(width), expected(width * 4), actual(width * 4);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int64_t i = 0; i < width; ++i) {
+            xv[i] = static_cast<float>(i % 257 - 128 + pass) * 0.25f;
+            sv[i] = static_cast<float>(i % 101 - 50 + pass * 4) * 0.5f;
+            bv[i] = static_cast<float>(i % 31 - 15 - pass) * 0.125f;
+            for (int64_t row = 0; row < 4; ++row) {
+                expected[row * width + i] = sv[i] + (2.0f * xv[i] + bv[i]);
+            }
+        }
+        const auto execute_order = [&](const std::vector<size_t> & order) {
+            ggml_backend_buffer_clear(physical, 0xa5 + pass);
+            ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+            ggml_backend_tensor_set(seed, sv.data(), 0, ggml_nbytes(seed));
+            ggml_backend_tensor_set(bias, bv.data(), 0, ggml_nbytes(bias));
+            for (const size_t index : order) {
+                ggml_tensor * node = graph->nodes[index];
+                ggml_cgraph step = *graph;
+                step.n_nodes = 1;
+                step.nodes = &node;
+                REQUIRE(ggml_backend_graph_compute(cpu, &step) == GGML_STATUS_SUCCESS);
+            }
+            ggml_backend_synchronize(cpu);
+            ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+            return std::memcmp(actual.data(), expected.data(), ggml_nbytes(output)) == 0;
+        };
+        REQUIRE(execute_order(original_order));
+        const bool unsafe_matches = execute_order(unsafe_order);
+        REQUIRE(unsafe_matches == !reuse);
+        const bool scheduled_matches = execute_order(scheduled_order);
+        std::fprintf(stderr, "REPEAT order %s pass=%d original=exact old-order=%s scheduled=%s\n",
+                     reuse ? "gallocr" : "context", pass, unsafe_matches ? "exact" : "CORRUPT",
+                     scheduled_matches ? "exact" : "CORRUPT");
+        REQUIRE(scheduled_matches);
+    }
+    REQUIRE(scheduled_order == original_order);
+    if (allocator != nullptr) {
+        ggml_gallocr_free(allocator);
+    }
+    ggml_backend_buffer_free(context_buffer);
+    ggml_free(ctx);
+}
+
+static void run_repeat_allocation_order_checks() {
+    const char * flag = std::getenv("HRX_ENABLE_REPEAT");
+    const bool had_flag = flag != nullptr;
+    const std::string previous = flag == nullptr ? "" : flag;
+#ifdef _WIN32
+    REQUIRE(_putenv_s("HRX_ENABLE_REPEAT", "1") == 0);
+#else
+    REQUIRE(setenv("HRX_ENABLE_REPEAT", "1", 1) == 0);
+#endif
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    REQUIRE(cpu != nullptr);
+    run_graph_traversal_checks();
+    run_repeat_allocation_order_case(cpu, false);
+    run_repeat_allocation_order_case(cpu, true);
+    ggml_backend_free(cpu);
+#ifdef _WIN32
+    REQUIRE(_putenv_s("HRX_ENABLE_REPEAT", had_flag ? previous.c_str() : "") == 0);
+#else
+    REQUIRE((had_flag ? setenv("HRX_ENABLE_REPEAT", previous.c_str(), 1) : unsetenv("HRX_ENABLE_REPEAT")) == 0);
+#endif
+}
+
+static void run_hc_fusion_consumer_checks() {
+    for (int variant = 0; variant < 5; ++variant) {
+        ggml_init_params params = {};
+        params.mem_size = 1024 * 1024;
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2560, 4, 1);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 10240);
+        ggml_tensor * rms = ggml_rms_norm(ctx, input, 1.0e-6f);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, rms, 10240, 1);
+        ggml_tensor * weighted = ggml_mul(ctx, flat, gamma);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(graph, weighted);
+        if (variant == 1) {
+            ggml_build_forward_expand(graph, ggml_scale(ctx, flat, 2.0f));
+        } else if (variant == 2) {
+            ggml_build_forward_expand(graph, ggml_view_1d(ctx, flat, 10240, 0));
+        } else if (variant == 3) {
+            ggml_set_output(rms);
+        } else if (variant == 4) {
+            ggml_set_output(flat);
+        }
+        auto imported = ggml::hrx::import_ggml_graph(*graph);
+        REQUIRE(imported.valid());
+        ggml::hrx::CommandPlan plan;
+        ggml::hrx::DispatchMatch match;
+        const std::vector<bool> covered(imported.graph.nodes().size(), false);
+        const bool accepted = match_dispatch_at_index(
+            imported.graph, plan, covered, producer_index_for_tensor(imported.graph, rms), match);
+        REQUIRE(accepted == (variant == 0));
+        if (accepted) {
+            REQUIRE(match.dispatches.size() == 1);
+            REQUIRE(kernel_name_for_id(match.dispatches[0].kernel.kernel_id) ==
+                    "qwen4exp:qwen38_hc_grouped_norm_decode");
+        }
+        std::fprintf(stderr, "HC fusion consumer variant=%d %s\n", variant, accepted ? "accepted" : "declined");
+        ggml_free(ctx);
+    }
+}
+
+static void run_fusion_storage_order_case(ggml_backend_t cpu, bool reuse) {
+    const int64_t width = 2560;
+    ggml_init_params params = {};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    ggml_tensor * seed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    ggml_set_name(x, "fusion_x");
+    ggml_set_name(seed, "fusion_seed");
+    ggml_set_name(gamma, "fusion_gamma");
+    for (ggml_tensor * input : { x, seed, gamma }) {
+        ggml_set_input(input);
+    }
+    ggml_set_output(x);
+    ggml_set_output(gamma);
+    ggml_tensor * rms = ggml_rms_norm(ctx, x, 1.0e-6f);
+    ggml_tensor * copy = ggml_cont(ctx, seed);
+    ggml_tensor * weighted = ggml_mul(ctx, rms, gamma);
+    ggml_set_name(rms, "fusion_rms");
+    ggml_set_name(copy, "fusion_intervening_copy");
+    ggml_set_name(weighted, "fusion_weighted");
+    // Retaining RMS prevents MUL from reusing its buffer. The independent seed
+    // instead becomes available after CONT, at MUL's original position.
+    for (ggml_tensor * output : { rms, copy, weighted }) {
+        ggml_set_output(output);
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, rms);
+    ggml_build_forward_expand(graph, copy);
+    ggml_build_forward_expand(graph, weighted);
+    REQUIRE(graph->n_nodes == 3 && graph->nodes[0] == rms && graph->nodes[1] == copy &&
+            graph->nodes[2] == weighted);
+    ggml_gallocr_t allocator = nullptr;
+    ggml_backend_buffer_t context_buffer = nullptr;
+    if (reuse) {
+        allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+        REQUIRE(allocator != nullptr && ggml_gallocr_alloc_graph(allocator, graph));
+    } else {
+        context_buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+        REQUIRE(context_buffer != nullptr);
+    }
+    REQUIRE((seed->data == weighted->data) == reuse);
+    auto imported = ggml::hrx::import_ggml_graph(*graph);
+    REQUIRE(imported.valid());
+    ggml_backend_buffer_t physical = seed->buffer;
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(physical));
+    ggml_backend_hrx_buffer_context resident_context = {};
+    resident_context.buffer = dummy_hrx_buffer(reinterpret_cast<uintptr_t>(base));
+    resident_context.base = base;
+    resident_context.identity = 1;
+    resident_context.generation = 1;
+    ggml_backend_buffer_type resident_type = *physical->buft;
+    resident_type.iface.is_host = nullptr;
+    ggml_backend_buffer resident_buffer = *physical;
+    resident_buffer.buft = &resident_type;
+    resident_buffer.iface.get_base = resident_buffer_base_callback();
+    resident_buffer.context = &resident_context;
+    const auto ids = imported.graph.values().external_value_ids();
+    // The scheduler diagnostic must see these resident descriptors too, not CPU
+    // host-staging identities. Restore real CPU buffers before numeric execution.
+    for (const auto id : ids) {
+        const auto * value = imported.graph.values().find(id);
+        REQUIRE(value != nullptr && value->tensor != nullptr && value->tensor->view_src == nullptr);
+        REQUIRE(value->tensor->buffer == physical);
+        auto * tensor = const_cast<ggml_tensor *>(value->tensor);
+        tensor->buffer = &resident_buffer;
+        ggml::hrx::ValueBufferBinding binding;
+        REQUIRE(ggml_backend_hrx_resolve_value_buffer(tensor, binding));
+        REQUIRE(binding.buffer == resident_context.buffer && binding.host_data == nullptr);
+        REQUIRE(base + binding.offset == tensor->data);
+        REQUIRE(imported.graph.values().bind_buffer(id, binding));
+    }
+    ggml::hrx::DispatchScheduler scheduler;
+    REQUIRE(scheduler.schedule_graph(imported.graph, test_dispatch_target()));
+    const auto commands = ggml::hrx::build_command_program(
+        imported.graph, scheduler.plan(), ggml::hrx::get_qwen_kernel_corpus(), "gfx1151");
+    REQUIRE(commands.valid() && commands.commands.size() == 2);
+    REQUIRE(commands.initialization_commands.empty() && commands.transients.allocations.empty() &&
+            commands.transients.arena_size == 0);
+    const auto bindings = ggml::hrx::CommandProgramBindings::from_value_map(imported.graph.values());
+    const auto resolved = ggml::hrx::resolve_command_program_bindings(commands, bindings);
+    REQUIRE(resolved.valid());
+    const auto weighted_id = imported.graph.values().find_tensor(weighted)->id;
+    const auto copy_id = imported.graph.values().find_tensor(copy)->id;
+    REQUIRE(resolved.commands[0].bindings.back().binding.value == weighted_id);
+    REQUIRE(resolved.commands[1].bindings.back().binding.value == copy_id);
+    for (const auto & command : resolved.commands) {
+        for (const auto & binding : command.bindings) {
+            const auto * value = imported.graph.values().find(binding.binding.value);
+            REQUIRE(value != nullptr && value->tensor != nullptr);
+            REQUIRE(binding.binding.origin == ggml::hrx::CommandBindingOrigin::GraphValue);
+            REQUIRE(binding.ref.buffer == resident_context.buffer);
+            REQUIRE(base + binding.ref.offset == value->tensor->data);
+            REQUIRE(binding.ref.length == ggml_nbytes(value->tensor));
+        }
+    }
+    const auto * seed_binding = bindings.find(imported.graph.values().find_tensor(seed)->id);
+    const auto * weighted_binding = bindings.find(weighted_id);
+    REQUIRE(seed_binding != nullptr && weighted_binding != nullptr);
+    REQUIRE(seed_binding->buffer == weighted_binding->buffer);
+    REQUIRE((seed_binding->offset == weighted_binding->offset) == reuse);
+    for (const auto id : ids) {
+        const_cast<ggml_tensor *>(imported.graph.values().find(id)->tensor)->buffer = physical;
+    }
+    std::fprintf(stderr, "FUSION storage %s: seed=%p weighted=%p offsets=%zu/%zu arena=0\n",
+                 reuse ? "gallocr" : "context", seed->data, weighted->data,
+                 seed_binding->offset, weighted_binding->offset);
+
+    std::vector<float> xv(width), sv(width), gv(width), baseline(width), actual(width), copied(width);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int64_t i = 0; i < width; ++i) {
+            xv[i] = static_cast<float>(i % 127 - 63 + pass) * 0.125f;
+            sv[i] = static_cast<float>(i % 13 + 1 + pass);
+            gv[i] = 1.0f + static_cast<float>(i % 7) * 0.125f;
+        }
+        const auto execute = [&](bool early_write, std::vector<float> & normalized) {
+            ggml_backend_buffer_clear(physical, 0xa5 + pass);
+            ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+            ggml_backend_tensor_set(seed, sv.data(), 0, ggml_nbytes(seed));
+            ggml_backend_tensor_set(gamma, gv.data(), 0, ggml_nbytes(gamma));
+            const std::vector<size_t> order = early_write ? std::vector<size_t>{ 0, 2, 1 } :
+                                                           std::vector<size_t>{ 0, 1, 2 };
+            // CPU emulation of the fused dispatch's early write; no HRX kernel
+            // runs. Writing raw RMS as well does not affect the seed/CONT hazard.
+            for (const size_t index : order) {
+                ggml_tensor * node = graph->nodes[index];
+                ggml_cgraph step = *graph;
+                step.n_nodes = 1;
+                step.nodes = &node;
+                REQUIRE(ggml_backend_graph_compute(cpu, &step) == GGML_STATUS_SUCCESS);
+            }
+            ggml_backend_synchronize(cpu);
+            ggml_backend_tensor_get(weighted, normalized.data(), 0, ggml_nbytes(weighted));
+            ggml_backend_tensor_get(copy, copied.data(), 0, ggml_nbytes(copy));
+            return std::memcmp(copied.data(), sv.data(), ggml_nbytes(copy)) == 0;
+        };
+        REQUIRE(execute(false, baseline));
+        const bool early_matches = execute(true, actual);
+        REQUIRE(std::memcmp(baseline.data(), actual.data(), ggml_nbytes(weighted)) == 0);
+        REQUIRE(early_matches == !reuse);
+        std::fprintf(stderr, "FUSION storage %s pass=%d original=exact early-write=%s weighted=exact\n",
+                     reuse ? "gallocr" : "context", pass, early_matches ? "exact" : "CORRUPT (expected proof)");
+    }
+    if (allocator != nullptr) {
+        ggml_gallocr_free(allocator);
+    }
+    ggml_backend_buffer_free(context_buffer);
+    ggml_free(ctx);
+}
+
+static void run_fusion_storage_order_checks() {
+    run_hc_fusion_consumer_checks();
+    const char * flag = std::getenv("HRX_TRACE_FUSION_STORAGE");
+    const bool had_flag = flag != nullptr;
+    const std::string previous = flag == nullptr ? "" : flag;
+#ifdef _WIN32
+    REQUIRE(_putenv_s("HRX_TRACE_FUSION_STORAGE", "1") == 0);
+#else
+    REQUIRE(setenv("HRX_TRACE_FUSION_STORAGE", "1", 1) == 0);
+#endif
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    REQUIRE(cpu != nullptr);
+    run_fusion_storage_order_case(cpu, false);
+    run_fusion_storage_order_case(cpu, true);
+    ggml_backend_free(cpu);
+#ifdef _WIN32
+    REQUIRE(_putenv_s("HRX_TRACE_FUSION_STORAGE", had_flag ? previous.c_str() : "") == 0);
+#else
+    REQUIRE((had_flag ? setenv("HRX_TRACE_FUSION_STORAGE", previous.c_str(), 1) :
+                        unsetenv("HRX_TRACE_FUSION_STORAGE")) == 0);
+#endif
 }
 
 static void schedule_single_matmul_command(ggml_context * ctx,
@@ -4811,7 +5261,21 @@ static void run_unsupported_op_fails() {
     ggml_backend_free(backend);
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--fusion-storage-order") == 0) {
+        run_fusion_storage_order_checks();
+        REQUIRE(ggml_backend_hrx_shutdown());
+        return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--repeat-allocation-order") == 0) {
+        run_repeat_allocation_order_checks();
+        REQUIRE(ggml_backend_hrx_shutdown());
+        return 0;
+    }
+    if (argc != 1) {
+        std::fprintf(stderr, "usage: hrx-backend-test [--repeat-allocation-order|--fusion-storage-order]\n");
+        return 1;
+    }
     run_status_checks();
     run_command_plan_metadata_checks();
     run_dispatch_registry_checks();
@@ -4844,6 +5308,7 @@ int main() {
 
     if (ggml_backend_hrx_get_device_count() == 0) {
         std::fprintf(stderr, "test skipped: no HRX devices available\n");
+        REQUIRE(ggml_backend_hrx_shutdown());
         return 0;
     }
 
@@ -4853,5 +5318,6 @@ int main() {
     run_chained_add_f32();
     run_same_uid_distinct_graph_reuses_graph_program();
     run_unsupported_op_fails();
+    REQUIRE(ggml_backend_hrx_shutdown());
     return 0;
 }

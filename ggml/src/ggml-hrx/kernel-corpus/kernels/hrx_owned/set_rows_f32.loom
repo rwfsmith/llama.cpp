@@ -1,0 +1,74 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// 2D, element-contiguous rows. The executor validates unique in-range IDs before
+// dispatch and reports failure; these device guards also prevent invalid addresses.
+
+amdgpu.target<gfx11-generic> @ggml_set_rows_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_set_rows_wave64) export("ggml_set_rows_f32") @ggml_set_rows_f32(%row_length: index, %row_count: index, %cache_rows: index, %source_stride: index, %output_stride: index, %index_stride: index, %output_f16: index, %index_i64: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%row_count, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%row_length: index, %row_count: index, %cache_rows: index, %source_stride: index, %output_stride: index, %index_stride: index, %output_f16: index, %index_i64: index, %source: buffer, %ids: buffer, %output: buffer) {
+  %width = index.assume %row_length [range(%row_length, 1, 512)] : index
+  %rows = index.assume %row_count [range(%row_count, 1, 4096)] : index
+  %capacity = index.assume %cache_rows [range(%cache_rows, 1, 134217728)] : index
+  %ss = index.assume %source_stride [range(%source_stride, 1, 134217728)] : index
+  %ds = index.assume %output_stride [range(%output_stride, 1, 134217728)] : index
+  %is = index.assume %index_stride [range(%index_stride, 1, 134217728)] : index
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [range(%row0, 0, 4095)] : index
+  %lane = kernel.workitem.id<x> : index
+  %rm1 = index.sub %rows, %one : index
+  %cm1 = index.sub %capacity, %one : index
+  %src_span = index.mul %rm1, %ss : index
+  %dst_span = index.mul %cm1, %ds : index
+  %id_span = index.mul %rm1, %is : index
+  %src_extent = index.add %src_span, %width : index
+  %dst_extent = index.add %dst_span, %width : index
+  %id_extent = index.add %id_span, %one : index
+  %id_pos = index.mul %row, %is : index
+  %wide_ids = index.cmp ne, %index_i64, %zero : index
+  %id64 = scf.if %wide_ids -> (i64) {
+    %iv = buffer.view %ids[%offset] : buffer -> view<[%id_extent]xi64>
+    %v = view.load %iv[%id_pos] : view<[%id_extent]xi64> -> i64
+    scf.yield %v : i64
+  } else {
+    %iv = buffer.view %ids[%offset] : buffer -> view<[%id_extent]xi32>
+    %v = view.load %iv[%id_pos] : view<[%id_extent]xi32> -> i32
+    %v64 = scalar.extsi %v : i32 to i64
+    scf.yield %v64 : i64
+  }
+  %capacity64 = index.cast %capacity : index to i64
+  %zero64 = scalar.constant 0 : i64
+  %nonnegative = scalar.cmpi sge, %id64, %zero64 : i64
+  %below_limit = scalar.cmpi slt, %id64, %capacity64 : i64
+  %valid = scalar.andi %nonnegative, %below_limit : i1
+  scf.if %valid {
+    %id0 = index.cast %id64 : i64 to index
+    %id = index.assume %id0 [range(%id0, 0, 134217727)] : index
+    %src_base = index.mul %row, %ss : index
+    %dst_base = index.mul %id, %ds : index
+    %sv = buffer.view %source[%offset] : buffer -> view<[%src_extent]xf32>
+    %half = index.cmp ne, %output_f16, %zero : index
+    scf.for %col = [%lane to %width step %threads] {
+      %si = index.add %src_base, %col : index
+      %di = index.add %dst_base, %col : index
+      %value = view.load %sv[%si] : view<[%src_extent]xf32> -> f32
+      scf.if %half {
+        %dv = buffer.view %output[%offset] : buffer -> view<[%dst_extent]xf16>
+        %value16 = scalar.fptrunc %value : f32 to f16
+        view.store %value16, %dv[%di] : f16, view<[%dst_extent]xf16>
+      } else {
+        %dv = buffer.view %output[%offset] : buffer -> view<[%dst_extent]xf32>
+        view.store %value, %dv[%di] : f32, view<[%dst_extent]xf32>
+      }
+    }
+  }
+  kernel.return
+}

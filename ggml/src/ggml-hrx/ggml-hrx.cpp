@@ -2,12 +2,21 @@
 
 #include "backend-buffer-binding.h"
 #include "backend-context.h"
+#include "dispatch_registration/dispatch-copy.h"
+#include "dispatch_registration/dispatch-add.h"
+#include "dispatch_registration/dispatch-gather-add.h"
+#include "dispatch_registration/dispatch-llm-matmul.h"
+#include "dispatch_registration/dispatch-qwen-preamble.h"
+#include "dispatch_registration/dispatch-qwen4exp-flash-attention.h"
+#include "dispatch_registration/dispatch-rmsnorm.h"
+#include "dispatch_registration/dispatch-swiglu.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "hrx_runtime.h"
 #include "kernel-corpus/kernel-corpus.h"
 #include "loom-jit.h"
 #include "runtime/graph-executor.h"
+#include "runtime/command-program-executor.h"
 #include "runtime/graph-program-cache.h"
 #include "runtime/kernel-executable-cache.h"
 #include "runtime/prepared-command-program-cache.h"
@@ -65,20 +74,74 @@ static bool hrx_check(hrx_status_t status, const char * expression, const char *
 }  // namespace
 
 ggml_backend_hrx_reg_context::~ggml_backend_hrx_reg_context() {
+    if (runtime_active) {
+        shutdown();
+    }
+}
+
+bool ggml_backend_hrx_reg_context::release_runtime_locked() {
     for (auto & context : device_contexts) {
         if (context->buffer_stream != nullptr) {
             hrx_stream_release(context->buffer_stream);
+            context->buffer_stream = nullptr;
         }
         if (context->device != nullptr) {
             hrx_device_release(context->device);
+            context->device = nullptr;
         }
     }
+    runtime_active = false;
     if (initialized) {
-        hrx_status_t status = hrx_gpu_shutdown();
-        if (!hrx_status_is_ok(status)) {
-            hrx_status_ignore(status);
+        initialized = false;
+        return HRX_CHECK(hrx_gpu_shutdown());
+    }
+    return true;
+}
+
+bool ggml_backend_hrx_reg_context::shutdown() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (live_backends != 0 || live_buffers != 0) {
+        return false;
+    }
+    if (!runtime_active) {
+        return true;
+    }
+    for (const auto & context : device_contexts) {
+        if (context->buffer_stream != nullptr && !HRX_CHECK(hrx_stream_synchronize(context->buffer_stream))) {
+            return false;
         }
     }
+    return release_runtime_locked();
+}
+
+bool ggml_backend_hrx_reg_context::ensure_runtime_locked() {
+    if (runtime_active) {
+        return true;
+    }
+    hrx_status_t status = hrx_gpu_initialize(0);
+    if (hrx_status_is_ok(status)) {
+        initialized = true;
+    } else if (hrx_status_code(status) == HRX_STATUS_ALREADY_EXISTS) {
+        hrx_status_ignore(status);
+    } else {
+        HRX_CHECK(status);
+        return false;
+    }
+    runtime_active = true;
+    for (auto & context : device_contexts) {
+        hrx_device_t device = nullptr;
+        if (!HRX_CHECK(hrx_gpu_device_get(context->ordinal, &device)) || device == nullptr) {
+            release_runtime_locked();
+            return false;
+        }
+        hrx_device_retain(device);
+        context->device = device;
+        if (!HRX_CHECK(hrx_stream_create(device, 0, &context->buffer_stream))) {
+            release_runtime_locked();
+            return false;
+        }
+    }
+    return true;
 }
 
 namespace {
@@ -168,6 +231,7 @@ static hrx_status_t submit_copy_buffer(hrx_stream_t stream, void * user_data) {
 
 static void buffer_free(ggml_backend_buffer_t buffer) {
     auto * context = buffer_context(buffer);
+    auto * registry = context->device->registry;
     if (context->base != reinterpret_cast<uint8_t *>(GGML_HRX_FAKE_PTR_BASE)) {
         context->device->host_buffers.remove(context->buffer);
     }
@@ -175,6 +239,8 @@ static void buffer_free(ggml_backend_buffer_t buffer) {
         hrx_buffer_release(context->buffer);
     }
     delete context;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    --registry->live_buffers;
 }
 
 static void buffer_memset(ggml_backend_buffer_t buffer,
@@ -285,6 +351,11 @@ static const ggml_backend_buffer_i buffer_i = {
 
 static ggml_backend_buffer_t buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     auto *              type_context = static_cast<ggml_backend_hrx_buffer_type_context *>(buft->context);
+    auto *              registry = type_context->device->registry;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (!registry->ensure_runtime_locked()) {
+        return nullptr;
+    }
     const bool          host_visible = type_context->host_visible;
     const bool          direct_host_binding = host_visible && type_context->device->use_direct_host_bindings;
     hrx_memory_type_t   memory_type          = HRX_MEMORY_TYPE_DEVICE_LOCAL;
@@ -331,6 +402,7 @@ static ggml_backend_buffer_t buffer_alloc(ggml_backend_buffer_type_t buft, size_
     if (host_visible && allocation != nullptr) {
         type_context->device->host_buffers.add(allocation, base, size);
     }
+    ++registry->live_buffers;
     return ggml_backend_buffer_init(buft, buffer_i, context, size);
 }
 
@@ -353,6 +425,7 @@ static const char * backend_name(ggml_backend_t backend) {
 
 static void backend_free(ggml_backend_t backend) {
     auto * context = static_cast<ggml_backend_hrx_context *>(backend->context);
+    auto * registry = context->device->registry;
     HRX_CHECK(hrx_stream_synchronize(context->stream));
     context->prepared_programs.clear();
     context->graph_programs.clear();
@@ -363,6 +436,8 @@ static void backend_free(ggml_backend_t backend) {
     hrx_stream_release(context->stream);
     delete context;
     delete backend;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    --registry->live_backends;
 }
 
 static bool synchronous_upload_fallback(ggml_backend_hrx_context * backend,
@@ -740,19 +815,9 @@ static void hrx_verify_after(ggml_backend_hrx_context * context, const std::vect
     }
 }
 
-// Wall-clock accounting for the HRX half of a token. graph_compute() already blocks on the compute stream
-// before it returns, so the interval around executor.execute() is submission and the interval around
-// hrx_stream_synchronize() is GPU wait.
-//
-// Read the "submit" bucket with care: it is NOT all host-side cost. download_synchronous() calls
-// hrx_stream_synchronize() before every device-to-host readback, so any split that writes a value consumed
-// on the CPU drains the GPU from inside submission. Measured on qwen4exp decode that hidden wait is 89% of
-// the download time, which makes the raw submit/gpu split read as 73/27 when the true GPU-busy share is
-// about 85%. Always pair this with the "HRX download" breakdown before drawing a conclusion.
-//
-// Totals are reported cumulatively every kHrxTimeReportInterval calls, because llama-cli deadlocks in
-// teardown and gets killed, so anything printed only at backend_free() would never appear. Diff two
-// consecutive reports to recover a steady-state rate.
+// Host wall-clock totals include both prefill and decode. Submission can also block in host-staging readbacks.
+// The "gpu" bucket measures the final host synchronization call, not device execution time or GPU utilization.
+// Report periodically so diagnostics remain available when teardown does not complete.
 static bool hrx_time_compute_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("HRX_TIME_COMPUTE");
@@ -806,14 +871,14 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
         static uint64_t splits    = 0;
         static uint64_t nodes     = 0;
         static double   submit_ms = 0.0;
-        static double   gpu_ms    = 0.0;
+        static double   sync_wait_ms = 0.0;
         splits += 1;
         nodes += static_cast<uint64_t>(graph->n_nodes);
         submit_ms += elapsed(t_entry, t_submitted);
-        gpu_ms += elapsed(t_submitted, t_synced);
+        sync_wait_ms += elapsed(t_submitted, t_synced);
         if (splits % kHrxTimeReportInterval == 0) {
-            GGML_LOG_INFO("HRX time: splits=%" PRIu64 " nodes=%" PRIu64 " submit=%.1fms gpu=%.1fms total=%.1fms\n",
-                          splits, nodes, submit_ms, gpu_ms, submit_ms + gpu_ms);
+            GGML_LOG_INFO("HRX time: splits=%" PRIu64 " nodes=%" PRIu64 " submit=%.1fms sync_wait=%.1fms total=%.1fms\n",
+                          splits, nodes, submit_ms, sync_wait_ms, submit_ms + sync_wait_ms);
         }
     }
     hrx_verify_after(context, captures);
@@ -870,6 +935,11 @@ static void device_props(ggml_backend_dev_t device, ggml_backend_dev_props * pro
 static ggml_backend_t device_init(ggml_backend_dev_t device, const char * parameters) {
     GGML_UNUSED(parameters);
     auto *       device_ctx = device_context(device);
+    auto *       registry = device_ctx->registry;
+    std::lock_guard<std::mutex> lock(registry->mutex);
+    if (!registry->ensure_runtime_locked()) {
+        return nullptr;
+    }
     hrx_stream_t stream     = nullptr;
     if (!HRX_CHECK(hrx_stream_create(device_ctx->device, 0, &stream))) {
         return nullptr;
@@ -886,6 +956,8 @@ static ggml_backend_t device_init(ggml_backend_dev_t device, const char * parame
     if (backend == nullptr) {
         delete context;
         hrx_stream_release(stream);
+    } else {
+        ++registry->live_backends;
     }
     return backend;
 }
@@ -952,19 +1024,7 @@ static bool hrx_gdn_conv_prepare_enabled() {
 // row-strided f32 copy (rows element-contiguous). Keeping the two in sync matters more than usual here,
 // because a CPY on a pre-allocated cache tensor that this declines aborts ggml_backend_sched outright.
 static bool hrx_copy_f32_supported(const ggml_tensor * op) {
-    const ggml_tensor * source = op == nullptr ? nullptr : op->src[0];
-    if (source == nullptr || op->type != GGML_TYPE_F32 || source->type != GGML_TYPE_F32 ||
-        ggml_nelements(op) != ggml_nelements(source) || ggml_nelements(op) <= 0) {
-        return false;
-    }
-    if (ggml_is_contiguous(op) && ggml_is_contiguous(source)) {
-        return true;
-    }
-    const auto rows_copyable = [](const ggml_tensor * t) {
-        return t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0 &&
-               static_cast<int64_t>(t->nb[1] / sizeof(float)) >= t->ne[0];
-    };
-    return rows_copyable(op) && rows_copyable(source) && op->ne[0] == source->ne[0] && op->ne[1] == source->ne[1];
+    return ggml::hrx::supports_copy_f32_dispatch(op);
 }
 
 static bool eager_capability_declared(enum ggml_op op) {
@@ -1052,8 +1112,8 @@ static bool hrx_weight_quant_supported(enum ggml_type type) {
 // runs there. @qwen3_moe_dense_linear_q8_0_f16_wmma covers it.
 //
 // Q8_0 is deliberately NOT folded into hrx_weight_quant_supported() because that helper is
-// op-agnostic and also gates GET_ROWS (token_embd.weight is Q8_0 and there is no Q8_0 embed kernel)
-// and MUL_MAT_ID. Instead this narrower helper is OR'd into the GGML_OP_NONE placement probe so a
+// op-agnostic and also gates GET_ROWS and MUL_MAT_ID. Q8 embedding has its own opt-in shape
+// predicate. Instead this narrower helper is OR'd into the GGML_OP_NONE placement probe so a
 // Q8_0 weight may live in an HRX buffer, exactly as hrx_moe_down_weight_supported() already is.
 //
 // Note this deliberately does NOT narrow the GGML_OP_NONE placement probe or GET_ROWS, which must
@@ -1074,10 +1134,10 @@ static bool hrx_dense_matmul_weight_supported(enum ggml_type type) {
 // (dispatch-llm-matmul.cpp) would decline: an op HRX claims but that no matcher roots at strands the
 // whole split with a hard "unsupported HRX node" abort instead of degrading to the CPU for that node.
 // Unlike Q4_K/Q6_K -- which additionally have the fused qwen.* projection matchers in
-// dispatch-qwen-matmul.cpp as a second chance -- Q8_0 is served only by
+// dispatch-qwen-matmul.cpp as a second chance -- the 256-aligned Q8_0 route is served by
 // "llm.matmul.dense_q8_0_f16_wmma", so these guards mirror that matcher's exactly: 2D contiguous
 // weight/activation/result, f32 activation and result, a 256-aligned contraction width, and a token
-// count inside the kernel's token_capacity bound.
+// count inside the kernel's token_capacity bound. The opt-in narrow route is checked separately.
 static constexpr int64_t kHrxDenseMatmulMaxTokenCount = 2048;
 
 static bool hrx_dense_matmul_q8_0_shape_supported(const ggml_tensor * op) {
@@ -1162,87 +1222,109 @@ static bool hrx_moe_down_weight_supported(const ggml_tensor * weight) {
 // below, both of which key off the full-width row.
 static constexpr int64_t kHrxHiddenSizeQwen4Exp = 2560;
 
-// qwen4exp routed gate/up expert weights (ffn_gate_exps / ffn_up_exps): Q4_K
-// [hidden_size=2560, expert_hidden_size=640, expert_count=512]. Note this is the transpose of the
-// down-projection geometry checked above ([640, 2560, 512]), so the two never collide.
-//
-// These are now served by "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp", a qwen4exp-scoped
-// sibling of the qwen30b decode matcher. The qwen30b matchers stay written against the kRoutedFfn*
-// constants pinned to the qwen30b profile (see dispatch-llm-profiles.h); the two sets of shape tests
-// are disjoint, so each declines what the other claims and neither model perturbs the other.
-//
-// The type test below is not optional. It has to agree exactly with
-// is_routed_ffn_gate_up_weight_qwen4exp() in dispatch-routed-ffn.cpp (the only gate/up kernel we have
-// is Q4_K) *and* with hrx_weight_quant_supported() in the GGML_OP_NONE arm of device_supports_op(),
-// because llama.cpp picks a weight's buffer type by probing its consuming op and ggml-backend then
-// re-probes the placed weight as GGML_OP_NONE. This model's quant mix is not uniform -- UD-Q4_K_XL
-// leaves a couple of expert tensors at Q5_K -- and a shape-only claim pinned one of those into an
-// HRX buffer that the NONE probe then refused, aborting the run with "pre-allocated tensor
-// (blk.2.ffn_gate_exps.weight) in a buffer (HRX0) that cannot run the operation (NONE)". Those few
-// layers keep their gate/up on the CPU.
+// Qwen4Exp gate/up weights: Q4_K decode fusion, or opt-in raw IQ3_XXS/IQ4_XS projections.
+// The consuming-op and NONE placement probes must agree; unrelated quantizations remain on CPU.
 static constexpr int64_t kHrxMoeGateUpExpertCountQwen4Exp = 512;
 static constexpr int64_t kHrxMoeRouteCountQwen4Exp        = 10;
 
-static bool hrx_moe_gate_up_weight_qwen4exp(const ggml_tensor * weight) {
-    return weight != nullptr && weight->type == GGML_TYPE_Q4_K && weight->ne[0] == kHrxHiddenSizeQwen4Exp &&
-           weight->ne[1] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
-           weight->ne[2] == kHrxMoeGateUpExpertCountQwen4Exp;
+static bool hrx_iq_experts_enabled() {
+    const char * value = std::getenv("HRX_ENABLE_IQ_EXPERTS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
-// The SwiGLU between qwen4exp's routed gate/up and down projections. HRX only ever runs this
-// activation *inside* the fused "llm.routed_ffn.*gate_up_swiglu*" dispatches -- there is no matcher
-// rooted at a standalone GGML_OP_GLU anywhere in the corpus. So a GLU that HRX claims without its
-// gate/up having been fused alongside it is stranded, and must follow its producers to the CPU.
+static bool hrx_moe_tokens_supported(int64_t tokens) {
+    const char * value = std::getenv("HRX_ENABLE_MOE_SMALL_BATCH");
+    return tokens == 1 || (tokens >= 2 && tokens <= 8 && hrx_iq_experts_enabled() &&
+                          value != nullptr && std::strcmp(value, "1") == 0);
+}
+
+static bool hrx_moe_placement_probe(const ggml_tensor * op) {
+    // weight_buft_supported attaches a zero-byte dummy buffer to a NONE weight.
+    // A real unallocated graph has buffer == nullptr; a loaded weight has nonzero
+    // storage. Neither is the loader probe, even at the same 512-token shape.
+    const ggml_tensor * weight = op->src[0];
+    return weight != nullptr && weight->op == GGML_OP_NONE && weight->data == nullptr &&
+           weight->buffer != nullptr && ggml_backend_buffer_get_size(weight->buffer) == 0 &&
+           op->src[1] != nullptr && op->src[1]->op == GGML_OP_NONE &&
+           op->src[1]->ne[2] == 512 && op->src[2] != nullptr && op->src[2]->op == GGML_OP_NONE;
+}
+
+static bool hrx_moe_op_layout_supported(const ggml_tensor * op, bool down) {
+    const ggml_tensor * input = op->src[1];
+    const ggml_tensor * ids = op->src[2];
+    if (input == nullptr || ids == nullptr) {
+        return false;
+    }
+    const int64_t tokens = input->ne[2];
+    return hrx_moe_tokens_supported(tokens) && input->type == GGML_TYPE_F32 && ggml_is_contiguous(input) &&
+           input->ne[0] == (down ? 640 : 2560) && input->ne[1] == (down ? 10 : 1) && input->ne[3] == 1 &&
+           ids->type == GGML_TYPE_I32 && ids->ne[0] == 10 && ids->ne[1] == tokens &&
+           ids->ne[2] == 1 && ids->ne[3] == 1 && ids->nb[0] == sizeof(int32_t) &&
+           ids->nb[1] >= 10 * sizeof(int32_t) && ids->nb[1] <= 512 * sizeof(int32_t) &&
+           ids->nb[1] % sizeof(int32_t) == 0 &&
+           op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+           op->ne[0] == (down ? 2560 : 640) && op->ne[1] == 10 && op->ne[2] == tokens && op->ne[3] == 1;
+}
+
+static bool hrx_moe_gate_up_weight_qwen4exp(const ggml_tensor * weight) {
+    if (weight == nullptr) {
+        return false;
+    }
+    const bool quant_supported = weight->type == GGML_TYPE_Q4_K ||
+        (hrx_iq_experts_enabled() && (weight->type == GGML_TYPE_IQ3_XXS || weight->type == GGML_TYPE_IQ4_XS));
+    return quant_supported && weight->ne[0] == kHrxHiddenSizeQwen4Exp &&
+           weight->ne[1] == kHrxMoeDownExpertHiddenSizeQwen4Exp &&
+           weight->ne[2] == kHrxMoeGateUpExpertCountQwen4Exp && weight->ne[3] == 1 &&
+           ggml_is_contiguous(weight);
+}
+
+// Q4_K SwiGLU belongs to the fused decode dispatch; IQ uses a standalone F32
+// SwiGLU with the same T=1 or opt-in T=2..8 contract as its projections.
 //
 // Keyed on the expert_hidden_size=640 row alone, so it covers both the routed decode shape
 // [640, route_count=10] and the shared-expert shape [640, 1]. The latter only became reachable once
 // the Q8_0 dense matmul route let its gate/up projections run on HRX: that pulled the GLU onto HRX
-// behind them, where it stranded its split with "unsupported HRX node 8: GLU f32[640]". Other models
-// keep the permissive default -- qwen30b's expert_hidden_size is 768.
+// behind them, where it stranded its split with "unsupported HRX node 8: GLU f32[640]".
+// HRX_ENABLE_SWIGLU=1 separately admits contiguous shared F32 rows, width <=32768 and T=1..8.
+// Other models retain their routed fusion path -- qwen30b's expert_hidden_size is 768.
 static bool hrx_moe_glu_qwen4exp_decode(const ggml_tensor * op) {
     if (op == nullptr || op->type != GGML_TYPE_F32 || op->ne[0] != kHrxMoeDownExpertHiddenSizeQwen4Exp ||
-        op->ne[2] != 1 || op->ne[3] != 1) {
+        op->ne[3] != 1) {
         return false;
     }
     if (op->ne[1] != kHrxMoeRouteCountQwen4Exp) {
-        // Shared-expert GLU [expert_hidden, 1, 1]: no matcher, always CPU.
+        // Shared-expert GLU is handled separately by the opt-in standalone dispatch.
         return true;
     }
-    // Routed decode GLU [expert_hidden, route_count, 1]. llama.cpp's build_moe_ffn() emits this as
-    // glu_split(mul_mat_id(gate_exps, ...), mul_mat_id(up_exps, ...)), so the gate/up expert weights
-    // are reachable from here -- and this GLU is only fused (and therefore only claimable) when
-    // "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp" matched, which requires both of them to
-    // be Q4_K. On the Q5_K layers of this quant mix the gate/up stays on the CPU, and this GLU has to
-    // stay with it. Unlike an expert weight, a GLU is a pure compute node with no buffer-type probe
-    // behind it, so it is safe to decide this from the surrounding topology.
+    if (!hrx_moe_tokens_supported(op->ne[2])) {
+        return true;
+    }
+    // Q4_K fuses SwiGLU; the experimental IQ route computes it separately and packs the down input.
+    // Keep other formats with their CPU producers.
     const ggml_tensor * gate = op->src[0];
     const ggml_tensor * up   = op->src[1];
-    const bool          fused = gate != nullptr && up != nullptr && gate->op == GGML_OP_MUL_MAT_ID &&
+    const bool          fused = ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU && ggml_is_contiguous(op) &&
+                        gate != nullptr && up != nullptr && ggml_is_contiguous(gate) && ggml_is_contiguous(up) &&
+                        gate->op == GGML_OP_MUL_MAT_ID &&
                        up->op == GGML_OP_MUL_MAT_ID && hrx_moe_gate_up_weight_qwen4exp(gate->src[0]) &&
-                       hrx_moe_gate_up_weight_qwen4exp(up->src[0]);
+                       hrx_moe_gate_up_weight_qwen4exp(up->src[0]) &&
+                       (op->ne[2] == 1 || (gate->src[0]->type != GGML_TYPE_Q4_K &&
+                                          up->src[0]->type != GGML_TYPE_Q4_K));
     return !fused;
 }
 
-// True when a qwen4exp routed-FFN down node's activation input comes from a GLU whose gate/up were
-// themselves fusable on HRX. The down dispatch binds a Q8_1-x4 alternate of that activation, and the
-// only thing that ever publishes it is the gate/up dispatch -- so if gate/up ran on the CPU (this
-// quant mix leaves blk.2's expert gate/up at Q5_K), the down node has no alternate to bind, fails to
-// match, and strands its split.
-//
-// The `src[1]->op != GGML_OP_GLU` fallback is load-bearing: llama.cpp's load-time buffer probe builds
-// its MUL_MAT_ID test op with a synthetic f32 leaf for src[1], not a GLU. Returning true there keeps
-// the probe's answer a pure function of the weight, so every down expert weight still lands in an HRX
-// buffer and the GGML_OP_NONE re-probe stays consistent. Only real graph nodes, which always feed the
-// down projection from a GLU, take the chain-checked path.
+// Q4_K requires the gate/up alternate; the IQ opt-in also permits packing an
+// ordinary F32 split input. Keep unsupported GLU producer chains off HRX.
 static bool hrx_moe_down_chain_fusable_qwen4exp(const ggml_tensor * op) {
     const ggml_tensor * glu = op == nullptr ? nullptr : op->src[1];
     if (glu == nullptr || glu->op != GGML_OP_GLU) {
-        return true;
+        return hrx_iq_experts_enabled();
     }
     const ggml_tensor * gate = glu->src[0];
     const ggml_tensor * up   = glu->src[1];
     return gate != nullptr && up != nullptr && gate->op == GGML_OP_MUL_MAT_ID && up->op == GGML_OP_MUL_MAT_ID &&
-           hrx_moe_gate_up_weight_qwen4exp(gate->src[0]) && hrx_moe_gate_up_weight_qwen4exp(up->src[0]);
+           hrx_moe_gate_up_weight_qwen4exp(gate->src[0]) && hrx_moe_gate_up_weight_qwen4exp(up->src[0]) &&
+           !hrx_moe_glu_qwen4exp_decode(glu);
 }
 
 // qwen4exp's MoE router chain -- SOFT_MAX over the [n_expert=512, T] gate logits, its descending
@@ -1451,10 +1533,9 @@ static bool hrx_mul_outer_broadcast_enabled() {
     return enabled == nullptr || enabled[0] != '0';
 }
 
-// Default off, and it has to stay that way: HRX_ENABLE_REPEAT=1 on a "capital of France" decode
-// moves the 96 hyper-connection REPEAT nodes onto the GPU and produces garbage tokens
-// ("Weih Weihжек sensit呦quedaoise...") for a 2.7% decode gain. The knob is kept so the corruption
-// stays reproducible against common.repeat_f32, not because it is a tuning option.
+// Keep opt-in pending broader validation. REPEAT exposed traversal reordering that
+// violated ggml's reused-buffer lifetimes. Stable original traversal fixes the
+// allocation regression and current Q3 smoke cases, but not all expanded MUL paths.
 static bool hrx_repeat_dispatch_enabled() {
     const char * enabled = std::getenv("HRX_ENABLE_REPEAT");
     return enabled != nullptr && enabled[0] != '0';
@@ -1680,15 +1761,33 @@ static constexpr int64_t kQwen4ExpQsaHiddenSize  = kQwen4ExpQueryHeadCount * kHr
 static constexpr int64_t kHrxHcMultiplierQwen4Exp = 4;
 static constexpr int64_t kHrxHcDimQwen4Exp        = kHrxHcMultiplierQwen4Exp * kHrxHiddenSizeQwen4Exp;
 
-// HRX's only GET_ROWS kernels are embedding lookups: they read a leaf weight tensor. qwen4exp's
-// build_qsa_top_k() emits two gathers that are not lookups at all -- ggml_get_rows(k_all, blk_cells)
-// over an F16 view of the indexer key cache (src/models/qwen4exp.cpp line 593) and
-// ggml_get_rows(score, cell_blk) expanding per-block scores to per-token ones (line 651) -- neither of
-// which any matcher roots at. Requiring a leaf source keeps every embedding lookup claimed, including
-// F16 ones, while declining both.
+// Legacy lookup/fusion placement must not treat a state alias as a leaf table.
+// ggml_view_tensor() leaves op == NONE, unlike ggml_view_2d()/ggml_reshape_2d(),
+// so checking the producer opcode alone misses such aliases. Standalone F32
+// state gathers have their own opt-in capability above the legacy fallback.
 static bool hrx_non_leaf_gather_qwen4exp(const ggml_tensor * op) {
     const ggml_tensor * source = op == nullptr ? nullptr : op->src[0];
-    return source != nullptr && source->op != GGML_OP_NONE;
+    return source != nullptr && (source->op != GGML_OP_NONE || source->view_src != nullptr);
+}
+
+// Preserve the old leaf-side gather+ADD/row-selector fusion eligibility, not a
+// claim that arbitrary F32 tables have a standalone embedding kernel. These
+// bounds mirror match_gather_add_f32; the graph matcher still requires the ADD
+// consumer and peer gather. The 2048x1 attention residual selector is included.
+static bool hrx_legacy_leaf_f32_gather_supported(const ggml_tensor * op) {
+    if (op == nullptr || op->src[0] == nullptr || op->src[1] == nullptr ||
+        hrx_non_leaf_gather_qwen4exp(op)) {
+        return false;
+    }
+    const ggml_tensor * source = op->src[0];
+    const ggml_tensor * ids = op->src[1];
+    return source->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32 &&
+           source->ne[0] >= 128 && source->ne[0] <= 32768 && source->ne[0] % 128 == 0 &&
+           source->ne[1] >= 1 && source->ne[1] <= 2048 && source->ne[2] == 1 && source->ne[3] == 1 &&
+           op->ne[0] == source->ne[0] && op->ne[1] >= 1 && op->ne[1] <= 2048 &&
+           op->ne[2] == 1 && op->ne[3] == 1 && op->view_src == nullptr &&
+           ggml_nelements(ids) == op->ne[1] &&
+           ggml_is_contiguous(source) && ggml_is_contiguous(ids) && ggml_is_contiguous(op);
 }
 
 // qwen4exp's lightning indexer (build_qsa_top_k() in src/models/qwen4exp.cpp) works entirely in
@@ -1920,7 +2019,8 @@ static bool hrx_layout_chain_has_row_width(const ggml_tensor * t, int64_t row_wi
 //                              of src/models/qwen4exp.cpp: pooling precedes norm and rotation), so the
 //                              key-publish chain's mandatory ROPE producer is absent
 //
-// Claiming either strands the SET_ROWS with no dispatch. This only ever fires on qwen4exp shapes; any
+// These shapes require the opt-in standalone dispatch; without it, claiming them strands SET_ROWS.
+// This only ever fires on qwen4exp shapes; any
 // geometry it does not positively recognise stays claimed, so the qwen30b profile is untouched.
 static bool hrx_cache_publish_unmatched_qwen4exp(const ggml_tensor * op) {
     const ggml_tensor * source = op == nullptr ? nullptr : op->src[0];
@@ -1951,30 +2051,11 @@ static bool hrx_cache_publish_unmatched_qwen4exp(const ggml_tensor * op) {
 // claims but no matcher roots at is a hard "unsupported HRX node 0: FLASH_ATTN_EXT f32[256,24]"
 // abort rather than a CPU fallback.
 //
-// Measured blocker chain as of this change (HRX_ENABLE_QSA_ATTN=1 HRX_TRACE_QSA_ATTN=1):
+// Two known split boundaries are addressed: the 6144-wide GDN/QSA collision is separated by provenance,
+// and the interleaved gate's strided [256,24] view can now copy into a contiguous [6144,1] destination.
+// Keep the attention claim opt-in until full-graph correctness is verified.
 //
-//  1. [fixed] The gated MUL was declined by hrx_gdn_norm_gate_row's flattened arm, because QSA's
-//     hidden width collides exactly with the flattened GDN value stream (24*256 == 128*48 == 6144).
-//     hrx_qsa_output_gate_mul_qwen4exp now exempts it by provenance, and the scheduler does place
-//     attn_gated on HRX once it is claimed.
-//  2. [open] The match still declines at "no_gate_mul": ggml cuts the split immediately after the
-//     reshape, so HRX receives only "FLASH_ATTN_EXT[256,24,1,1] RESHAPE[6144,1,1,1] VIEW[256,24,1,1]"
-//     and the MUL is in the next split. The cut is forced by the gate operand. qwen4exp.cpp:798
-//     builds the gate as a strided ggml_view_3d of the interleaved wq projection (row 256, row stride
-//     512 floats) and then ggml_cont_2d's it to [6144,1]. hrx_copy_f32_supported accepts a
-//     row-strided copy only when the geometry matches on both sides
-//     ("op->ne[0] == source->ne[0] && op->ne[1] == source->ne[1]"), and this one flattens [256,24]
-//     to [6144,1], so the CONT stays on the CPU and a CPU->HRX copy has to land between the reshape
-//     and the MUL.
-//
-//     The bytes are actually identical -- a contiguous destination makes "24 rows of 256" and "one
-//     row of 6144" the same write -- so the fix is to let hrx_copy_f32_supported accept a
-//     row-copyable source flattened into a fully contiguous destination of equal element count. That
-//     must be done together with dispatch-copy.cpp, which derives the row geometry it binds from the
-//     op rather than the source; binding [6144,1] against a strided [256,24] source would read the
-//     wrong bytes. Do not relax the capability without changing the matcher to key on the source.
-//
-// Set HRX_ENABLE_QSA_ATTN=1 to lift the decline and reproduce the above; combine with
+// Set HRX_ENABLE_QSA_ATTN=1 to lift the decline; combine with HRX_TRACE_QSA_ATTN=1 and
 // HRX_SURVEY_UNSUPPORTED=1 to collect diagnostics without aborting. Scoped to the 256-wide head so
 // qwen30b, whose heads are 128 wide, is untouched.
 static bool hrx_attention_head_size_unsupported(const ggml_tensor * op) {
@@ -2080,8 +2161,8 @@ static bool hrx_ple_stream_reduce_qwen4exp(const ggml_tensor * op) {
 // bisectable in a single build instead of one build per guard.
 //
 // The default is 0 -- the generic kernel serves every MUL the guards already allow, and overrides
-// none of their declines. Claiming more than that corrupts the model's output. Bisecting
-// HRX_MUL_CLAIM_MASK against a "capital of France" decode gave:
+// none of their declines. Historical bisection, before the allocation-order fix,
+// of HRX_MUL_CLAIM_MASK against a "capital of France" decode gave:
 //
 //   0x7F  all seven                                       -> garbage
 //   0x70  head_major|qsa_indexer|hc_grouped               -> coherent
@@ -2097,17 +2178,18 @@ static bool hrx_ple_stream_reduce_qwen4exp(const ggml_tensor * op) {
 // common.rmsnorm/common.mul_f32 as isolated single-node dispatches and corrupts the model, which is
 // why hrx_gdn_norm_gate_row() below has to keep declining it.
 //
-// The arithmetic is not the problem: hrx_owned/mul_f32.loom's check cases cover both broadcast
-// directions, test-backend-ops passes same-shape f32 MUL, and the three bad guards select ordinary
-// contiguous elementwise multiplies. HRX_TRACE_DISPATCH=1 shows what actually goes wrong -- claiming
-// them re-partitions the graph enough that four dispatches which fire at 0x00 stop firing at 0x7F:
+// Existing fixtures cover these broadcast directions and same-shape multiplies.
+// Expanding the claims changes partitioning and fusion selection. Historically,
+// four standalone dispatches observed at 0x00 disappeared from the trace at 0x7F:
 //
 //   common.copy_rows_f32           CONT     f32[1,10240,1,1]
 //   common.unary_f32               UNARY    f32[10240,1,1,1]
 //   llm.matmul.dense_q8_0_f16_wmma MUL_MAT  f32[248320,1,1,1]
 //   llm.matmul.dense_q8_0_f16_wmma MUL_MAT  f32[512,1,1,1]
 //
-// Losing a q8_0 weight matmul off the GPU mid-graph explains the corruption on its own.
+// A missing standalone trace entry can mean fusion, not missing computation.
+// Stable traversal fixes REPEAT but Q3 still corrupts at 0x7F; fusion storage
+// lifetimes and intermediate materialization require separate investigation.
 //
 // 0x74 is the largest coherent mask, but it is not worth shipping either: a decode census puts it at
 // 1438 splits / 3087 HRX nodes against 1330 / 3050 at 0x00. The 37 MULs it adds are scattered rather
@@ -2263,9 +2345,23 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // ... that cannot run the operation (NONE)" for a weight already placed on HRX0.
         case GGML_OP_NONE:
             return hrx_weight_quant_supported(op->type) || hrx_dense_matmul_weight_supported(op->type) ||
-                   hrx_moe_down_weight_supported(op);
+                   hrx_moe_down_weight_supported(op) || hrx_moe_gate_up_weight_qwen4exp(op);
         // Weight-consuming ops: the first source is the weight. Decline unsupported weight quantizations.
         case GGML_OP_GET_ROWS:
+            if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_Q4_K && op->src[0]->ne[0] != 2048) {
+                return !hrx_dispatch_group_disabled("embed") &&
+                       ggml::hrx::supports_q4_embedding_dispatch(op);
+            }
+            if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_Q8_0) {
+                return !hrx_dispatch_group_disabled("embed") &&
+                       ggml::hrx::supports_q8_embedding_dispatch(op);
+            }
+            if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_F32) {
+                return !hrx_dispatch_group_disabled("embed") &&
+                       (ggml::hrx::supports_f32_get_rows_dispatch(op) ||
+                        hrx_legacy_leaf_f32_gather_supported(op) ||
+                        (hrx_qwen4exp_router_dispatch_enabled() && hrx_moe_router_gather_qwen4exp(op)));
+            }
             return op->src[0] == nullptr ||
                    (!hrx_dispatch_group_disabled("embed") && hrx_weight_quant_supported(op->src[0]->type) &&
                     (!hrx_non_leaf_gather_qwen4exp(op) ||
@@ -2277,13 +2373,26 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             if (hrx_dispatch_group_disabled("matmul") || hrx_mul_mat_ne0_declined(op)) {
                 return false;
             }
-            // Q8_0 has exactly one dense matcher, so its shape guards must be replicated here to
-            // avoid stranding shapes that matcher declines. See hrx_dense_matmul_q8_0_shape_supported().
+            // Each Q8 route must pair capability with an actual single-op matcher.
             if (op->src[0]->type == GGML_TYPE_Q8_0) {
-                return hrx_dense_matmul_q8_0_shape_supported(op);
+                return hrx_dense_matmul_q8_0_shape_supported(op) ||
+                       (op->src[1] != nullptr &&
+                        ggml::hrx::llm_q8_narrow_supported(*op->src[0], *op->src[1], *op));
             }
             if (op->src[0]->type == GGML_TYPE_F32) {
                 return hrx_dense_matmul_f32_supported(op);
+            }
+            if (op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q6_K) {
+                const ggml_tensor * input = op->src[1];
+                if (input == nullptr) {
+                    return false;
+                }
+                // Existing quantized projection matchers are 2D. Only the opt-in shared HC route
+                // covers these batched axes; do not claim arbitrary 3D/4D or batched weights.
+                if (op->src[0]->ne[2] != 1 || op->src[0]->ne[3] != 1 ||
+                    input->ne[2] != 1 || input->ne[3] != 1 || op->ne[2] != 1 || op->ne[3] != 1) {
+                    return ggml::hrx::llm_mtp_hc_projection_supported(*op->src[0], *input, *op);
+                }
             }
             return hrx_dense_matmul_weight_supported(op->src[0]->type);
         case GGML_OP_MUL_MAT_ID:
@@ -2293,26 +2402,12 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             if (hrx_dispatch_group_disabled("matmul")) {
                 return false;
             }
-            // qwen4exp routed (MoE) gate/up projection: Q4_K at [hidden, expert_hidden, experts],
-            // served by "llm.routed_ffn.decode_gate_up_swiglu_q4k_q8_qwen4exp", which fuses gate + up
-            // + SwiGLU and republishes the result as a Q8_1-x4 alternate for the down dispatch.
-            //
-            // Deliberately shape-only (no token-count guard), for the same reason the down arm below
-            // is: llama.cpp's load-time buffer probe builds its MUL_MAT_ID test op with 512 tokens
-            // (weight_buft_supported()), which is byte-for-byte the same shape as a real 512-token
-            // prefill node -- so the two are indistinguishable here. Declining on token count would
-            // only push ffn_*_exps.weight into a CPU buffer and strand the whole routed FFN on the
-            // CPU, which is exactly the state this change exists to fix.
-            //
-            // Consequence, identical in kind to the down arm: a genuine prefill gate/up (n_ubatch > 1)
-            // is claimed but has no matcher -- the grouped/prefill schedule packs its expert ordinal
-            // into 7 bits of the partition descriptor, so it is structurally capped at 128 experts and
-            // can never serve qwen4exp's 512 -- and will hard-abort in DispatchScheduler rather than
-            // falling back to CPU. The entire qwen4exp HRX path (attention, GDN, routed down) is
-            // already decode-only for the same reason, so this adds no new constraint: run with
-            // -ub 1. See hrx_moe_gate_up_weight_qwen4exp().
+            // Preserve loader placement without claiming execution of its synthetic T=512 op.
+            // Q4_K keeps its T=1 fusion; raw IQ gate/up additionally admits opt-in T=2..8.
             if (hrx_moe_gate_up_weight_qwen4exp(op->src[0])) {
-                return true;
+                return hrx_moe_placement_probe(op) ||
+                       (hrx_moe_op_layout_supported(op, false) &&
+                        (op->src[0]->type != GGML_TYPE_Q4_K || op->ne[2] == 1));
             }
             if (hrx_weight_quant_supported(op->src[0]->type)) {
                 return true;
@@ -2321,15 +2416,15 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             // shape. See hrx_moe_down_quant_supported() above for why this is scoped to MUL_MAT_ID
             // and to this specific shape, and hrx-moe-down-kernel-spec.md §4 for the full rationale.
             // dispatch-routed-ffn.cpp registers "llm.routed_ffn.decode_down_qwen4exp", which matches
-            // Q5_1/Q8_0/IQ4_NL MUL_MAT_ID nodes fitting the decode-time weighted-reduce+residual-add
-            // topology. NOTE: this device_supports_op() check is still shape-only (op-level), so it
-            // will also claim MUL_MAT_ID nodes of this quant/shape whose surrounding graph topology
-            // does NOT match that dispatch (e.g. prefill, or an unexpected fusion) -- those nodes have
-            // no other registered matcher and will hard-abort in DispatchScheduler rather than falling
-            // back to CPU. This is the same general class of issue as the broader compute-op
-            // over-claim in the `default: return true;` case below (RMS_NORM/ADD/ROPE/etc.), just
-            // narrower in scope since it is gated to one specific weight quant+shape combination.
-            return hrx_moe_down_weight_supported(op->src[0]) && hrx_moe_down_chain_fusable_qwen4exp(op);
+            // Q5_1 decode and Q8_0/IQ4_NL decode or opt-in small batches. Capability
+            // checks cannot inspect consumers: the dispatch still requires the weighted
+            // ten-route ADD fold, with optional safe residual. Bare projections are not supported.
+            return hrx_moe_down_weight_supported(op->src[0]) &&
+                   (hrx_moe_placement_probe(op) ||
+                    (op->src[0]->ne[1] == 2560 && op->src[0]->ne[2] == 512 && op->src[0]->ne[3] == 1 &&
+                     ggml_is_contiguous(op->src[0]) && hrx_moe_op_layout_supported(op, true) &&
+                     (op->ne[2] == 1 || op->src[0]->type != GGML_TYPE_Q5_1) &&
+                     hrx_moe_down_chain_fusable_qwen4exp(op)));
         // qwen4exp GDN (Gated DeltaNet): all four of these are real compute ops with the over-claim
         // risk described in the comment above hrx_gdn_ssm_conv_decode_supported(), so each is
         // scoped to the exact qwen4exp decode-time shape profile and declined otherwise (falls back to
@@ -2358,7 +2453,9 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             return hrx_unary_f32_supported(op) ||
                    (!hrx_gdn_group_disabled("gdnconv") && hrx_gdn_unary_decode_supported(op));
         case GGML_OP_FLASH_ATTN_EXT:
-            return !hrx_dispatch_group_disabled("attn") && !hrx_attention_head_size_unsupported(op);
+            return !hrx_dispatch_group_disabled("attn") && !hrx_attention_head_size_unsupported(op) &&
+                   (op->src[0] == nullptr || op->src[0]->ne[0] != kHrxAttentionHeadSizeQwen4Exp ||
+                    ggml::hrx::supports_qwen4exp_flash_attention_dispatch(op));
         // llama.cpp clears a recurrent state slot with ggml_scale_inplace(s, 0) and carries surviving
         // slots forward with ggml_cpy(), both writing straight into the pre-allocated recurrent state
         // cache. ggml_backend_sched aborts instead of falling back when a pre-allocated tensor sits in a
@@ -2392,12 +2489,16 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // Each remaining guard names a specific qwen4exp shape that no matcher roots at. The GDN
         // alpha/gate prelude used to be one of them; common.add_f32 / common.mul_f32 now cover it.
         case GGML_OP_ADD:
-            return !hrx_add_non_f32(op) && !hrx_qsa_indexer_row_qwen4exp(op);
+            return !hrx_add_non_f32(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
+                   (ggml::hrx::supports_add_f32_dispatch(op) ||
+                    (!hrx_dispatch_group_disabled("matmul") && ggml::hrx::supports_fused_moe_add(op)));
         case GGML_OP_MUL:
             return hrx_mul_supported(op);
         case GGML_OP_RMS_NORM:
             return !hrx_gdn_norm_gate_row(op) && !hrx_attention_head_major_qwen4exp(op) &&
-                   !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op);
+                   !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op) &&
+                   (!(op->ne[0] == kHrxHiddenSizeQwen4Exp && op->ne[1] == kHrxHcMultiplierQwen4Exp) ||
+                    ggml::hrx::qwen4exp_hc_grouped_norm_rms_supported(op));
         case GGML_OP_REPEAT:
             return hrx_repeat_dispatch_enabled() && hrx_repeat_f32_supported(op);
         // VIEW is deliberately absent from these shape guards. It is a pure layout alias that the
@@ -2417,9 +2518,19 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_DIV:
             return hrx_qwen4exp_router_dispatch_enabled() || !hrx_moe_route_weight_norm_qwen4exp(op);
         case GGML_OP_SET_ROWS:
-            return !hrx_cache_publish_unmatched_qwen4exp(op);
+            return ggml::hrx::supports_set_rows_dispatch(op) || !hrx_cache_publish_unmatched_qwen4exp(op);
         case GGML_OP_GLU:
-            return !hrx_moe_glu_qwen4exp_decode(op);
+            if (ggml::hrx::supports_swiglu_f32_dispatch(op)) {
+                return true;
+            }
+            // Preserve routed fusion eligibility without claiming arbitrary standalone GLUs.
+            return op->type == GGML_TYPE_F32 && ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
+                   op->src[0] != nullptr && op->src[1] != nullptr &&
+                   op->src[0]->op == GGML_OP_MUL_MAT_ID && op->src[1]->op == GGML_OP_MUL_MAT_ID &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]) && !hrx_moe_glu_qwen4exp_decode(op);
         case GGML_OP_SOFT_MAX:
         case GGML_OP_ARGSORT:
             return hrx_qwen4exp_router_dispatch_enabled() || !hrx_moe_router_row_qwen4exp(op);
@@ -2466,28 +2577,34 @@ static ggml_backend_dev_t registry_device(ggml_backend_reg_t registry, size_t in
     return &context->devices[index];
 }
 
+static bool registry_shutdown(ggml_backend_reg_t registry) {
+    return static_cast<ggml_backend_hrx_reg_context *>(registry->context)->shutdown();
+}
+
 static void * registry_proc(ggml_backend_reg_t registry, const char * name) {
     GGML_UNUSED(registry);
-    GGML_UNUSED(name);
+    if (std::strcmp(name, "ggml_backend_reg_shutdown") == 0) {
+        return reinterpret_cast<void *>(registry_shutdown);
+    }
+    if (std::strcmp(name, "ggml_backend_hrx_shutdown") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_hrx_shutdown);
+    }
+    if (std::strcmp(name, "ggml_backend_hrx_set_mtp_host_trace_scope") == 0) {
+        return reinterpret_cast<void *>(ggml::hrx::set_mtp_host_trace_scope);
+    }
     return nullptr;
 }
 
 static const ggml_backend_reg_i registry_i = { registry_name, registry_device_count, registry_device, registry_proc };
 
-static std::unique_ptr<ggml_backend_hrx_reg_context> create_registry_context() {
-    auto         context = std::make_unique<ggml_backend_hrx_reg_context>();
-    hrx_status_t status  = hrx_gpu_initialize(0);
-    if (hrx_status_is_ok(status)) {
-        context->initialized = true;
-    } else if (hrx_status_code(status) == HRX_STATUS_ALREADY_EXISTS) {
-        hrx_status_ignore(status);
-    } else {
-        hrx_status_ignore(status);
-        return context;
+static void create_registry_context(ggml_backend_hrx_reg_context * context) {
+    if (!context->ensure_runtime_locked()) {
+        return;
     }
     int count = 0;
     if (!HRX_CHECK(hrx_gpu_device_count(&count))) {
-        return context;
+        context->release_runtime_locked();
+        return;
     }
     context->device_contexts.reserve(count);
     context->devices.reserve(count);
@@ -2498,6 +2615,8 @@ static std::unique_ptr<ggml_backend_hrx_reg_context> create_registry_context() {
         }
         hrx_device_retain(hrx_device);
         auto device_ctx                      = std::make_unique<ggml_backend_hrx_device_context>();
+        device_ctx->registry                 = context;
+        device_ctx->ordinal                  = i;
         device_ctx->device                   = hrx_device;
         device_ctx->name                     = "HRX" + std::to_string(i);
         device_ctx->use_direct_host_bindings = environment_flag_enabled("GGML_HRX_USE_UNIFIED_MEMORY");
@@ -2534,18 +2653,30 @@ static std::unique_ptr<ggml_backend_hrx_reg_context> create_registry_context() {
         context->device_contexts.back()->buft.device      = &context->devices.back();
         context->device_contexts.back()->host_buft.device = &context->devices.back();
     }
+}
+
+static ggml_backend_hrx_reg_context & registry_context() {
+    static ggml_backend_hrx_reg_context context;
     return context;
 }
 
 }  // namespace
 
 ggml_backend_reg_t ggml_backend_hrx_reg() {
-    static std::unique_ptr<ggml_backend_hrx_reg_context> context = create_registry_context();
-    static ggml_backend_reg registry = { GGML_BACKEND_API_VERSION, registry_i, context.get() };
-    for (auto & device : context->devices) {
-        device.reg = &registry;
-    }
+    auto & context = registry_context();
+    static ggml_backend_reg registry = { GGML_BACKEND_API_VERSION, registry_i, &context };
+    std::call_once(context.discovery, [&] {
+        std::lock_guard<std::mutex> lock(context.mutex);
+        create_registry_context(&context);
+        for (auto & device : context.devices) {
+            device.reg = &registry;
+        }
+    });
     return &registry;
+}
+
+bool ggml_backend_hrx_shutdown() {
+    return registry_context().shutdown();
 }
 
 ggml_backend_t ggml_backend_hrx_init(size_t device) {
