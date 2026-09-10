@@ -1,0 +1,46 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_qsa_bf16_projection_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_qsa_bf16_projection_wave64) export("ggml_qsa_bf16_projection") @ggml_qsa_bf16_projection(
+    %output_size: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%output_size, %token_count, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%output_size: index, %token_count: index, %weight: buffer, %input: buffer, %output: buffer) {
+  %outputs = index.assume %output_size [range(%output_size, 1, 513)] : index
+  %tokens = index.assume %token_count [range(%token_count, 1, 9)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %token0 = kernel.workgroup.id<y> : index
+  %row = index.assume %row0 [lt(%row0, %outputs)] : index
+  %token = index.assume %token0 [lt(%token0, %tokens)] : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %width = index.constant 2560 : index
+  %zero_offset = index.constant 0 : offset
+  %zero_index = index.constant 0 : index
+  %wv = buffer.view %weight[%zero_offset] : buffer -> view<[%outputs]x2560xbf16>
+  %iv = buffer.view %input[%zero_offset] : buffer -> view<[%tokens]x2560xf32>
+  %ov = buffer.view %output[%zero_offset] : buffer -> view<[%tokens]x[%outputs]xf32>
+  %zero = scalar.constant 0.0 : f32
+  %partial = scf.for %column0 = [%lane to %width step %threads](%sum = %zero : f32) -> (f32) {
+    %column = index.assume %column0 [range(%column0, 0, 2560)] : index
+    %w16 = view.load %wv[%row, %column] : view<[%outputs]x2560xbf16> -> bf16
+    %w = scalar.extf %w16 : bf16 to f32
+    %x32 = view.load %iv[%token, %column] : view<[%tokens]x2560xf32> -> f32
+    // Match the existing GGML CPU BF16 dot-product contract, including its
+    // activation conversion. This is not an additional precision reduction.
+    %x16 = scalar.fptrunc %x32 : f32 to bf16
+    %x = scalar.extf %x16 : bf16 to f32
+    %product = scalar.mulf %w, %x : f32
+    %next = scalar.addf %sum, %product : f32
+    scf.yield %next : f32
+  }
+  %sum = kernel.workgroup.reduce<addf> %partial : f32
+  %writer = index.cmp eq, %lane, %zero_index : index
+  scf.if %writer {
+    view.store %sum, %ov[%token, %row] : f32, view<[%tokens]x[%outputs]xf32>
+  }
+  kernel.return
+}

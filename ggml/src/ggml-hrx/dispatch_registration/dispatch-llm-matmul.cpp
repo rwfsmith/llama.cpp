@@ -28,6 +28,12 @@ static constexpr KernelCatalogRef kLlmDenseQ8_0F32AccumKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q8_0_f32_accum");
 static constexpr KernelCatalogRef kLlmDenseQ8_0GemvKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q8_0_gemv_f32");
+static constexpr KernelCatalogRef kLlmDenseQ6KF32GemvKernel =
+    GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_linear_q6k_f32_wave64");
+static constexpr KernelCatalogRef kLlmDenseQ8RoundedGemvKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q8_0_rounded_gemv");
+static constexpr KernelCatalogRef kLlmDenseQ6RoundedGemvKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_dense_q6k_rounded_gemv");
 static constexpr KernelCatalogRef kLlmQ8NarrowPackKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_q8_narrow_pack");
 static constexpr KernelCatalogRef kLlmQ8NarrowDotKernel =
@@ -55,6 +61,16 @@ static bool is_supported_dense_output_size(int64_t output_size) {
 
 static bool dense_f32_accum_enabled() {
     const char * flag = std::getenv("HRX_ENABLE_DENSE_F32_ACCUM");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+static bool dense_f32_gemv_enabled() {
+    const char * flag = std::getenv("HRX_ENABLE_DENSE_F32_GEMV");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+static bool dense_rounded_gemv_enabled() {
+    const char * flag = std::getenv("HRX_ENABLE_DENSE_ROUNDED_GEMV");
     return flag != nullptr && std::strcmp(flag, "1") == 0;
 }
 
@@ -137,6 +153,25 @@ static LlmDenseMatmulMatch match_llm_dense_matmul(const Graph &       graph,
         return {};
     }
 
+    // The accumulation-only route still stages F16 operands in 32-token WMMA
+    // tiles. Reuse the existing raw-F32 packet GEMVs at T1 instead: Q8 uses
+    // four independent wave32 rows; Q6 uses a wave64 two-row block cohort.
+    if (dense_f32_gemv_enabled() && token_count == 1 && weight->byte_count <= UINT32_MAX) {
+        if (weight->type == GGML_TYPE_Q8_0) {
+            match.kernel = kLlmDenseQ8_0GemvKernel;
+        } else if (weight->type == GGML_TYPE_Q6_K) {
+            match.kernel = kLlmDenseQ6KF32GemvKernel;
+        }
+    }
+    // Explicit baseline-operand selection wins over the raw-F32 experiment.
+    if (dense_rounded_gemv_enabled() && token_count == 1 && weight->byte_count <= UINT32_MAX) {
+        if (weight->type == GGML_TYPE_Q8_0) {
+            match.kernel = kLlmDenseQ8RoundedGemvKernel;
+        } else if (weight->type == GGML_TYPE_Q6_K) {
+            match.kernel = kLlmDenseQ6RoundedGemvKernel;
+        }
+    }
+
     match.input       = input;
     match.weight      = weight;
     match.output      = output;
@@ -157,6 +192,13 @@ static void build_llm_dense_matmul_dispatch(const LlmDenseMatmulMatch & match,
     if (match.kernel.id == kLlmDenseQ8_0GemvKernel.id) {
         dispatch.kernel.integer_parameters.emplace("input_size", match.input_size);
         dispatch.kernel.integer_parameters.emplace("output_size", match.output_size);
+    } else if (match.kernel.id == kLlmDenseQ6KF32GemvKernel.id) {
+        dispatch.kernel.integer_parameters.emplace("token_count", match.token_count);
+        dispatch.kernel.integer_parameters.emplace("input_size", match.input_size);
+        dispatch.kernel.integer_parameters.emplace("output_size", match.output_size);
+        dispatch.kernel.compile_parameters.emplace("ggml.linear_q6k_f32.token_capacity", "1");
+        dispatch.kernel.compile_parameters.emplace("ggml.linear_q6k_f32.output_capacity",
+                                                   to_config_value(match.output_size));
     } else {
         dispatch.kernel.integer_parameters.emplace("token_count", match.token_count);
         dispatch.kernel.compile_parameters.emplace("qwen3_moe.workload.token_capacity", to_config_value(match.token_count));
@@ -164,7 +206,8 @@ static void build_llm_dense_matmul_dispatch(const LlmDenseMatmulMatch & match,
                                                    to_config_value(match.input_size));
         dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.output_size",
                                                    to_config_value(match.output_size));
-        if (kernel.id == match.kernel.id) {
+        if (kernel.id == match.kernel.id && kernel.id != kLlmDenseQ8RoundedGemvKernel.id &&
+            kernel.id != kLlmDenseQ6RoundedGemvKernel.id) {
             dispatch.kernel.compile_parameters.emplace("qwen3_moe.dense_quantized.output_accumulation", "0");
         }
     }

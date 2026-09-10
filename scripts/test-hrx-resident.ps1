@@ -52,6 +52,20 @@ try {
     Assert-Test ($configuration.Environment.HRX_ENABLE_Q8_GEMV -eq '0') 'Q8 GEMV stays disabled'
     Assert-Test ($configuration.Environment.HRX_MUL_CLAIM_MASK -eq '0x7F') 'known-good claim mask'
     Assert-Test ($configuration.Models.Count -eq 1) 'MTP is opt-in'
+    $previousLlvmPath = $env:LLVM_PATH
+    try {
+        $env:LLVM_PATH = 'C:\unrelated-build\lib\llvm'
+        $compilerConfiguration = New-HrxStartupConfiguration $base
+        Assert-Test (-not $compilerConfiguration.Environment.ContainsKey('LLVM_PATH')) 'inherited LLVM_PATH is removed, not blanked'
+        Assert-Test ($env:LLVM_PATH -eq 'C:\unrelated-build\lib\llvm') 'parent LLVM_PATH is unchanged'
+        Assert-Test ($baseline -eq (Get-TestFingerprint $base)) 'inherited LLVM_PATH does not affect runtime fingerprint'
+        $compilerOverride = $base.Clone(); $compilerOverride.Env = @{ LLVM_PATH = 'C:\explicit-compiler' }
+        $explicitCompilerConfiguration = New-HrxStartupConfiguration $compilerOverride
+        Assert-Test ($explicitCompilerConfiguration.Environment.LLVM_PATH -eq 'C:\explicit-compiler') 'explicit LLVM_PATH override is preserved'
+        Assert-Test ($baseline -ne (Get-TestFingerprint $compilerOverride)) 'explicit LLVM_PATH override is fingerprinted'
+    } finally {
+        $env:LLVM_PATH = $previousLlvmPath
+    }
     # A present-but-empty LLAMA_ARG_API_KEY_FILE makes llama.cpp try to open '' and fail
     # startup outright; these must be absent from the child environment, not blanked.
     Assert-Test (-not $configuration.Environment.ContainsKey('LLAMA_API_KEY')) 'LLAMA_API_KEY is removed, not blanked'
@@ -78,7 +92,7 @@ try {
     $overrideConfiguration = New-HrxStartupConfiguration $override
     Assert-Test ($overrideConfiguration.Environment.HRX_ENABLE_SMALL_BATCH_GLUE -eq '0') 'explicit Env overrides small-batch defaults'
     Assert-Test ($overrideConfiguration.Environment.HRX_ENABLE_SWIGLU -eq '1') 'SWIGLU can be explicitly enabled'
-    foreach ($field in @('Prompt', 'PromptFile', 'Seed', 'Temperature', 'N', 'ExpectedOutput', 'CachePrompt', 'Tag')) {
+    foreach ($field in @('Prompt', 'PromptFile', 'Seed', 'Temperature', 'N', 'TopLogprobs', 'ExpectedOutput', 'CachePrompt', 'Tag')) {
         $changed = $base.Clone(); $changed[$field] = 'different-request'
         Assert-Test ($baseline -eq (Get-TestFingerprint $changed)) "$field does not restart"
     }

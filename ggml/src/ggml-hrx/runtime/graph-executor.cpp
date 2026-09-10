@@ -141,7 +141,8 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
     const clock::time_point t_looked_up = timing ? clock::now() : clock::time_point{};
     GraphProgramMatch binding_match = std::move(lookup.match);
     if (use_graph_prepared && lookup.program->has_prepared_program()) {
-        binding_match = lookup.program->match_host_staging_graph(graph);
+        // A stable node array does not guarantee stable device allocations or source slots.
+        binding_match = lookup.program->match_trusted_graph(graph);
         if (!binding_match.valid()) {
             result.status.append(binding_match.status);
             return result;

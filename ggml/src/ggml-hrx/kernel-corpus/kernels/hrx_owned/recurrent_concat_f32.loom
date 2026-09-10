@@ -1,0 +1,52 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_recurrent_concat_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_recurrent_concat_wave64) export("ggml_recurrent_concat_f32") @ggml_recurrent_concat_f32(
+    %history_count: index, %token_count: index, %input_transposed: index) {
+  %one = index.constant 1 : index
+  %groups = index.constant 40 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%history_count: index, %token_count: index, %input_transposed: index,
+         %history: buffer, %input: buffer, %output: buffer) {
+  %past = index.assume %history_count [range(%history_count, 3, 10)] : index
+  %tokens = index.assume %token_count [range(%token_count, 1, 9)] : index
+  %width = index.add %past, %tokens : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %group, %threads : index
+  %channel0 = index.add %base, %lane : index
+  %channel = index.assume %channel0 [range(%channel0, 0, 10240)] : index
+  %zero_offset = index.constant 0 : offset
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %hv = buffer.view %history[%zero_offset] : buffer -> view<10240x[%past]xf32>
+  %iv = buffer.view %input[%zero_offset] : buffer -> view<10240x[%tokens]xf32>
+  %it = buffer.view %input[%zero_offset] : buffer -> view<[%tokens]x10240xf32>
+  %ov = buffer.view %output[%zero_offset] : buffer -> view<10240x[%width]xf32>
+  scf.for %column0 = [%zero to %past step %one] {
+    %column = index.assume %column0 [lt(%column0, %past)] : index
+    %out_column = index.assume %column [lt(%column, %width)] : index
+    %value = view.load %hv[%channel, %column] : view<10240x[%past]xf32> -> f32
+    view.store %value, %ov[%channel, %out_column] : f32, view<10240x[%width]xf32>
+    scf.yield
+  }
+  %transposed = index.cmp eq, %input_transposed, %one : index
+  scf.for %token0 = [%zero to %tokens step %one] {
+    %token = index.assume %token0 [lt(%token0, %tokens)] : index
+    %out_column0 = index.add %past, %token : index
+    %out_column = index.assume %out_column0 [lt(%out_column0, %width)] : index
+    scf.if %transposed {
+      %value = view.load %it[%token, %channel] : view<[%tokens]x10240xf32> -> f32
+      view.store %value, %ov[%channel, %out_column] : f32, view<10240x[%width]xf32>
+    } else {
+      %value = view.load %iv[%channel, %token] : view<10240x[%tokens]xf32> -> f32
+      view.store %value, %ov[%channel, %out_column] : f32, view<10240x[%width]xf32>
+    }
+    scf.yield
+  }
+  kernel.return
+}

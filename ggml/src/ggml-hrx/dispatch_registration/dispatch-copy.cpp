@@ -13,9 +13,53 @@ namespace ggml::hrx {
 static constexpr KernelCatalogRef kCopyF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_copy_f32");
 static constexpr KernelCatalogRef kCopyRowsF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_copy_rows_f32");
 static constexpr KernelCatalogRef kSetRowsKernel = GGML_HRX_KERNEL_REF("hrx_owned", "ggml_set_rows_f32");
+static constexpr KernelCatalogRef kQsaF16GatherKernel = GGML_HRX_KERNEL_REF("hrx_owned", "ggml_qsa_get_rows_f16");
 
 bool is_set_rows_kernel(uint64_t kernel_id) {
     return kernel_id == kSetRowsKernel.id;
+}
+
+bool is_qsa_f16_gather_kernel(uint64_t kernel_id) {
+    return kernel_id == kQsaF16GatherKernel.id;
+}
+
+// A leaf with no producer op in this graph (GGML_OP_NONE) that is explicitly marked as a
+// graph input can only have been populated by host code before this command executes --
+// never by a GPU-computed producer within the same graph. This holds for the KV-cache
+// slot-index tensors (`k_idxs`/`v_idxs`, written directly by the CPU-side slot allocator),
+// but not for e.g. GPU-computed top-k routing indices, which always have a real producer
+// op (or a view of one). Used to let SET_ROWS/GET_ROWS skip the synchronous per-launch
+// index-validation readback for provably host-populated, bounded-by-construction indices,
+// while every GPU-computed producer keeps full validation.
+bool is_trusted_host_index_producer(const ggml_tensor * tensor) {
+    if (tensor != nullptr && tensor->op == GGML_OP_VIEW) {
+        const char * enabled = std::getenv("HRX_ENABLE_TRUSTED_INDEX_VIEWS");
+        if (enabled == nullptr || enabled[0] != '1' || enabled[1] != '\0') {
+            return false;
+        }
+        // Recurrent s_copy_main/s_copy_extra are slices of a host-populated input.
+        // Follow the producer, not view_src: the latter can skip an in-place op.
+        while (tensor != nullptr && tensor->op == GGML_OP_VIEW) {
+            const ggml_tensor * source = tensor->src[0];
+            if (source == nullptr || tensor->view_src == nullptr || tensor->type != source->type ||
+                !ggml_is_contiguous(tensor) || !ggml_is_contiguous(source)) {
+                return false;
+            }
+            const ggml_tensor * root = source->view_src != nullptr ? source->view_src : source;
+            const size_t source_offset = source->view_src != nullptr ? source->view_offs : 0;
+            if (tensor->view_src != root || tensor->view_offs < source_offset) {
+                return false;
+            }
+            const size_t offset = tensor->view_offs - source_offset;
+            const size_t source_bytes = ggml_nbytes(source);
+            if (offset % ggml_type_size(tensor->type) != 0 || offset > source_bytes ||
+                ggml_nbytes(tensor) > source_bytes - offset) {
+                return false;
+            }
+            tensor = source;
+        }
+    }
+    return tensor != nullptr && tensor->op == GGML_OP_NONE && (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
 }
 
 static const ggml_tensor * storage_root(const ggml_tensor * tensor) {
@@ -272,6 +316,75 @@ static bool match_copy_rows_f32_dispatch(const DispatchMatchContext & context, D
     return true;
 }
 
+template<class T>
+static bool qsa_f16_gather_geometry(const T & source, const T & ids, const T & output) {
+    if (source.type != GGML_TYPE_F16 || ids.type != GGML_TYPE_I32 || output.type != GGML_TYPE_F32 ||
+        source.ne[0] != 128 || source.ne[1] < 1 || source.ne[1] > 4096 ||
+        ids.ne[0] < 1 || ids.ne[0] > 4096 || output.ne[0] != 128 || output.ne[1] != ids.ne[0] ||
+        source.ne[2] != 1 || source.ne[3] != 1 ||
+        ids.ne[1] != 1 || ids.ne[2] != 1 || ids.ne[3] != 1 ||
+        output.ne[2] != 1 || output.ne[3] != 1 ||
+        source.nb[0] != sizeof(ggml_fp16_t) || source.nb[1] != 128 * sizeof(ggml_fp16_t) ||
+        ids.nb[0] != sizeof(int32_t) || output.nb[0] != sizeof(float) ||
+        output.nb[1] != 128 * sizeof(float) ||
+        !copy_contiguous(source) || !copy_contiguous(ids) || !copy_contiguous(output)) {
+        return false;
+    }
+    return copy_bytes(source) == static_cast<size_t>(128 * source.ne[1]) * sizeof(ggml_fp16_t) &&
+           copy_bytes(ids) == static_cast<size_t>(ids.ne[0]) * sizeof(int32_t) &&
+           copy_bytes(output) == static_cast<size_t>(128 * ids.ne[0]) * sizeof(float);
+}
+
+static bool qsa_gather_view_span(const ggml_tensor * tensor, size_t alignment) {
+    if (tensor->view_src == nullptr) {
+        return tensor->view_offs == 0;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    const size_t root_bytes = ggml_nbytes(tensor->view_src);
+    return tensor->view_offs % alignment == 0 && tensor->view_offs <= root_bytes &&
+           bytes <= root_bytes - tensor->view_offs;
+}
+
+bool supports_qsa_f16_gather_dispatch(const ggml_tensor * op) {
+    const char * flag = std::getenv("HRX_ENABLE_QSA_F16_GATHER");
+    if (flag == nullptr || flag[0] != '1' || flag[1] != '\0' ||
+        op == nullptr || op->op != GGML_OP_GET_ROWS || op->src[0] == nullptr || op->src[1] == nullptr ||
+        op->view_src != nullptr || !qsa_f16_gather_geometry(*op->src[0], *op->src[1], *op)) {
+        return false;
+    }
+    return qsa_gather_view_span(op->src[0], sizeof(ggml_fp16_t)) &&
+           qsa_gather_view_span(op->src[1], sizeof(int32_t));
+}
+
+static bool match_qsa_f16_gather_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_GET_ROWS || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * source = graph_value(context.graph, node->inputs[0]);
+    const Value * ids = graph_value(context.graph, node->inputs[1]);
+    const Value * output = graph_value(context.graph, node->output);
+    if (source == nullptr || ids == nullptr || output == nullptr ||
+        !supports_qsa_f16_gather_dispatch(output->tensor) ||
+        !qsa_f16_gather_geometry(*source, *ids, *output) ||
+        source->storage == output->storage || ids->storage == output->storage) {
+        return false;
+    }
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kQsaF16GatherKernel);
+    dispatch.kernel.integer_parameters = {
+        { "hidden_size", 128 },
+        { "vocabulary_count", source->ne[1] },
+        { "token_count", ids->ne[0] },
+    };
+    dispatch.bindings.push_back({ source->id, 0, source->byte_count });
+    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count, is_trusted_host_index_producer(ids->tensor) });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
 static bool match_set_rows_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
     const GraphNode * node = context.root_node;
     if (node == nullptr || node->op != GGML_OP_SET_ROWS || node->inputs.size() != 3) {
@@ -299,7 +412,9 @@ static bool match_set_rows_dispatch(const DispatchMatchContext & context, Dispat
         { "index_i64", ids->type == GGML_TYPE_I64 ? 1 : 0 },
     };
     dispatch.bindings.push_back({ source->id, 0, source->byte_count });
-    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count });
+    // KV-cache slot indices (k_idxs/v_idxs) are host-populated leaves; GPU-computed
+    // routing indices (e.g. QSA top-k) always have a real producer op and stay untrusted.
+    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count, is_trusted_host_index_producer(ids->tensor) });
     // SET_ROWS aliases src[2]. ReadWrite preserves all rows and padding not selected by IDs.
     dispatch.bindings.push_back({ output->id, 0, output->byte_count });
     match.covered_nodes.push_back(context.root_index);
@@ -308,6 +423,14 @@ static bool match_set_rows_dispatch(const DispatchMatchContext & context, Dispat
 }
 
 void register_copy_dispatch(DispatchRegistryBuilder & registry) {
+    registry.add({
+        "qwen4exp.qsa_get_rows_f16",
+        GGML_OP_GET_ROWS,
+        DispatchMatchKind::SingleOp,
+        -100,
+        DispatchSource::Common,
+        match_qsa_f16_gather_dispatch,
+    });
     registry.add({
         "common.set_rows_f32",
         GGML_OP_SET_ROWS,

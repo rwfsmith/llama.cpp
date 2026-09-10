@@ -256,3 +256,289 @@ kernel.def target(@ggml_iq_expert_wave64) export("ggml_mul_mat_id_iq4_xs_f32") @
   func.call @ggml_iq_expert_dot(%input_size, %output_size, %expert_count, %route_count, %token_count, %route_id_stride, %weight, %input, %ids, %tables, %output, %iq3, %bytes) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer, i1, offset)
   kernel.return
 }
+
+// Packet lanes still cover a contiguous row: lane L owns elements 4L..4L+3
+// in each 256-element block. Only F32 arithmetic is used after dequantization.
+func.def inline @ggml_iq3_packet_value(%grid: i8, %signs: i32, %mask: i32, %scale: f32) -> (f32) {
+  %zero = scalar.constant 0 : i32
+  %one = scalar.constant 1.0 : f32
+  %minus_one = scalar.constant -1.0 : f32
+  %bit = scalar.andi %signs, %mask : i32
+  %negative = scalar.cmpi ne, %bit, %zero : i32
+  %sign = scf.select %negative, %minus_one, %one : f32
+  %gi = scalar.extui %grid : i8 to i32
+  %gf = scalar.uitofp %gi : i32 to f32
+  %magnitude = scalar.mulf %scale, %gf : f32
+  %result = scalar.mulf %magnitude, %sign : f32
+  func.return %result : f32
+}
+
+func.def inline @ggml_iq3_xxs_packet4(%weight: buffer, %base: offset, %packet: index, %tables: buffer) -> (f32, f32, f32, f32) {
+  %zero = index.constant 0 : offset
+  %two = index.constant 2 : offset
+  %sign_offset = index.constant 1024 : offset
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c64 = index.constant 64 : index
+  %i1 = scalar.constant 1 : i32
+  %i2 = scalar.constant 2 : i32
+  %i4 = scalar.constant 4 : i32
+  %i7 = scalar.constant 7 : i32
+  %i8 = scalar.constant 8 : i32
+  %i16 = scalar.constant 16 : i32
+  %i24 = scalar.constant 24 : i32
+  %i28 = scalar.constant 28 : i32
+  %i127 = scalar.constant 127 : i32
+  %half = scalar.constant 0.5 : f32
+  %p = index.assume %packet [range(%packet, 0, 63)] : index
+  %dview = buffer.view %weight[%base] : buffer -> view<1xf16>
+  %qbase = index.add %base, %two : offset
+  %qs = buffer.view %weight[%qbase] : buffer -> view<96xi8>
+  %grid = buffer.view %tables[%zero] : buffer -> view<256x4xi8>
+  %signs = buffer.view %tables[%sign_offset] : buffer -> view<128xi8>
+  %group = index.div %p, %c8 : index
+  %group4 = index.mul %group, %c4 : index
+  %s0 = index.add %group4, %c64 : index
+  %s1 = index.add %s0, %c1 : index
+  %s2 = index.add %s0, %c2 : index
+  %s3 = index.add %s0, %c3 : index
+  // Preserve byte loads for the sign word at the unaligned block offset 66.
+  %b0 = view.load %qs[%s0] : view<96xi8> -> i8
+  %b1 = view.load %qs[%s1] : view<96xi8> -> i8
+  %b2 = view.load %qs[%s2] : view<96xi8> -> i8
+  %b3 = view.load %qs[%s3] : view<96xi8> -> i8
+  %u0 = scalar.extui %b0 : i8 to i32
+  %u1 = scalar.extui %b1 : i8 to i32
+  %u2 = scalar.extui %b2 : i8 to i32
+  %u3 = scalar.extui %b3 : i8 to i32
+  %v1 = scalar.shli %u1, %i8 : i32
+  %v2 = scalar.shli %u2, %i16 : i32
+  %v3 = scalar.shli %u3, %i24 : i32
+  %w01 = scalar.ori %u0, %v1 : i32
+  %w23 = scalar.ori %v2, %v3 : i32
+  %word = scalar.ori %w01, %w23 : i32
+  %scale_i = scalar.shrui %word, %i28 : i32
+  %scale_f = scalar.uitofp %scale_i : i32 to f32
+  %scale_plus = scalar.addf %scale_f, %half : f32
+  %d16 = view.load %dview[0] : view<1xf16> -> f16
+  %d = scalar.extf %d16 : f16 to f32
+  %dscale = scalar.mulf %d, %scale_plus : f32
+  %db = scalar.mulf %dscale, %half : f32
+  %in_group = index.rem %p, %c8 : index
+  %octet = index.div %in_group, %c2 : index
+  %octet_i = index.cast %octet : index to i32
+  %shift = scalar.muli %octet_i, %i7 : i32
+  %sign_raw = scalar.shrui %word, %shift : i32
+  %sign_idx_i = scalar.andi %sign_raw, %i127 : i32
+  %sign_idx0 = index.cast %sign_idx_i : i32 to index
+  %sign_idx = index.assume %sign_idx0 [range(%sign_idx0, 0, 127)] : index
+  %sign_byte = view.load %signs[%sign_idx] : view<128xi8> -> i8
+  %sign_word = scalar.extui %sign_byte : i8 to i32
+  %half_octet = index.rem %p, %c2 : index
+  %half_octet_i = index.cast %half_octet : index to i32
+  %sign_shift = scalar.muli %half_octet_i, %i4 : i32
+  %packet_signs = scalar.shrui %sign_word, %sign_shift : i32
+  %code_byte = view.load %qs[%p] : view<96xi8> -> i8
+  %code_i = scalar.extui %code_byte : i8 to i32
+  %code0 = index.cast %code_i : i32 to index
+  %code = index.assume %code0 [range(%code0, 0, 255)] : index
+  %gv = vector.load %grid[%code, 0] : view<256x4xi8> -> vector<4xi8>
+  %g0 = vector.extract %gv[0] : vector<4xi8> -> i8
+  %g1 = vector.extract %gv[1] : vector<4xi8> -> i8
+  %g2 = vector.extract %gv[2] : vector<4xi8> -> i8
+  %g3 = vector.extract %gv[3] : vector<4xi8> -> i8
+  %r0 = func.call @ggml_iq3_packet_value(%g0, %packet_signs, %i1, %db) : (i8, i32, i32, f32) -> (f32)
+  %r1 = func.call @ggml_iq3_packet_value(%g1, %packet_signs, %i2, %db) : (i8, i32, i32, f32) -> (f32)
+  %r2 = func.call @ggml_iq3_packet_value(%g2, %packet_signs, %i4, %db) : (i8, i32, i32, f32) -> (f32)
+  %r3 = func.call @ggml_iq3_packet_value(%g3, %packet_signs, %i8, %db) : (i8, i32, i32, f32) -> (f32)
+  func.return %r0, %r1, %r2, %r3 : f32, f32, f32, f32
+}
+
+func.def inline @ggml_iq4_packet_value(%packed: i8, %shift: i32, %scale: f32, %tables: buffer) -> (f32) {
+  %lut_offset = index.constant 1152 : offset
+  %i15 = scalar.constant 15 : i32
+  %lut = buffer.view %tables[%lut_offset] : buffer -> view<16xi8>
+  %packed_i = scalar.extui %packed : i8 to i32
+  %shifted = scalar.shrui %packed_i, %shift : i32
+  %code_i = scalar.andi %shifted, %i15 : i32
+  %code0 = index.cast %code_i : i32 to index
+  %code = index.assume %code0 [range(%code0, 0, 15)] : index
+  %v8 = view.load %lut[%code] : view<16xi8> -> i8
+  %vi = scalar.extsi %v8 : i8 to i32
+  %vf = scalar.sitofp %vi : i32 to f32
+  %result = scalar.mulf %scale, %vf : f32
+  func.return %result : f32
+}
+
+func.def inline @ggml_iq4_xs_packet4(%weight: buffer, %base: offset, %packet: index, %tables: buffer) -> (f32, f32, f32, f32) {
+  %two = index.constant 2 : offset
+  %four = index.constant 4 : offset
+  %eight = index.constant 8 : offset
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %i2 = scalar.constant 2 : i32
+  %i3 = scalar.constant 3 : i32
+  %i4 = scalar.constant 4 : i32
+  %i15 = scalar.constant 15 : i32
+  %i32 = scalar.constant 32 : i32
+  %p = index.assume %packet [range(%packet, 0, 63)] : index
+  %dview = buffer.view %weight[%base] : buffer -> view<1xf16>
+  %hi_base = index.add %base, %two : offset
+  %lo_base = index.add %base, %four : offset
+  %qs_base = index.add %base, %eight : offset
+  %hi_view = buffer.view %weight[%hi_base] : buffer -> view<1xi16>
+  %lo_view = buffer.view %weight[%lo_base] : buffer -> view<4xi8>
+  %qs = buffer.view %weight[%qs_base] : buffer -> view<128xi8>
+  %group = index.div %p, %c8 : index
+  %group_i = index.cast %group : index to i32
+  %lo_idx = index.div %group, %c2 : index
+  %lo_half = index.rem %group, %c2 : index
+  %lo_shift_idx = index.mul %lo_half, %c4 : index
+  %lo_shift = index.cast %lo_shift_idx : index to i32
+  %lo_byte = view.load %lo_view[%lo_idx] : view<4xi8> -> i8
+  %lo_word = scalar.extui %lo_byte : i8 to i32
+  %lo_shifted = scalar.shrui %lo_word, %lo_shift : i32
+  %lo = scalar.andi %lo_shifted, %i15 : i32
+  %hi16 = view.load %hi_view[0] : view<1xi16> -> i16
+  %hi_word = scalar.extui %hi16 : i16 to i32
+  %hi_shift = scalar.muli %group_i, %i2 : i32
+  %hi_shifted = scalar.shrui %hi_word, %hi_shift : i32
+  %hi_two = scalar.andi %hi_shifted, %i3 : i32
+  %hi = scalar.shli %hi_two, %i4 : i32
+  %scale_raw = scalar.ori %lo, %hi : i32
+  %scale_i = scalar.subi %scale_raw, %i32 : i32
+  %scale_f = scalar.sitofp %scale_i : i32 to f32
+  %d16 = view.load %dview[0] : view<1xf16> -> f16
+  %d = scalar.extf %d16 : f16 to f32
+  %dl = scalar.mulf %d, %scale_f : f32
+  %within = index.rem %p, %c8 : index
+  %nibble = index.div %within, %c4 : index
+  %nibble_shift_idx = index.mul %nibble, %c4 : index
+  %nibble_shift = index.cast %nibble_shift_idx : index to i32
+  %byte_packet = index.rem %within, %c4 : index
+  %byte_in_group = index.mul %byte_packet, %c4 : index
+  %group_base = index.mul %group, %c16 : index
+  %byte_idx = index.add %group_base, %byte_in_group : index
+  %pv = vector.load %qs[%byte_idx] : view<128xi8> -> vector<4xi8>
+  %p0 = vector.extract %pv[0] : vector<4xi8> -> i8
+  %p1 = vector.extract %pv[1] : vector<4xi8> -> i8
+  %p2 = vector.extract %pv[2] : vector<4xi8> -> i8
+  %p3 = vector.extract %pv[3] : vector<4xi8> -> i8
+  %r0 = func.call @ggml_iq4_packet_value(%p0, %nibble_shift, %dl, %tables) : (i8, i32, f32, buffer) -> (f32)
+  %r1 = func.call @ggml_iq4_packet_value(%p1, %nibble_shift, %dl, %tables) : (i8, i32, f32, buffer) -> (f32)
+  %r2 = func.call @ggml_iq4_packet_value(%p2, %nibble_shift, %dl, %tables) : (i8, i32, f32, buffer) -> (f32)
+  %r3 = func.call @ggml_iq4_packet_value(%p3, %nibble_shift, %dl, %tables) : (i8, i32, f32, buffer) -> (f32)
+  func.return %r0, %r1, %r2, %r3 : f32, f32, f32, f32
+}
+
+func.def inline @ggml_iq_expert_dot_packet4(%input_size: index, %output_size: index, %expert_count: index, %route_count: index, %token_count: index, %route_id_stride: index, %weight: buffer, %input: buffer, %ids: buffer, %tables: buffer, %output: buffer, %iq3: i1, %block_bytes: offset) {
+  %width = index.assume %input_size [range(%input_size, 256, 2560), mul(%input_size, 256)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 640)] : index
+  %experts = index.assume %expert_count [range(%expert_count, 1, 512)] : index
+  %routes = index.assume %route_count [range(%route_count, 1, 16)] : index
+  %tokens = index.assume %token_count [range(%token_count, 1, 8)] : index
+  %stride = index.assume %route_id_stride [range(%route_id_stride, 10, 512)] : index
+  %token0 = kernel.workgroup.id<z> : index
+  %token, %ntokens = index.assume %token0, %tokens [lt(%token0, %tokens)] : index, index
+  %row0 = kernel.workgroup.id<x> : index
+  %route0 = kernel.workgroup.id<y> : index
+  %row, %nrows = index.assume %row0, %outputs [lt(%row0, %outputs)] : index, index
+  %route, %nroutes = index.assume %route0, %routes [lt(%route0, %routes)] : index, index
+  %lane0 = kernel.workitem.id<x> : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 63)] : index
+  %zero = index.constant 0 : offset
+  %zero_idx = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c4 = index.constant 4 : index
+  %c256 = index.constant 256 : index
+  %zero_f = scalar.constant 0.0 : f32
+  %qnan_bits = scalar.constant 2143289344 : i32
+  %four = index.constant 4 : offset
+  %id_row = index.mul %token, %stride : index
+  %id_base = index.scale %id_row, %four : index, offset -> offset
+  %ids_view = buffer.view %ids[%id_base] : buffer -> view<[%nroutes]xi32>
+  %x = buffer.view %input[%zero] : buffer -> view<[%ntokens]x[%width]xf32>
+  %y = buffer.view %output[%zero] : buffer -> view<[%ntokens]x[%nroutes]x[%nrows]xi32>
+  %expert_i = view.load %ids_view[%route] : view<[%nroutes]xi32> -> i32
+  %expert0 = index.cast %expert_i : i32 to index
+  %valid = index.cmp ult, %expert0, %experts : index
+  %sum = scf.if %valid -> (f32) {
+    %expert, %nexperts = index.assume %expert0, %experts [range(%expert0, 0, 511), lt(%expert0, %experts)] : index, index
+    %blocks = index.div %width, %c256 : index
+    %expert_rows = index.mul %expert, %nrows : index
+    %flat_row = index.add %expert_rows, %row : index
+    %row_blocks = index.mul %flat_row, %blocks : index
+    %row_bytes = index.scale %row_blocks, %block_bytes : index, offset -> offset
+    %element = index.mul %lane, %c4 : index
+    %partial = scf.for %block = [%zero_idx to %blocks step %c1](%acc = %zero_f : f32) -> (f32) {
+      %block_offset = index.scale %block, %block_bytes : index, offset -> offset
+      %base = index.add %row_bytes, %block_offset : offset
+      %w0, %w1, %w2, %w3 = scf.if %iq3 -> (f32, f32, f32, f32) {
+        %a, %b, %c, %d = func.call @ggml_iq3_xxs_packet4(%weight, %base, %lane, %tables) : (buffer, offset, index, buffer) -> (f32, f32, f32, f32)
+        scf.yield %a, %b, %c, %d : f32, f32, f32, f32
+      } else {
+        %a, %b, %c, %d = func.call @ggml_iq4_xs_packet4(%weight, %base, %lane, %tables) : (buffer, offset, index, buffer) -> (f32, f32, f32, f32)
+        scf.yield %a, %b, %c, %d : f32, f32, f32, f32
+      }
+      %block_col = index.mul %block, %c256 : index
+      %col0 = index.add %block_col, %element : index
+      %col = index.assume %col0 [lt(%col0, %width), mul(%col0, 4)] : index
+      %xv = vector.load %x[%token, %col] : view<[%ntokens]x[%width]xf32> -> vector<4xf32>
+      %x0 = vector.extract %xv[0] : vector<4xf32> -> f32
+      %x1 = vector.extract %xv[1] : vector<4xf32> -> f32
+      %x2 = vector.extract %xv[2] : vector<4xf32> -> f32
+      %x3 = vector.extract %xv[3] : vector<4xf32> -> f32
+      %p0 = scalar.mulf %w0, %x0 : f32
+      %p1 = scalar.mulf %w1, %x1 : f32
+      %p2 = scalar.mulf %w2, %x2 : f32
+      %p3 = scalar.mulf %w3, %x3 : f32
+      %a0 = scalar.addf %acc, %p0 : f32
+      %a1 = scalar.addf %a0, %p1 : f32
+      %a2 = scalar.addf %a1, %p2 : f32
+      %a3 = scalar.addf %a2, %p3 : f32
+      scf.yield %a3 : f32
+    }
+    scf.yield %partial : f32
+  } else {
+    scf.yield %zero_f : f32
+  }
+  %total = kernel.workgroup.reduce<addf> %sum : f32
+  %writer = index.cmp eq, %lane, %zero_idx : index
+  scf.if %writer {
+    %result = scf.if %valid -> (i32) {
+      %bits = scalar.bitcast %total : f32 to i32
+      scf.yield %bits : i32
+    } else {
+      scf.yield %qnan_bits : i32
+    }
+    view.store %result, %y[%token, %route, %row] : i32, view<[%ntokens]x[%nroutes]x[%nrows]xi32>
+  }
+  func.return
+}
+
+kernel.def target(@ggml_iq_expert_wave64) export("ggml_mul_mat_id_iq3_xxs_f32_packet4") @ggml_mul_mat_id_iq3_xxs_f32_packet4(%input_size: index, %output_size: index, %expert_count: index, %route_count: index, %token_count: index, %route_id_stride: index) {
+  %one = index.constant 1 : index
+  %wave = index.constant 64 : index
+  kernel.launch.config workgroups(%output_size, %route_count, %token_count) workgroup_size(%wave, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %expert_count: index, %route_count: index, %token_count: index, %route_id_stride: index, %weight: buffer, %input: buffer, %ids: buffer, %tables: buffer, %output: buffer) {
+  %iq3 = scalar.constant true : i1
+  %bytes = index.constant 98 : offset
+  func.call @ggml_iq_expert_dot_packet4(%input_size, %output_size, %expert_count, %route_count, %token_count, %route_id_stride, %weight, %input, %ids, %tables, %output, %iq3, %bytes) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer, i1, offset)
+  kernel.return
+}
+
+kernel.def target(@ggml_iq_expert_wave64) export("ggml_mul_mat_id_iq4_xs_f32_packet4") @ggml_mul_mat_id_iq4_xs_f32_packet4(%input_size: index, %output_size: index, %expert_count: index, %route_count: index, %token_count: index, %route_id_stride: index) {
+  %one = index.constant 1 : index
+  %wave = index.constant 64 : index
+  kernel.launch.config workgroups(%output_size, %route_count, %token_count) workgroup_size(%wave, %one, %one) : index
+} launch(%input_size: index, %output_size: index, %expert_count: index, %route_count: index, %token_count: index, %route_id_stride: index, %weight: buffer, %input: buffer, %ids: buffer, %tables: buffer, %output: buffer) {
+  %iq3 = scalar.constant false : i1
+  %bytes = index.constant 136 : offset
+  func.call @ggml_iq_expert_dot_packet4(%input_size, %output_size, %expert_count, %route_count, %token_count, %route_id_stride, %weight, %input, %ids, %tables, %output, %iq3, %bytes) : (index, index, index, index, index, index, buffer, buffer, buffer, buffer, buffer, i1, offset)
+  kernel.return
+}

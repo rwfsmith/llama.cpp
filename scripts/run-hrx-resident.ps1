@@ -6,7 +6,7 @@ Run starts the server if needed, otherwise reuses its loaded weights. A changed
 EXE/DLL content or metadata, model shard path/size/mtime, startup argument, or
 effective child environment restarts it. Model contents are NEVER hashed: after
 an in-place edit preserving model size/mtime, explicitly Stop before Run.
-Prompt, Seed, Temperature, N, ExpectedOutput and CachePrompt are request-only.
+Prompt, Seed, Temperature, N, TopLogprobs, ExpectedOutput and CachePrompt are request-only.
 Changing Mtp, context, batching, KV offload, threads, model or backend needs restart.
 Only one worker (-np 1) and loopback HTTP are used; no fallback to another backend.
 The Windows child survives this script. Run Stop when finished to release VRAM.
@@ -24,6 +24,56 @@ Never commit or share api-key.txt. Invalid key files fail closed, not regenerate
 All DLLs in the executable, HIP bin, pinned bin and GGML_BACKEND_PATH DLL's directories
 are hashed. If using extra runtime locations, supply them through DllDirectories.
 Environment is inherited, then HIP/known-good HRX defaults, then Env overrides.
+Inherited LLVM_PATH is removed: a build compiler override can break HIP's internal
+kernel compilation and hang stream creation. Use Env only for deliberate overrides;
+the parent process and machine environment are not modified.
+Env @{ HRX_ENABLE_TRUSTED_INDEX_VIEWS = '1' } enables replay through validated
+host-index VIEW chains used by recurrent-state gathers. It remains opt-in.
+Env @{ HRX_ENABLE_F32_ROUTER = '1' } enables the Qwen4exp 2560x512 F32
+router projection for 1-8 tokens; the downstream router must also be enabled.
+Env @{ HRX_ENABLE_RECURRENT_CONCAT = '1' } assembles GDN/PLE convolution
+windows on the GPU (history 3 or 9, 1-8 new tokens); state writeback is unchanged.
+Env @{ HRX_ENABLE_QSA_PROJECTIONS = '1' } runs the BF16 QSA indexer
+projections on GPU with the existing CPU BF16 input rounding and F32 accumulation.
+Env @{ HRX_ENABLE_GDN_PREFILL = '1' } enables one-dispatch GDN recurrence
+for 2-8 tokens and 1..T snapshots, retaining state in registers across tokens.
+The model's fused-GDN settings must retain 16 Q/K heads; other layouts fall back.
+Env @{ HRX_ENABLE_GDN_NORM_PREFILL = '1' } packs strided 128x16 Q/K
+heads for 2-8 tokens on GPU and reuses the existing F32 L2 normalization kernel.
+Env @{ HRX_ENABLE_QSA_ROPE = '1' } enables QSA normalization and IMRoPE,
+including compensated trig reduction and CPU-compatible YaRN arithmetic.
+Env @{ HRX_ENABLE_QSA_GLUE = '1' } enables supported 128-wide QSA pooling
+and score additions, including masks, through the existing F32 ADD kernels.
+Env @{ HRX_ENABLE_IQ_PACKET4 = '1' } selects experimental four-weight IQ3_XXS/
+IQ4_XS expert decoding with F32 arithmetic; the existing IQ/small-batch gates apply.
+Env @{ HRX_ENABLE_GDN_CONV_PREFILL = '1' } runs four-tap GDN convolution
+for 2-8 tokens on GPU, keeping SILU and convolution-history writeback separate.
+Env @{ HRX_ENABLE_QSA_F16_GATHER = '1' } gathers 128-wide F16 indexer
+cache rows into F32 on GPU, retaining the existing index-validation contract.
+Env @{ HRX_ENABLE_QSA_MASK = '1' } runs bounded QSA zero/-infinity fills,
+F16/F32 mask casts and F16 mask additions on GPU with original rounding.
+TOP_K and multi-query mask SET_ROWS retain their existing fallback paths.
+Multi-query destination fills also remain on CPU so those in-place scatters
+never write a device-only allocation; decode destination fills require SET_ROWS.
+Env @{ HRX_ENABLE_DENSE_F32_GEMV = '1' } selects existing raw-F32 Q8/Q6
+GEMVs for single-token dense projections. Unlike the F32-accumulation WMMA
+route, these do not round operands to F16. This changes numerical behavior;
+keep it opt-in pending full-model checks. Q4 and multi-token routes are unchanged.
+Env @{ HRX_ENABLE_DENSE_ROUNDED_GEMV = '1' } uses T1 Q8/Q6 GEMVs with
+the existing WMMA F16 operand rounding and F32 accumulation. It overrides the
+raw-F32 GEMV flag when both are set. Reduction order still differs from WMMA,
+so this alternative also remains opt-in pending numerical/performance checks.
+Env @{ LLAMA_QSA_DENSE_BYPASS = '1' } skips redundant QSA selection when
+its budget includes every KV cell, while retaining raw indexer-key cache writes.
+This model-level opt-in applies equally to HRX and Vulkan; sparse selection
+resumes above the budget. Graph reuse checks include this transition.
+LLAMA_ARG_LOG_VERBOSITY=5 emits dense/sparse branch diagnostics.
+For diagnostic split wall times, set HRX_PROFILE_SPLITS=1 and
+LLAMA_ARG_LOG_VERBOSITY=4. These are not isolated GPU kernel timings;
+do not compare instrumented throughput with the normal benchmark runs.
+TopLogprobs 1-20 records pre-sampling token log probabilities in response.json
+for identical-prefix numerical comparisons without reloading model weights.
+Leave it at 0 for throughput comparisons.
 Its fingerprint is stored, not its potentially sensitive values. SWIGLU is not
 enabled by default. MTP defaults off; enable explicitly for the full sidecar.
 MicroBatch > 1 enables the MOE, HC and glue small-batch flags even without MTP.
@@ -62,6 +112,7 @@ param(
     [int]$Seed = 1234,
     [ValidateRange(0.0, 10.0)][double]$Temperature = 1.0,
     [ValidateRange(1, 4096)][int]$N = 16,
+    [ValidateRange(0, 20)][int]$TopLogprobs = 0,
     [string]$ExpectedOutput = '',
     [switch]$CachePrompt,
     [string]$Tag = 'test',
@@ -198,7 +249,13 @@ try {
         messages = @(@{ role = 'user'; content = $Prompt })
         stream = $false; seed = $Seed; temperature = $Temperature; max_tokens = $N
         cache_prompt = $CachePrompt.IsPresent; chat_template_kwargs = @{ enable_thinking = $false }
-    } | ConvertTo-Json -Depth 8
+    }
+    if ($TopLogprobs -gt 0) {
+        $request.logprobs = $true
+        $request.top_logprobs = $TopLogprobs
+        $request.post_sampling_probs = $false
+    }
+    $request = $request | ConvertTo-Json -Depth 8
     $request | Set-Content -LiteralPath (Join-Path $artifactDir 'request.json') -Encoding utf8
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {

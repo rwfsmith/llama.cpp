@@ -31,6 +31,8 @@ struct CommandBinding {
     size_t               offset = 0;
     size_t               length = 0;
     ResourceAccess       access = ResourceAccess::Read;
+    // Carried through from DispatchBinding::trusted. See its comment for the contract.
+    bool                 trusted = false;
 };
 
 struct Command {

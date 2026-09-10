@@ -1,5 +1,6 @@
 #include "dispatch-gather-add.h"
 
+#include "dispatch-copy.h"
 #include "ggml.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
@@ -211,7 +212,10 @@ static bool match_get_rows_f32_dispatch(const DispatchMatchContext & context, Di
         { "token_count", ids->ne[0] },
     };
     dispatch.bindings.push_back({ source->id, 0, source->byte_count });
-    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count });
+    // Every current caller (e.g. build_inp_out_ids()'s output-position selection, or the
+    // Hyper-Connections gather) populates ids from a host-side leaf; a GPU-computed
+    // producer (op != GGML_OP_NONE) still keeps full validation.
+    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count, is_trusted_host_index_producer(ids->tensor) });
     dispatch.bindings.push_back({ output->id, 0, output->byte_count });
     match.covered_nodes.push_back(context.root_index);
     match.dispatches.push_back(std::move(dispatch));

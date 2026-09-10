@@ -1,0 +1,140 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_qsa_gfx11_wave64 {subgroup_size = 64}
+
+config.decl @ggml.qsa_rope.theta_scale : f32
+config.decl @ggml.qsa_rope.freq_scale : f32
+config.decl @ggml.qsa_rope.ext_factor : f32
+config.decl @ggml.qsa_rope.magnitude : f32
+config.decl @ggml.qsa_rope.corr_low : f32
+config.decl @ggml.qsa_rope.corr_width : f32
+// IMRoPE [11,11,10,0], 64 rotary dimensions, zero offset. Keep GGML's repeated
+// theta multiplication: pow(base, pair * exponent) has different long-position rounding.
+kernel.def target(@ggml_qsa_gfx11_wave64) export("ggml_qsa_rope_f32") @ggml_qsa_rope_f32(
+    %width: index, %heads: index, %tokens: index) {
+  %one = index.constant 1 : index
+  %wg = index.constant 256 : index
+  %rows = index.mul %heads, %tokens : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%wg, %one, %one) : index
+} launch(%width: index, %heads: index, %tokens: index, %input: buffer, %positions: buffer, %output: buffer) {
+  %w = index.assume %width [range(%width, 128, 256)] : index
+  %h = index.assume %heads [range(%heads, 1, 24)] : index
+  %t = index.assume %tokens [range(%tokens, 1, 65536)] : index
+  %rows = index.mul %h, %t : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %rows)] : index
+  %lane = kernel.workitem.id<x> : index
+  %active = index.cmp ult, %lane, %w : index
+  %offset = index.constant 0 : offset
+  %iv = buffer.view %input[%offset] : buffer -> view<[%rows]x[%w]xf32>
+  %ov = buffer.view %output[%offset] : buffer -> view<[%rows]x[%w]xf32>
+  %pv = buffer.view %positions[%offset] : buffer -> view<4x[%t]xi32>
+  scf.if %active {
+    %col = index.assume %lane [lt(%lane, %w)] : index
+    %x = view.load %iv[%row, %col] : view<[%rows]x[%w]xf32> -> f32
+    %c0 = index.constant 0 : index
+    %c1 = index.constant 1 : index
+    %c3 = index.constant 3 : index
+    %c32 = index.constant 32 : index
+    %c64 = index.constant 64 : index
+    %rotates = index.cmp ult, %col, %c64 : index
+    %result = scf.if %rotates -> (f32) {
+      %pair = index.rem %col, %c32 : index
+      %low_half = index.cmp ult, %col, %c32 : index
+      %partner0 = scf.if %low_half -> (index) {
+        %high = index.add %pair, %c32 : index
+        scf.yield %high : index
+      } else {
+        scf.yield %pair : index
+      }
+      %partner = index.assume %partner0 [lt(%partner0, %w)] : index
+      %other = view.load %iv[%row, %partner] : view<[%rows]x[%w]xf32> -> f32
+      %plane0 = index.rem %pair, %c3 : index
+      %plane = index.assume %plane0 [range(%plane0, 0, 2)] : index
+      %token0 = index.div %row, %h : index
+      %token = index.assume %token0 [lt(%token0, %t)] : index
+      %position = view.load %pv[%plane, %token] : view<4x[%t]xi32> -> i32
+      %position_f = scalar.sitofp %position : i32 to f32
+      %theta_scale = config.get @ggml.qsa_rope.theta_scale : f32
+      %theta_extrap = scf.for %i = [%c0 to %pair step %c1](%theta = %position_f : f32) -> (f32) {
+        %next = scalar.mulf %theta, %theta_scale : f32
+        scf.yield %next : f32
+      }
+      %freq_scale = config.get @ggml.qsa_rope.freq_scale : f32
+      %ext_factor = config.get @ggml.qsa_rope.ext_factor : f32
+      %magnitude = config.get @ggml.qsa_rope.magnitude : f32
+      %low = config.get @ggml.qsa_rope.corr_low : f32
+      %corr_width = config.get @ggml.qsa_rope.corr_width : f32
+      %zero = scalar.constant 0.0 : f32
+      %one = scalar.constant 1.0 : f32
+      %pair_i = index.cast %pair : index to i32
+      %pair_f = scalar.uitofp %pair_i : i32 to f32
+      %distance = scalar.subf %pair_f, %low : f32
+      %fraction = scalar.divf %distance, %corr_width : f32
+      %clamp_low = scalar.maxnumf %zero, %fraction : f32
+      %clamp = scalar.minnumf %one, %clamp_low : f32
+      %ramp = scalar.subf %one, %clamp : f32
+      %mix = scalar.mulf %ramp, %ext_factor : f32
+      %inverse = scalar.subf %one, %mix : f32
+      %interp = scalar.mulf %freq_scale, %theta_extrap : f32
+      %extrapolated = scalar.mulf %theta_extrap, %mix : f32
+      // Match the canonical clang-cl CPU build: round the extrapolated product,
+      // then fuse theta_interp * (1 - ramp_mix) + that rounded product.
+      %angle = scalar.fmaf %interp, %inverse, %extrapolated : f32
+      // Native trig converts radians to F32 turns. Reduce first, retaining the
+      // product/sum residuals so even I32-sized positions do not lose their phase.
+      %inv_tau = scalar.constant 0.15915493667125702 : f32
+      %tau_hi = scalar.constant 6.2831854820251465 : f32
+      %tau_lo = scalar.constant -1.7484555314695172e-07 : f32
+      %tau_tail = scalar.constant -6.8604980400235275e-15 : f32
+      %turns = scalar.mulf %angle, %inv_tau : f32
+      %q = scalar.roundevenf %turns : f32
+      %negative_q = scalar.subf %zero, %q : f32
+      %product = scalar.mulf %q, %tau_hi : f32
+      %negative_product = scalar.subf %zero, %product : f32
+      %product_error = scalar.fmaf %q, %tau_hi, %negative_product : f32
+      %difference = scalar.subf %angle, %product : f32
+      %remainder_hi = scalar.subf %difference, %product_error : f32
+      %recovered = scalar.subf %difference, %remainder_hi : f32
+      %remainder_lo = scalar.subf %recovered, %product_error : f32
+      %low_product = scalar.mulf %q, %tau_lo : f32
+      %negative_low_product = scalar.subf %zero, %low_product : f32
+      %low_product_error = scalar.fmaf %q, %tau_lo, %negative_low_product : f32
+      %difference_lo = scalar.subf %remainder_hi, %low_product : f32
+      %z = scalar.subf %difference_lo, %remainder_hi : f32
+      %recovered_hi = scalar.subf %difference_lo, %z : f32
+      %error_hi = scalar.subf %remainder_hi, %recovered_hi : f32
+      %error_lo = scalar.addf %low_product, %z : f32
+      %sum_error = scalar.subf %error_hi, %error_lo : f32
+      %product_errors = scalar.subf %remainder_lo, %low_product_error : f32
+      %correction = scalar.addf %sum_error, %product_errors : f32
+      %small_turns = scalar.mulf %difference_lo, %inv_tau : f32
+      %small_q = scalar.roundevenf %small_turns : f32
+      %negative_small_q = scalar.subf %zero, %small_q : f32
+      %small_hi = scalar.fmaf %negative_small_q, %tau_hi, %difference_lo : f32
+      %small_lo = scalar.fmaf %negative_small_q, %tau_lo, %small_hi : f32
+      %tail_correction = scalar.fmaf %negative_q, %tau_tail, %correction : f32
+      %corrected = scalar.addf %small_lo, %tail_correction : f32
+      %reduced_angle = scalar.fmaf %negative_small_q, %tau_tail, %corrected : f32
+      %sin = scalar.sinf<afn> %reduced_angle : f32
+      %cos = scalar.cosf<afn> %reduced_angle : f32
+      %s = scalar.mulf %sin, %magnitude : f32
+      %c = scalar.mulf %cos, %magnitude : f32
+      %own = scalar.mulf %x, %c : f32
+      %cross = scalar.mulf %other, %s : f32
+      %rotated = scf.if %low_half -> (f32) {
+        %lower = scalar.subf %own, %cross : f32
+        scf.yield %lower : f32
+      } else {
+        %upper = scalar.addf %cross, %own : f32
+        scf.yield %upper : f32
+      }
+      scf.yield %rotated : f32
+    } else {
+      scf.yield %x : f32
+    }
+    view.store %result, %ov[%row, %col] : f32, view<[%rows]x[%w]xf32>
+  }
+  kernel.return
+}

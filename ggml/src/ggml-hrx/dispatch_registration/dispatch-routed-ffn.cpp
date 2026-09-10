@@ -27,6 +27,11 @@ static bool iq_experts_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+static bool iq_packet4_enabled() {
+    const char * value = std::getenv("HRX_ENABLE_IQ_PACKET4");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static bool moe_token_count_supported(int64_t tokens) {
     const char * value = std::getenv("HRX_ENABLE_MOE_SMALL_BATCH");
     return tokens == 1 || (tokens >= 2 && tokens <= 8 && iq_experts_enabled() &&
@@ -100,6 +105,10 @@ static constexpr KernelCatalogRef kIQ3XXSExpertKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_mul_mat_id_iq3_xxs_f32");
 static constexpr KernelCatalogRef kIQ4XSExpertKernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_mul_mat_id_iq4_xs_f32");
+static constexpr KernelCatalogRef kIQ3XXSPacket4ExpertKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_mul_mat_id_iq3_xxs_f32_packet4");
+static constexpr KernelCatalogRef kIQ4XSPacket4ExpertKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_mul_mat_id_iq4_xs_f32_packet4");
 static constexpr KernelCatalogRef kSmallDownQ8Kernel =
     GGML_HRX_KERNEL_REF("hrx_owned", "ggml_moe_small_down_q8_0");
 static constexpr KernelCatalogRef kSmallDownIQ4Kernel =
@@ -254,8 +263,10 @@ static bool match_decode_iq_expert_qwen4exp_dispatch(const DispatchMatchContext 
     dispatch_match.constant_initializations.push_back({ table_value, table_name, 0, std::move(tables) });
 
     Dispatch dispatch;
-    dispatch.kernel = make_kernel_specialization(weight->type == GGML_TYPE_IQ3_XXS ?
-                                                 kIQ3XXSExpertKernel : kIQ4XSExpertKernel);
+    const bool iq3 = weight->type == GGML_TYPE_IQ3_XXS;
+    dispatch.kernel = make_kernel_specialization(iq_packet4_enabled() ?
+        (iq3 ? kIQ3XXSPacket4ExpertKernel : kIQ4XSPacket4ExpertKernel) :
+        (iq3 ? kIQ3XXSExpertKernel : kIQ4XSExpertKernel));
     dispatch.kernel.integer_parameters.emplace("input_size", kQwen4ExpRoutedFfnInputSize);
     dispatch.kernel.integer_parameters.emplace("output_size", kQwen4ExpRoutedFfnExpertHiddenSize);
     dispatch.kernel.integer_parameters.emplace("expert_count", kQwen4ExpRoutedFfnExpertCount);

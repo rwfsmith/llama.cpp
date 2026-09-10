@@ -1,0 +1,110 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @qsa_mask_wave64 {subgroup_size = 64}
+
+kernel.def target(@qsa_mask_wave64) export("ggml_qsa_mask_fill") @ggml_qsa_mask_fill(
+    %element_count: index, %element_bytes: index, %value_bits: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %groups = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%element_count: index, %element_bytes: index, %value_bits: index, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 4194304)] : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %group, %threads : index
+  %i = index.add %base, %lane : index
+  %valid = index.cmp ult, %i, %count : index
+  %offset = index.constant 0 : offset
+  %two = index.constant 2 : index
+  %half = index.cmp eq, %element_bytes, %two : index
+  scf.if %valid {
+    // Integer stores preserve signed zero and infinity without float config parsing.
+    %bits = index.cast %value_bits : index to i32
+    scf.if %half {
+      %view = buffer.view %output[%offset] : buffer -> view<[%count]xi16>
+      %bits16 = scalar.trunci %bits : i32 to i16
+      view.store %bits16, %view[%i] : i16, view<[%count]xi16>
+    } else {
+      %view = buffer.view %output[%offset] : buffer -> view<[%count]xi32>
+      view.store %bits, %view[%i] : i32, view<[%count]xi32>
+    }
+  }
+  kernel.return
+}
+
+kernel.def target(@qsa_mask_wave64) export("ggml_qsa_mask_cast") @ggml_qsa_mask_cast(
+    %element_count: index, %source_f16: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %groups = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%element_count: index, %source_f16: index, %input: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 4194304)] : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %group, %threads : index
+  %i = index.add %base, %lane : index
+  %valid = index.cmp ult, %i, %count : index
+  %offset = index.constant 0 : offset
+  %one = index.constant 1 : index
+  %half = index.cmp eq, %source_f16, %one : index
+  scf.if %valid {
+    scf.if %half {
+      %src = buffer.view %input[%offset] : buffer -> view<[%count]xf16>
+      %dst = buffer.view %output[%offset] : buffer -> view<[%count]xf32>
+      %value = view.load %src[%i] : view<[%count]xf16> -> f16
+      %converted = scalar.extf %value : f16 to f32
+      view.store %converted, %dst[%i] : f32, view<[%count]xf32>
+    } else {
+      %src = buffer.view %input[%offset] : buffer -> view<[%count]xf32>
+      %dst = buffer.view %output[%offset] : buffer -> view<[%count]xf16>
+      %value = view.load %src[%i] : view<[%count]xf32> -> f32
+      %converted = scalar.fptrunc %value : f32 to f16
+      view.store %converted, %dst[%i] : f16, view<[%count]xf16>
+    }
+  }
+  kernel.return
+}
+
+kernel.def target(@qsa_mask_wave64) export("ggml_qsa_mask_add_f16") @ggml_qsa_mask_add_f16(
+    %element_count: index, %rhs_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %groups = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%element_count: index, %rhs_count: index, %lhs: buffer, %rhs: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 4194304)] : index
+  %rhs_size = index.assume %rhs_count [range(%rhs_count, 1, 4194304)] : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %group, %threads : index
+  %i = index.add %base, %lane : index
+  %valid = index.cmp ult, %i, %count : index
+  %offset = index.constant 0 : offset
+  scf.if %valid {
+    %j = index.rem %i, %rhs_size : index
+    %a_view = buffer.view %lhs[%offset] : buffer -> view<[%count]xf16>
+    %b_view = buffer.view %rhs[%offset] : buffer -> view<[%rhs_size]xf16>
+    %dst = buffer.view %output[%offset] : buffer -> view<[%count]xf16>
+    %a = view.load %a_view[%i] : view<[%count]xf16> -> f16
+    %b = view.load %b_view[%j] : view<[%rhs_size]xf16> -> f16
+    // CPU binary-ops.cpp promotes both halves, adds in F32, then rounds once.
+    %a32 = scalar.extf %a : f16 to f32
+    %b32 = scalar.extf %b : f16 to f32
+    %sum = scalar.addf %a32, %b32 : f32
+    %result = scalar.fptrunc %sum : f32 to f16
+    view.store %result, %dst[%i] : f16, view<[%count]xf16>
+  }
+  kernel.return
+}

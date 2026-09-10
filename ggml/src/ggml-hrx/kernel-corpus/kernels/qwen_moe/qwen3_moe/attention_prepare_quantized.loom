@@ -27,11 +27,18 @@ kernel.decl @ggml_quantize_q8_1_x4_f32(%token_count: index, %input_size: index) 
 // Materializes the ordinary Qwen RMSNorm boundary. This remains useful for
 // prefill schedules that reuse one normalized row across many output tiles;
 // decode uses the fused Q8_1 producer below.
+//
+// %token_count is a pure launch-grid row count with no positional/causal meaning (each
+// workgroup normalizes one independent row). The HRX matcher for this kernel also uses it for
+// per-head norms (e.g. qwen4exp's indexer q_norm), where the caller's real row count is
+// heads * real_tokens rather than real_tokens alone, so this needs materially more headroom
+// than the 2048 real-token ceiling used for flat [hidden_size, real_tokens] callers elsewhere
+// in this dispatch profile.
 kernel.def target(@qwen3_moe_attention_prepare_gfx11_wave32) @qwen3_moe_rmsnorm_f32(%token_count: index) {
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   kernel.launch.config workgroups(%token_count, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
-} launch(%token_count: index, %input: buffer, %weight: buffer, %output: buffer) where [range(%token_count, 1, 2048)] {
+} launch(%token_count: index, %input: buffer, %weight: buffer, %output: buffer) where [range(%token_count, 1, 131072)] {
   %hidden_size0 = config.get @qwen3_moe.model.hidden_size : index
   %epsilon = config.get @qwen3_moe.model.rms_epsilon : f32
   %hidden_size = index.assume %hidden_size0 [range(%hidden_size0, 128, 32768), mul(%hidden_size0, 128)] : index

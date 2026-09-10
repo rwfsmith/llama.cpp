@@ -3,6 +3,7 @@
 #include "dispatch-add.h"
 #include "dispatch-copy.h"
 #include "dispatch-elementwise.h"
+#include "dispatch-qsa-mask.h"
 #include "dispatch-gated-delta-net.h"
 #include "dispatch-gather-add.h"
 #include "dispatch-llm-matmul.h"
@@ -12,6 +13,7 @@
 #include "dispatch-qwen-matmul.h"
 #include "dispatch-qwen-preamble.h"
 #include "dispatch-qwen4exp-flash-attention.h"
+#include "dispatch-qwen4exp-rope.h"
 #include "dispatch-rmsnorm.h"
 #include "dispatch-routed-ffn.h"
 #include "dispatch-scale.h"
@@ -41,6 +43,7 @@ static void register_llm_dispatches(DispatchRegistryBuilder & builder) {
     register_qwen_attention_postprocess_dispatches(builder);
     register_qwen_flash_attention_dispatches(builder);
     register_qwen4exp_flash_attention_dispatches(builder);
+    register_qwen4exp_qsa_rope_dispatches(builder);
     register_qwen_matmul_dispatches(builder);
     register_llm_matmul_dispatches(builder);
     register_routed_ffn_dispatches(builder);
@@ -57,6 +60,7 @@ static DispatchRegistry build_llm_registry() {
     register_scale_dispatch(builder);
     register_copy_dispatch(builder);
     register_elementwise_dispatches(builder);
+    register_qsa_mask_dispatches(builder);
     register_swiglu_dispatch(builder);
     register_llm_dispatches(builder);
     return builder.build();

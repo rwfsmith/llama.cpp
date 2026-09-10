@@ -102,6 +102,7 @@ static void append_command(const Graph &          graph,
         command_binding.value                                      = binding.value;
         command_binding.offset                                     = binding.offset;
         command_binding.length                                     = binding.length;
+        command_binding.trusted                                    = binding.trusted;
         const Value *                               value          = graph.values().find(command_binding.value);
         const CommandPlanTransient *                plan_transient = find_plan_transient(plan, command_binding.value);
         const CommandPlanCompletionCounterRequest * completion_counter =

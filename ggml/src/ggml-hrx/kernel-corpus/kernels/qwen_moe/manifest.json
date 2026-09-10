@@ -4,9 +4,9 @@
   "upstream_revision": "d343e4ad5167dca6758cb0d2db08785e43e99070",
   "source_subdirectory": "experimental/qwen_moe/kernels",
   "qwen_endpoint_source_subdirectory": "experimental/qwen/kernels",
-  "corpus_sha256": "ce2711ba360db150344d63658b6fc0024954e4ad4c598233caed7680ca85f993",
-  "upstream_corpus_sha256": "76f504d2c19e85a1b51679bb2edc5e9a60b865f545ecaabacedd14ba7db15842",
-  "owned_corpus_sha256": "1126fc55f6123c13ee9a8a8d146082bd9b63d9fd1ed123e27478ff964e58ad44",
+  "corpus_sha256": "ecccc732a216dedf2fc98dfdab3034414c1672e11564745535650c9f016c6ec7",
+  "upstream_corpus_sha256": "cfaf299162ab8e4e3b57628733c42fc0403ff452462485826a04f71ac60df6b3",
+  "owned_corpus_sha256": "279adeeace1ab0dc4aeff8c8052af0bd9d097bdf6136e4a7c59236b1c3d0e4a5",
   "build_bazel_sha256": "598eeb34f8606182a732299c989387dd450c0d8f33e4275635b4a679c0f986d0",
   "files": [
     {
@@ -31,8 +31,8 @@
     },
     {
       "path": "qwen3_moe/attention_prepare_quantized.loom",
-      "sha256": "4bd47e89d1569e3622de60d88a6e09309afe35d48d3b6b1f25469e3b71aa7118",
-      "size": 29030
+      "sha256": "9d213862262ad3ac63b7d34839cfe561df649c08567a45f2a8329c6ecb4ec6ed",
+      "size": 29524
     },
     {
       "path": "qwen3_moe/attention_qkv_postprocess_fused.loom",
@@ -287,8 +287,8 @@
     },
     {
       "path": "qwen4exp/gdn_decode.loom",
-      "sha256": "cd6369aeb2e06db2976bd641edc2449d1be16fd47e09e8ac94167ce83af9be8c",
-      "size": 49276
+      "sha256": "8ffff0c29f0e9172ef62cd5994e35a852fcbe319accc3a6fe796f4999ef11989",
+      "size": 61129
     },
     {
       "path": "qwen4exp/hc_norm.loom",
@@ -5486,6 +5486,50 @@
       ]
     },
     {
+      "name": "qwen38_gdn_conv_prefill",
+      "symbol": "qwen38_gdn_conv_prefill",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "conv_input",
+        "conv_weight",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
       "name": "qwen38_gdn_conv_prepare_decode",
       "symbol": "qwen38_gdn_conv_prepare_decode",
       "source": "qwen4exp/gdn_decode.loom",
@@ -5546,6 +5590,114 @@
         "read",
         "read",
         "write",
+        "write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "archive",
+        "link_module": "gdn_decode_linked",
+        "primary_sources": [
+          "qwen4exp/gdn_decode.loom"
+        ],
+        "library_sources": [
+          "qwen4exp/gdn_common.loom",
+          "qwen4exp/model_config.loom"
+        ]
+      },
+      "compile_dependencies": [
+        "qwen4exp/gdn_common.loom",
+        "qwen4exp/model_config.loom"
+      ]
+    },
+    {
+      "name": "qwen38_gdn_recurrent_prefill",
+      "symbol": "qwen38_gdn_recurrent_prefill",
+      "source": "qwen4exp/gdn_decode.loom",
+      "family": "qwen4exp",
+      "workload_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "snapshot_count",
+          "type": "index"
+        },
+        {
+          "name": "q_head_stride",
+          "type": "index"
+        },
+        {
+          "name": "q_token_stride",
+          "type": "index"
+        },
+        {
+          "name": "k_head_stride",
+          "type": "index"
+        },
+        {
+          "name": "k_token_stride",
+          "type": "index"
+        },
+        {
+          "name": "v_head_stride",
+          "type": "index"
+        },
+        {
+          "name": "v_token_stride",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "token_count",
+          "type": "index"
+        },
+        {
+          "name": "snapshot_count",
+          "type": "index"
+        },
+        {
+          "name": "q_head_stride",
+          "type": "index"
+        },
+        {
+          "name": "q_token_stride",
+          "type": "index"
+        },
+        {
+          "name": "k_head_stride",
+          "type": "index"
+        },
+        {
+          "name": "k_token_stride",
+          "type": "index"
+        },
+        {
+          "name": "v_head_stride",
+          "type": "index"
+        },
+        {
+          "name": "v_token_stride",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "q",
+        "k",
+        "v",
+        "gate",
+        "beta",
+        "state",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
+        "read",
         "write"
       ],
       "target_selector": "",

@@ -21,17 +21,21 @@ namespace {
 // Kernel catalog references (family "qwen4exp", see kernel-corpus/kernels/qwen_moe/manifest.json).
 static constexpr KernelCatalogRef kQwenGdnConvPrepareDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_conv_prepare_decode");
+static constexpr KernelCatalogRef kQwenGdnConvPrefillKernel =
+    GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_conv_prefill");
 static constexpr KernelCatalogRef kQwenGdnRecurrentDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_recurrent_decode");
 static constexpr KernelCatalogRef kQwenGdnRecurrentDecodeSplitKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_recurrent_decode_split");
+static constexpr KernelCatalogRef kQwenGdnRecurrentPrefillKernel =
+    GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_recurrent_prefill");
 static constexpr KernelCatalogRef kQwenGdnNormGateDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_norm_gate_decode");
 
 // qwen4exp GDN decode-only (K=1, single token, single sequence) shape profile. Field names mirror
 // qwen4exp.cpp's build_layer_attn_linear()/build_conv_state_at(), where head_k_dim = head_v_dim =
 // hparams.ssm_d_state, num_k_heads = hparams.ssm_n_group, num_v_heads = hparams.ssm_dt_rank. Chunked
-// prefill (K>1, n_seq_tokens>1) is intentionally left CPU-fallback -- see per-matcher comments below.
+// prefill has separate opt-in core and convolution matchers; norm-gate remains decode-only.
 static constexpr int64_t kGdnHeadDim        = 128;
 static constexpr int64_t kGdnKeyHeadCount   = 16;
 static constexpr int64_t kGdnValueHeadCount = 48;
@@ -64,23 +68,99 @@ static std::string to_config_value(int64_t value) {
     return std::to_string(value);
 }
 
+static bool gdn_prefill_aligned(const ggml_tensor & value) {
+    return value.view_offs % sizeof(float) == 0;
+}
+
+static bool gdn_prefill_aligned(const Value & value) {
+    return value.storage_offset % sizeof(float) == 0;
+}
+
+template<class T>
+static bool gdn_prefill_shape(const T & value, int64_t n0, int64_t n1, int64_t n2, int64_t n3) {
+    return value.type == GGML_TYPE_F32 && value.ne[0] == n0 && value.ne[1] == n1 &&
+           value.ne[2] == n2 && value.ne[3] == n3 && gdn_prefill_aligned(value);
+}
+
+template<class T>
+static bool gdn_prefill_dense(const T & value) {
+    size_t stride = sizeof(float);
+    for (int d = 0; d < 4; ++d) {
+        if (value.ne[d] > 1 && value.nb[d] != stride) {
+            return false;
+        }
+        stride *= static_cast<size_t>(value.ne[d]);
+    }
+    return value.nb[0] == sizeof(float);
+}
+
+template<class T>
+static bool gdn_prefill_rows(const T & value) {
+    // Bound every launch index and exclude overlapping rows/tokens.
+    return value.nb[0] == sizeof(float) &&
+           value.nb[1] % sizeof(float) == 0 && value.nb[2] % sizeof(float) == 0 &&
+           value.nb[1] >= 128 * sizeof(float) && value.nb[1] <= 65536 * sizeof(float) &&
+           value.nb[2] <= 65536 * sizeof(float) &&
+           value.nb[2] >= (static_cast<size_t>(value.ne[1]) - 1) * value.nb[1] + 128 * sizeof(float);
+}
+
+static bool gdn_prefill_owns_output(const ggml_tensor & value) {
+    return value.view_src == nullptr;
+}
+
+static bool gdn_prefill_owns_output(const Value & value) {
+    return value.alias_source.value < 0;
+}
+
+template<class T>
+static bool gdn_conv_prefill_supported(const T * input, const T * weight, const T * output) {
+    const char * enabled = std::getenv("HRX_ENABLE_GDN_CONV_PREFILL");
+    if (enabled == nullptr || enabled[0] != '1' || enabled[1] != '\0' ||
+        input == nullptr || weight == nullptr || output == nullptr) {
+        return false;
+    }
+    const int64_t tokens = output->ne[1];
+    return tokens >= 2 && tokens <= 8 &&
+           gdn_prefill_shape(*input, tokens + kGdnConvKernelSize - 1, kGdnConvChannels, 1, 1) &&
+           gdn_prefill_shape(*weight, kGdnConvKernelSize, kGdnConvChannels, 1, 1) &&
+           gdn_prefill_shape(*output, kGdnConvChannels, tokens, 1, 1) &&
+           gdn_prefill_dense(*input) && gdn_prefill_dense(*weight) && gdn_prefill_dense(*output) &&
+           gdn_prefill_owns_output(*output);
+}
+
+template<class T>
+static bool gdn_prefill_supported(const T * q, const T * k, const T * v, const T * gate,
+                                  const T * beta, const T * state, const T * output, int64_t slots) {
+    const char * enabled = std::getenv("HRX_ENABLE_GDN_PREFILL");
+    if (enabled == nullptr || enabled[0] != '1' || enabled[1] != '\0' ||
+        q == nullptr || k == nullptr || v == nullptr || gate == nullptr || beta == nullptr ||
+        state == nullptr || output == nullptr) {
+        return false;
+    }
+    const int64_t tokens = v->ne[2];
+    // K>T leaves caller-owned slots unwritten; do not claim that contract yet.
+    return tokens >= 2 && tokens <= 8 && slots >= 1 && slots <= tokens &&
+           gdn_prefill_shape(*q, 128, 16, tokens, 1) &&
+           gdn_prefill_shape(*k, 128, 16, tokens, 1) &&
+           gdn_prefill_shape(*v, 128, 48, tokens, 1) &&
+           gdn_prefill_shape(*gate, 1, 48, tokens, 1) &&
+           gdn_prefill_shape(*beta, 1, 48, tokens, 1) &&
+           gdn_prefill_shape(*state, 128, 128, 48, 1) &&
+           gdn_prefill_shape(*output, 6144, tokens + 128 * slots, 1, 1) &&
+           gdn_prefill_rows(*q) && gdn_prefill_rows(*k) && gdn_prefill_rows(*v) &&
+           gdn_prefill_dense(*gate) && gdn_prefill_dense(*beta) &&
+           gdn_prefill_dense(*state) && gdn_prefill_dense(*output) && gdn_prefill_owns_output(*output);
+}
+
 // ---------------------------------------------------------------------------------------------
 // qwen4exp.gdn_conv_prepare_decode
 //
 // Matches: SSM_CONV -> UNARY(SILU)
 //
 // This is qwen4exp.cpp's build_layer_attn_linear()'s conv+silu+per-head L2-norm prelude, fed by
-// build_conv_state_at()'s CONCAT. The root is SSM_CONV, *not* CONCAT, even though CONCAT is
-// SSM_CONV's own producer and topologically comes first -- ggml's own cross-backend scheduler
-// (ggml-backend.cpp's ggml_backend_sched_backend_id_from_cur(), *not* this backend's
-// device_supports_op) always assigns this specific CONCAT to CPU, independently of anything this
-// file declares support for: the CONCAT's source chain roots through build_rs()'s ggml_get_rows
-// gather of the persistent recurrent conv-state buffer, and ggml prefers to run an op on the same
-// backend as its inputs. That assignment happens during ggml's graph-splitting pass, *before* HRX's
-// own DispatchScheduler ever sees a Graph -- CONCAT is carved into a separate CPU split and never
-// appears as a node in the Graph this dispatcher's traversal visits at all (confirmed by tracing
-// graph_compute()'s per-split input: the split containing this SSM_CONV has no CONCAT node in it).
-// A matcher rooted at CONCAT therefore never fires; SSM_CONV is the only reachable root.
+// build_conv_state_at()'s CONCAT. The root remains SSM_CONV, not CONCAT. The window is
+// materialized separately, either on CPU or by the opt-in recurrent CONCAT kernel.
+// This matcher must work regardless of whether the window producer shares its HRX split.
 //
 // Because CONCAT is not part of this match, `conv_input` below binds directly to SSM_CONV's own
 // src[0] -- the CONCAT's already-materialized [4,conv_channels,1,1] output value -- without tracing
@@ -324,6 +404,76 @@ static NormGateMatch match_qwen4exp_gdn_norm_gate(const Graph & graph, const Gra
 }
 
 }  // namespace
+
+bool supports_gdn_conv_prefill_dispatch(const ggml_tensor * op) {
+    return op != nullptr && op->op == GGML_OP_SSM_CONV &&
+           gdn_conv_prefill_supported(op->src[0], op->src[1], op);
+}
+
+static bool match_qwen4exp_gdn_conv_prefill_dispatch(const DispatchMatchContext & context,
+                                                    DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_SSM_CONV || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * input = graph_value(context.graph, node->inputs[0]);
+    const Value * weight = graph_value(context.graph, node->inputs[1]);
+    const Value * output = graph_value(context.graph, node->output);
+    if (!gdn_conv_prefill_supported(input, weight, output)) {
+        return false;
+    }
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kQwenGdnConvPrefillKernel);
+    dispatch.kernel.integer_parameters.emplace("token_count", output->ne[1]);
+    dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    dispatch.bindings.push_back({ weight->id, 0, weight->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
+bool supports_gdn_prefill_dispatch(const ggml_tensor * op) {
+    return op != nullptr && op->op == GGML_OP_GATED_DELTA_NET &&
+           gdn_prefill_supported(op->src[0], op->src[1], op->src[2], op->src[3], op->src[4],
+                                op->src[5], op, ggml_get_op_params_i32(op, 0));
+}
+
+static bool match_qwen4exp_gdn_recurrent_prefill_dispatch(const DispatchMatchContext & context,
+                                                         DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_GATED_DELTA_NET || node->inputs.size() != 6) {
+        return false;
+    }
+    const GatedDeltaNetParams * params = op_params_as<GatedDeltaNetParams>(node->params);
+    const Value * inputs[6];
+    for (size_t i = 0; i < 6; ++i) {
+        inputs[i] = graph_value(context.graph, node->inputs[i]);
+    }
+    const Value * output = graph_value(context.graph, node->output);
+    if (params == nullptr ||
+        !gdn_prefill_supported(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5],
+                              output, params->k)) {
+        return false;
+    }
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kQwenGdnRecurrentPrefillKernel);
+    dispatch.kernel.integer_parameters.emplace("token_count", inputs[2]->ne[2]);
+    dispatch.kernel.integer_parameters.emplace("snapshot_count", params->k);
+    const char * head_strides[] = { "q_head_stride", "k_head_stride", "v_head_stride" };
+    const char * token_strides[] = { "q_token_stride", "k_token_stride", "v_token_stride" };
+    for (size_t i = 0; i < 3; ++i) {
+        dispatch.kernel.integer_parameters.emplace(head_strides[i], inputs[i]->nb[1] / sizeof(float));
+        dispatch.kernel.integer_parameters.emplace(token_strides[i], inputs[i]->nb[2] / sizeof(float));
+    }
+    for (const Value * input : inputs) {
+        dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    }
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
 
 static bool match_qwen4exp_gdn_conv_prepare_decode_dispatch(const DispatchMatchContext & context,
                                                              DispatchMatch &              match) {
@@ -653,6 +803,22 @@ static bool match_qwen4exp_gdn_norm_gate_decode_dispatch(const DispatchMatchCont
 }
 
 void register_gdn_dispatches(DispatchRegistryBuilder & registry) {
+    registry.add({
+        "qwen4exp.gdn_conv_prefill",
+        GGML_OP_SSM_CONV,
+        DispatchMatchKind::SingleOp,
+        50,
+        DispatchSource::Qwen,
+        match_qwen4exp_gdn_conv_prefill_dispatch,
+    });
+    registry.add({
+        "qwen4exp.gdn_recurrent_prefill",
+        GGML_OP_GATED_DELTA_NET,
+        DispatchMatchKind::SingleOp,
+        50,
+        DispatchSource::Qwen,
+        match_qwen4exp_gdn_recurrent_prefill_dispatch,
+    });
     registry.add({
         "qwen4exp.gdn_conv_prepare_decode",
         GGML_OP_SSM_CONV,

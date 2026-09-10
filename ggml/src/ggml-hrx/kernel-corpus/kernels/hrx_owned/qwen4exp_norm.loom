@@ -1,0 +1,59 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_qsa_norm_gfx11_wave64 {subgroup_size = 64}
+
+config.decl @ggml.qsa_norm.epsilon : f32
+
+kernel.def target(@ggml_qsa_norm_gfx11_wave64) export("ggml_qsa_norm_f32") @ggml_qsa_norm_f32(
+    %width: index, %heads: index, %tokens: index, %source_stride: index) {
+  %one = index.constant 1 : index
+  %wg = index.constant 64 : index
+  %rows = index.mul %heads, %tokens : index
+  kernel.launch.config workgroups(%rows, %one, %one) workgroup_size(%wg, %one, %one) : index
+} launch(%width: index, %heads: index, %tokens: index, %source_stride: index, %input: buffer, %output: buffer) {
+  %w = index.assume %width [range(%width, 128, 256)] : index
+  %h = index.assume %heads [range(%heads, 1, 65536)] : index
+  %t = index.assume %tokens [range(%tokens, 1, 8)] : index
+  %stride = index.assume %source_stride [range(%source_stride, 128, 512)] : index
+  %rows = index.mul %h, %t : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %rows)] : index
+  %lane = kernel.workitem.id<x> : index
+  %one = index.constant 1 : index
+  %wg = index.constant 64 : index
+  %rows_less_one = index.sub %rows, %one : index
+  %span = index.mul %rows_less_one, %stride : index
+  %extent = index.add %span, %w : index
+  %base = index.mul %row, %stride : index
+  %offset = index.constant 0 : offset
+  %iv = buffer.view %input[%offset] : buffer -> view<[%extent]xf32>
+  %ov = buffer.view %output[%offset] : buffer -> view<[%rows]x[%w]xf32>
+  %zero = scalar.constant 0.0 : f32
+  %local = scf.for %col = [%lane to %w step %wg](%sum = %zero : f32) -> (f32) {
+    %at = index.add %base, %col : index
+    %safe = index.assume %at [lt(%at, %extent)] : index
+    %x = view.load %iv[%safe] : view<[%extent]xf32> -> f32
+    %square = scalar.mulf %x, %x : f32
+    %next = scalar.addf %sum, %square : f32
+    scf.yield %next : f32
+  }
+  %sum = kernel.workgroup.reduce<addf> %local : f32
+  %wi = index.cast %w : index to i32
+  %wf = scalar.uitofp %wi : i32 to f32
+  %mean = scalar.divf %sum, %wf : f32
+  %epsilon = config.get @ggml.qsa_norm.epsilon : f32
+  %variance = scalar.addf %mean, %epsilon : f32
+  %root = scalar.sqrtf %variance : f32
+  %unit = scalar.constant 1.0 : f32
+  %scale = scalar.divf %unit, %root : f32
+  scf.for %col = [%lane to %w step %wg] {
+    %at = index.add %base, %col : index
+    %safe = index.assume %at [lt(%at, %extent)] : index
+    %c = index.assume %col [lt(%col, %w)] : index
+    %x = view.load %iv[%safe] : view<[%extent]xf32> -> f32
+    %y = scalar.mulf %x, %scale : f32
+    view.store %y, %ov[%row, %c] : f32, view<[%rows]x[%w]xf32>
+  }
+  kernel.return
+}

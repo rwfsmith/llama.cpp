@@ -19,13 +19,16 @@
 // SIGMOID / 134 SILU nodes in the MoE router and shared-expert paths for free.
 
 #include "dispatch-elementwise.h"
+#include "dispatch-copy.h"
 
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -57,15 +60,25 @@ static constexpr KernelCatalogRef kDenseMatmulF32Kernel =
 // back to the CPU for that one node.
 static constexpr int64_t kDenseMatmulF32MaxInputSize   = 131072;
 static constexpr int64_t kDenseMatmulF32MaxTokenCount  = 2048;
-// Deliberately far below what the kernel can address. This route exists for small per-layer F32
-// gates, and the one other F32 MUL_MAT in a qwen4exp decode graph is the MoE router logits
-// projection ([2560]x[n_expert] = 512 wide). That node must stay CPU-side: dispatch-moe-router.cpp
-// roots its multi-op match at the SOFT_MAX above it and walks down to the ARGSORT/TOP_K/GET_ROWS
-// that select route weights. Claiming the logits MUL_MAT drags the SOFT_MAX into the HRX split
-// while GET_ROWS stays behind, and the router matcher then hard-aborts the graph with
-// "missing GET_ROWS from reshaped probabilities and top-k ids". 256 clears qwen4exp's 48-wide
-// ssm_alpha/ssm_beta gates with room to spare while excluding any plausible expert count.
+// The historical bound avoids pulling an incomplete router chain onto HRX.
+// The opt-in qwen4exp projection requires the now-supported router chain too.
 static constexpr int64_t kDenseMatmulF32MaxOutputSize  = 256;
+
+bool dense_f32_shape_supported(int64_t input_size, int64_t output_size, int64_t token_count) {
+    if (input_size < 1 || input_size > kDenseMatmulF32MaxInputSize ||
+        output_size < 1 || token_count < 1 || token_count > kDenseMatmulF32MaxTokenCount) {
+        return false;
+    }
+    if (output_size <= kDenseMatmulF32MaxOutputSize) {
+        return true;
+    }
+    const char * projection = std::getenv("HRX_ENABLE_F32_ROUTER");
+    const char * router = std::getenv("HRX_ENABLE_QWEN4EXP_ROUTER");
+    return input_size == 2560 && output_size == 512 && token_count <= 8 &&
+           projection != nullptr && projection[0] == '1' && projection[1] == '\0' &&
+           (router == nullptr || (router[0] != '\0' && router[0] != '0'));
+}
+
 static constexpr KernelCatalogRef kMulF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_mul_f32");
 static constexpr KernelCatalogRef kMulOuterF32Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_mul_outer_f32");
@@ -217,6 +230,42 @@ static bool match_unary_f32_dispatch(const DispatchMatchContext & context, Dispa
     return true;
 }
 
+static bool gdn_norm_prefill_enabled() {
+    const char * flag = std::getenv("HRX_ENABLE_GDN_NORM_PREFILL");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+template<class T>
+static bool gdn_norm_prefill_geometry(const T & input, const T & output, bool output_contiguous,
+                                      size_t input_bytes, size_t output_bytes) {
+    if (input.type != GGML_TYPE_F32 || output.type != GGML_TYPE_F32 || !output_contiguous ||
+        input.ne[0] != 128 || input.ne[1] != 16 || input.ne[2] < 2 || input.ne[2] > 8 ||
+        input.ne[3] != 1 || input.nb[0] != sizeof(float) || input.nb[1] != 128 * sizeof(float) ||
+        input.nb[2] != 10240 * sizeof(float)) {
+        return false;
+    }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (input.ne[d] != output.ne[d]) {
+            return false;
+        }
+    }
+    const size_t tokens = static_cast<size_t>(input.ne[2]);
+    return input_bytes >= ((tokens - 1) * 10240 + 2048) * sizeof(float) &&
+           output_bytes == tokens * 2048 * sizeof(float);
+}
+
+bool gdn_norm_prefill_supported(const ggml_tensor * op) {
+    if (!gdn_norm_prefill_enabled() || op == nullptr || op->op != GGML_OP_L2_NORM ||
+        op->src[0] == nullptr ||
+        !gdn_norm_prefill_geometry(*op->src[0], *op, ggml_is_contiguous(op),
+                                  ggml_nbytes(op->src[0]), ggml_nbytes(op))) {
+        return false;
+    }
+    float eps = 0.0f;
+    std::memcpy(&eps, op->op_params, sizeof(eps));
+    return eps >= 0.0f;
+}
+
 static bool match_l2_norm_f32_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
     const GraphNode * node = context.root_node;
     if (node == nullptr || node->op != GGML_OP_L2_NORM) {
@@ -224,8 +273,19 @@ static bool match_l2_norm_f32_dispatch(const DispatchMatchContext & context, Dis
     }
     const Value * input  = nullptr;
     const Value * output = nullptr;
+    bool pack_gdn = false;
     if (!elementwise_f32_pair(context.graph, node, &input, &output)) {
-        return false;
+        if (!gdn_norm_prefill_enabled() || node->inputs.size() != 1) {
+            return false;
+        }
+        input = elementwise_graph_value(context.graph, node->inputs[0]);
+        output = elementwise_graph_value(context.graph, node->output);
+        if (input == nullptr || output == nullptr ||
+            !gdn_norm_prefill_geometry(*input, *output, output->contiguous,
+                                      input->byte_count, output->byte_count)) {
+            return false;
+        }
+        pack_gdn = true;
     }
     // ggml normalizes over ne[0] only; ne[1..3] are independent rows. One workgroup owns one row, so
     // the kernel needs the row length and the flattened row count.
@@ -251,7 +311,23 @@ static bool match_l2_norm_f32_dispatch(const DispatchMatchContext & context, Dis
     dispatch.kernel.integer_parameters.emplace("row_length", row_length);
     dispatch.kernel.integer_parameters.emplace("row_count", row_count);
     dispatch.kernel.compile_parameters.emplace("ggml.l2_norm_f32.epsilon", epsilon_text);
-    dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    if (pack_gdn) {
+        // Q/K heads are contiguous within a token, but successive tokens skip
+        // the other convolution channels. Pack once, then reuse the row norm.
+        const ValueId packed = context.next_plan_value;
+        CopyF32Geometry geometry;
+        geometry.element_count = output->element_count;
+        geometry.row_length = 2048;
+        geometry.row_count = input->ne[2];
+        geometry.source_row_stride = 10240;
+        geometry.output_row_stride = 2048;
+        match.transients.push_back({ packed, "gdn.norm.prefill.packed", output->byte_count, 256 });
+        match.dispatches.push_back(make_copy_f32_dispatch(
+            geometry, input->id, input->byte_count, packed, output->byte_count));
+        dispatch.bindings.push_back({ packed, 0, output->byte_count });
+    } else {
+        dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    }
     dispatch.bindings.push_back({ output->id, 0, output->byte_count });
 
     match.covered_nodes.push_back(context.root_index);
@@ -488,9 +564,7 @@ static bool match_dense_matmul_f32_dispatch(const DispatchMatchContext & context
     if (input->ne[0] != input_size || output->ne[0] != output_size || output->ne[1] != token_count) {
         return false;
     }
-    if (input_size < 1 || input_size > kDenseMatmulF32MaxInputSize || output_size < 1 ||
-        output_size > kDenseMatmulF32MaxOutputSize || token_count < 1 ||
-        token_count > kDenseMatmulF32MaxTokenCount) {
+    if (!dense_f32_shape_supported(input_size, output_size, token_count)) {
         return false;
     }
 
@@ -508,7 +582,122 @@ static bool match_dense_matmul_f32_dispatch(const DispatchMatchContext & context
     return true;
 }
 
+bool qsa_bf16_projection_supported(const ggml_tensor * op) {
+    const char * enabled = std::getenv("HRX_ENABLE_QSA_PROJECTIONS");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 || op == nullptr ||
+        op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * weight = op->src[0];
+    const ggml_tensor * input = op->src[1];
+    if (weight->type != GGML_TYPE_BF16 || input->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (const ggml_tensor * tensor : { weight, input, op }) {
+        if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || !ggml_is_contiguous(tensor)) {
+            return false;
+        }
+    }
+    return weight->ne[0] == 2560 && (weight->ne[1] == 128 || weight->ne[1] == 512) &&
+           input->ne[0] == 2560 && input->ne[1] >= 1 && input->ne[1] <= 8 &&
+           op->ne[0] == weight->ne[1] && op->ne[1] == input->ne[1];
+}
+
+static bool match_qsa_bf16_projection_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * weight = elementwise_graph_value(context.graph, node->inputs[0]);
+    const Value * input = elementwise_graph_value(context.graph, node->inputs[1]);
+    const Value * output = elementwise_graph_value(context.graph, node->output);
+    if (weight == nullptr || input == nullptr || output == nullptr ||
+        !qsa_bf16_projection_supported(output->tensor)) {
+        return false;
+    }
+    static constexpr KernelCatalogRef kernel = GGML_HRX_KERNEL_REF("hrx_owned", "ggml_qsa_bf16_projection");
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kernel);
+    dispatch.kernel.integer_parameters.emplace("output_size", output->ne[0]);
+    dispatch.kernel.integer_parameters.emplace("token_count", output->ne[1]);
+    dispatch.bindings.push_back({ weight->id, 0, weight->byte_count });
+    dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
+bool recurrent_concat_supported(const ggml_tensor * op) {
+    const char * enabled = std::getenv("HRX_ENABLE_RECURRENT_CONCAT");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 || op == nullptr ||
+        op->op != GGML_OP_CONCAT || ggml_get_op_params_i32(op, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * history = op->src[0];
+    const ggml_tensor * input = op->src[1];
+    if (history == nullptr || input == nullptr || history->type != GGML_TYPE_F32 ||
+        input->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(history) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    for (const ggml_tensor * tensor : { history, input, op }) {
+        if (tensor->ne[1] != 10240 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            return false;
+        }
+    }
+    if ((history->ne[0] != 3 && history->ne[0] != 9) || input->ne[0] < 1 || input->ne[0] > 8 ||
+        op->ne[0] != history->ne[0] + input->ne[0]) {
+        return false;
+    }
+    return (input->nb[0] == sizeof(float) &&
+            input->nb[1] == static_cast<size_t>(input->ne[0]) * sizeof(float)) ||
+           (input->nb[0] == 10240 * sizeof(float) && input->nb[1] == sizeof(float));
+}
+
+static bool match_recurrent_concat_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_CONCAT || node->inputs.size() != 2) {
+        return false;
+    }
+    const Value * history = elementwise_graph_value(context.graph, node->inputs[0]);
+    const Value * input = elementwise_graph_value(context.graph, node->inputs[1]);
+    const Value * output = elementwise_graph_value(context.graph, node->output);
+    if (history == nullptr || input == nullptr || output == nullptr ||
+        !recurrent_concat_supported(output->tensor)) {
+        return false;
+    }
+    static constexpr KernelCatalogRef kernel = GGML_HRX_KERNEL_REF("hrx_owned", "ggml_recurrent_concat_f32");
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kernel);
+    dispatch.kernel.integer_parameters.emplace("history_count", history->ne[0]);
+    dispatch.kernel.integer_parameters.emplace("token_count", input->ne[0]);
+    dispatch.kernel.integer_parameters.emplace("input_transposed", input->nb[0] == 10240 * sizeof(float) ? 1 : 0);
+    dispatch.bindings.push_back({ history->id, 0, history->byte_count });
+    dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
 void register_elementwise_dispatches(DispatchRegistryBuilder & registry) {
+    registry.add({
+        "qwen4exp.qsa_bf16_projection",
+        GGML_OP_MUL_MAT,
+        DispatchMatchKind::SingleOp,
+        0,
+        DispatchSource::Common,
+        match_qsa_bf16_projection_dispatch,
+    });
+    registry.add({
+        "qwen4exp.recurrent_concat",
+        GGML_OP_CONCAT,
+        DispatchMatchKind::SingleOp,
+        0,
+        DispatchSource::Common,
+        match_recurrent_concat_dispatch,
+    });
     registry.add({
         // Priority 0: these are the fallback single-op forms. Any fused matcher that wants to absorb
         // an activation into a larger dispatch (the routed-FFN SwiGLU kernels, qwen4exp's GDN

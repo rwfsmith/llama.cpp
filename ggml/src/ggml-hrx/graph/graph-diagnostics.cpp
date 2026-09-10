@@ -170,6 +170,20 @@ json op_params_json(const OpParams & params) {
                     { "kind", "gated_delta_net" },
                     { "k",    value.k           }
                 };
+            } else if constexpr (std::is_same_v<T, ScaleParams>) {
+                return {
+                    { "kind",  "scale"     },
+                    { "scale", value.scale },
+                    { "bias",  value.bias  }
+                };
+            } else if constexpr (std::is_same_v<T, FillParams>) {
+                // JSON numbers cannot represent infinities or distinguish signed zero.
+                return {
+                    { "kind", "fill" },
+                    { "value_bits", value.value_bits }
+                };
+            } else {
+                static_assert(!std::is_same_v<T, T>, "OpParams alternative needs snapshot serialization");
             }
         },
         params);
@@ -177,6 +191,12 @@ json op_params_json(const OpParams & params) {
 
 OpParams parse_op_params(const json & item) {
     const std::string kind = item.value("kind", "none");
+    if (kind == "fill") {
+        return FillParams{ item.at("value_bits").get<uint32_t>() };
+    }
+    if (kind == "scale") {
+        return ScaleParams{ item.at("scale").get<float>(), item.at("bias").get<float>() };
+    }
     if (kind == "rms_norm") {
         return RmsNormParams{ item.value("eps", 0.0f) };
     }

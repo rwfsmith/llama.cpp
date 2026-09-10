@@ -1,5 +1,6 @@
 #include "dispatch-qwen-preamble.h"
 
+#include "dispatch-copy.h"
 #include "ggml.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
@@ -191,7 +192,9 @@ static bool match_raw_embedding_dispatch(const DispatchMatchContext & context, D
     dispatch.kernel.integer_parameters.emplace("vocabulary_count", weight->ne[1]);
     dispatch.kernel.integer_parameters.emplace("token_count", ids->ne[0]);
     dispatch.bindings.push_back({ weight->id, 0, weight->byte_count });
-    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count });
+    // Token IDs come from build_inp_embd()/qwen4exp.cpp's MTP embedding input, both
+    // host-populated leaves; a GPU-computed producer still keeps full validation.
+    dispatch.bindings.push_back({ ids->id, 0, ids->byte_count, is_trusted_host_index_producer(ids->tensor) });
     dispatch.bindings.push_back({ output->id, 0, output->byte_count });
     match.covered_nodes.push_back(context.root_index);
     match.dispatches.push_back(std::move(dispatch));

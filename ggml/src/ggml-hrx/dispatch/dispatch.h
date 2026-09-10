@@ -28,6 +28,12 @@ struct DispatchBinding {
     ValueId value;
     size_t  offset = 0;
     size_t  length = 0;
+    // True only when the matcher proved this value is written exclusively by trusted
+    // host code before the command executes (e.g. a `ggml_set_input()` leaf with no
+    // GPU-side producer in this graph), so per-launch index validation and replay
+    // exclusion are unnecessary for it. Defaults to untrusted for every existing
+    // binding; only specific matchers that verify the producer set this to true.
+    bool    trusted = false;
 };
 
 struct Dispatch {

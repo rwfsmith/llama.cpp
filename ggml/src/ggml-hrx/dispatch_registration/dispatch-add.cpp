@@ -104,6 +104,12 @@ bool supports_add_f32_dispatch(const ggml_tensor * op) {
            add_geometry(*op->src[0], *op->src[1], *op);
 }
 
+bool supports_qsa_add_dispatch(const ggml_tensor * op) {
+    return enabled("HRX_ENABLE_QSA_GLUE") && op != nullptr && op->view_src == nullptr &&
+           op->ne[0] == 128 && op->ne[1] >= 1 && op->ne[1] <= 65536 &&
+           op->ne[2] == 1 && op->ne[3] == 1 && supports_add_f32_dispatch(op);
+}
+
 bool is_broadcast_add_candidate(const ggml_tensor * op) {
     return op != nullptr && op->op == GGML_OP_ADD && op->src[0] != nullptr && op->src[1] != nullptr &&
            (!same_shape(*op, *op->src[0]) || !same_shape(*op, *op->src[1]));

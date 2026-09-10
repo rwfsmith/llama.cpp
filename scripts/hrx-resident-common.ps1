@@ -224,6 +224,9 @@ function New-HrxStartupConfiguration($Options) {
     foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
         $environment[$entry.Key.ToString().ToUpperInvariant()] = [string]$entry.Value
     }
+    # A build-time LLVM override can break COMGR's internal blit compilation and
+    # hang HIP stream creation. Let the runtime select its compiler by default.
+    $environment.Remove('LLVM_PATH')
     $environment.HRX_GPU_DRIVER = 'hip'
     $environment.HIP_PATH = $Options.HipPath
     $environment.HIP_DEVICE_LIB_PATH = Join-Path $Options.HipPath 'lib\llvm\amdgcn\bitcode'

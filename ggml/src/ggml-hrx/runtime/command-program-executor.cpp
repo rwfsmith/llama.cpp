@@ -1206,12 +1206,14 @@ static bool validate_row_ids(const CommandProgramExecutionContext & context, con
     }
     const bool set_rows = is_set_rows_kernel(command.kernel.specialization.kernel_id);
     const bool f32_get_rows = is_f32_get_rows_kernel(command.kernel.specialization.kernel_id);
+    const bool f16_get_rows = is_qsa_f16_gather_kernel(command.kernel.specialization.kernel_id);
     const bool q4_embedding = is_q4_embedding_kernel(command.kernel.specialization.kernel_id);
     const bool embedding = q4_embedding || is_q8_embedding_kernel(command.kernel.specialization.kernel_id);
-    if (!set_rows && !embedding && !f32_get_rows) {
+    if (!set_rows && !embedding && !f32_get_rows && !f16_get_rows) {
         return true;
     }
     const char * operation = set_rows ? "SET_ROWS" :
+                            f16_get_rows ? "QSA F16 GET_ROWS" :
                             f32_get_rows ? "F32 GET_ROWS" : (q4_embedding ? "Q4 GET_ROWS" : "Q8 GET_ROWS");
     if (command.kernel.bindings.size() != 3 || context.host_transfers == nullptr) {
         GGML_LOG_ERROR("HRX %s: missing validation bindings\n", operation);
@@ -1235,9 +1237,15 @@ static bool validate_row_ids(const CommandProgramExecutionContext & context, con
     const size_t index_size = set_rows && parameters.at("index_i64") ? sizeof(int64_t) : sizeof(int32_t);
     const size_t stride = set_rows ? static_cast<size_t>(parameters.at("index_stride")) * index_size : index_size;
     const int64_t capacity = parameters.at(set_rows ? "cache_rows" : "vocabulary_count");
-    if (embedding || f32_get_rows) {
+    if (f16_get_rows &&
+        (parameters.at("hidden_size") != 128 || capacity < 1 || capacity > 4096 || count < 1 || count > 4096)) {
+        GGML_LOG_ERROR("HRX %s: unsupported gather geometry\n", operation);
+        return false;
+    }
+    if (embedding || f32_get_rows || f16_get_rows) {
         const size_t width = static_cast<size_t>(parameters.at("hidden_size"));
-        const size_t row_bytes = f32_get_rows ? width * sizeof(float) :
+        const size_t row_bytes = f16_get_rows ? width * sizeof(ggml_fp16_t) :
+                                f32_get_rows ? width * sizeof(float) :
                                 q4_embedding ? width / 256 * 144 : width / 32 * 34;
         const size_t source_alignment = f32_get_rows ? sizeof(float) : sizeof(uint16_t);
         if (source.offset % source_alignment != 0 || ids.offset % sizeof(int32_t) != 0 ||
@@ -1252,6 +1260,14 @@ static bool validate_row_ids(const CommandProgramExecutionContext & context, con
         (count - 1) > (ids.length - index_size) / stride) {
         GGML_LOG_ERROR("HRX %s: index binding is too small\n", operation);
         return false;
+    }
+    // Trusted producers (see DispatchBinding::trusted) are host-populated leaves with no
+    // GPU-side producer in this graph, so their values cannot depend on anything this
+    // graph computed. The allocator/geometry checks above still apply unconditionally;
+    // only the synchronous GPU readback and per-row bounds/uniqueness scan below, which
+    // exist to catch GPU-computed IDs, are unnecessary for them.
+    if (command.kernel.bindings[1].binding.trusted) {
+        return true;
     }
     std::vector<uint8_t> bytes((count - 1) * stride + index_size);
     // This waits on preceding producers, including GPU-generated top-k IDs.
@@ -1857,12 +1873,24 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
     RecordedCommandGraphExecutionResult result;
     result.event = HrxGraphReplayEvent::Ineligible;
     // Host validation is a dispatch boundary. A recorded graph must not bypass it or run consumers on failure.
+    // SET_ROWS/GET_ROWS/embedding kernels whose IDs come from a trusted host-populated producer
+    // (DispatchBinding::trusted, set only for provable leaves such as the KV-cache k_idxs/v_idxs,
+    // build_inp_out_ids()'s output-position selection, or a token-embedding inp_tokens) already
+    // skip the validation readback in validate_row_ids(), and may also safely reuse a previously
+    // recorded command sequence: upload_prepared_host_staging() below refreshes its actual
+    // buffer contents on every replay regardless of whether the graph is rebuilt or hit, so
+    // replay eligibility never risks stale index data. Q4 routed gate/up IDs are always
+    // GPU-computed top-k routing output and always require validation; no matcher marks them
+    // trusted.
     const auto requires_validation = [](const PreparedCommand & command) {
-        return is_set_rows_kernel(command.kernel.specialization.kernel_id) ||
-               is_q4_routed_gate_up_kernel(command.kernel.specialization.kernel_id) ||
-               is_f32_get_rows_kernel(command.kernel.specialization.kernel_id) ||
-               is_q8_embedding_kernel(command.kernel.specialization.kernel_id) ||
-               is_q4_embedding_kernel(command.kernel.specialization.kernel_id);
+        if (is_set_rows_kernel(command.kernel.specialization.kernel_id) ||
+            is_f32_get_rows_kernel(command.kernel.specialization.kernel_id) ||
+            is_qsa_f16_gather_kernel(command.kernel.specialization.kernel_id) ||
+            is_q8_embedding_kernel(command.kernel.specialization.kernel_id) ||
+            is_q4_embedding_kernel(command.kernel.specialization.kernel_id)) {
+            return command.kernel.bindings.size() < 2 || !command.kernel.bindings[1].binding.trusted;
+        }
+        return is_q4_routed_gate_up_kernel(command.kernel.specialization.kernel_id);
     };
     if (std::any_of(prepared.commands.begin(), prepared.commands.end(), requires_validation) ||
         std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), requires_validation)) {
@@ -1886,6 +1914,13 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
         if (std::any_of(prepared.commands.begin(), prepared.commands.end(), is_f32_gather) ||
             std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), is_f32_gather)) {
             result.ineligible_reason = "f32_get_rows_requires_index_validation";
+        }
+        const auto is_f16_gather = [](const PreparedCommand & command) {
+            return is_qsa_f16_gather_kernel(command.kernel.specialization.kernel_id);
+        };
+        if (std::any_of(prepared.commands.begin(), prepared.commands.end(), is_f16_gather) ||
+            std::any_of(prepared.initialization_commands.begin(), prepared.initialization_commands.end(), is_f16_gather)) {
+            result.ineligible_reason = "qsa_f16_get_rows_requires_index_validation";
         }
         const auto is_q4_gate_up = [](const PreparedCommand & command) {
             return is_q4_routed_gate_up_kernel(command.kernel.specialization.kernel_id);

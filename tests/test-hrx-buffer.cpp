@@ -741,11 +741,59 @@ static void run_set_rows_capabilities(ggml_backend_t backend) {
     ggml_free(context);
 }
 
+static uint64_t next_host_alias_graph_uid();
+
+static void run_set_rows_adjacent_mask_checks(ggml_backend_t backend) {
+    constexpr int64_t rows = 512;
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        ggml_context * ctx = ggml_init({ 1024 * 1024, nullptr, true });
+        REQUIRE(ctx != nullptr);
+        auto * mask = ggml_new_tensor_2d(ctx, type, 1, rows);
+        auto * zeros = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, rows);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows);
+        ggml_set_input(ids);
+        auto * output = ggml_set_rows(ctx, mask, zeros, ids);
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        graph->uid = next_host_alias_graph_uid();
+        REQUIRE(ggml_backend_supports_op(backend, output));
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        REQUIRE(buffer != nullptr);
+        const std::vector<float> source(rows, 0.0f);
+        const std::vector<float> initial_f32(rows, -INFINITY);
+        const std::vector<ggml_fp16_t> initial_f16(rows, ggml_fp32_to_fp16(-INFINITY));
+        std::vector<int32_t> indices(rows);
+        std::vector<uint8_t> actual(ggml_nbytes(output));
+        ggml_backend_tensor_set(zeros, source.data(), 0, source.size() * sizeof(float));
+        for (int repeat = 0; repeat < 64; ++repeat) {
+            for (int64_t row = 0; row < rows; ++row) {
+                indices[row] = static_cast<int32_t>((row * 73 + repeat * 17) % rows);
+            }
+            ggml_backend_tensor_set(ids, indices.data(), 0, indices.size() * sizeof(int32_t));
+            const void * initial = type == GGML_TYPE_F16 ?
+                static_cast<const void *>(initial_f16.data()) : static_cast<const void *>(initial_f32.data());
+            ggml_backend_tensor_set(mask, initial, 0, ggml_nbytes(mask));
+            REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(output, actual.data(), 0, actual.size());
+            const auto nonzero = std::count_if(actual.begin(), actual.end(), [](uint8_t byte) { return byte != 0; });
+            if (nonzero != 0) {
+                std::fprintf(stderr, "Adjacent scalar SET_ROWS type=%s repeat=%d nonzero_bytes=%zu\n",
+                             ggml_type_name(type), repeat, static_cast<size_t>(nonzero));
+            }
+            REQUIRE(nonzero == 0);
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, "Adjacent scalar SET_ROWS mask checks passed (F16/F32, shuffled full permutation)\n");
+}
+
 static void run_set_rows_checks(ggml_backend_t backend) {
     const char * flag = std::getenv("HRX_ENABLE_SET_ROWS");
     const bool had_flag = flag != nullptr;
     const std::string previous = flag == nullptr ? "" : flag;
     run_set_rows_capabilities(backend);
+    run_set_rows_adjacent_mask_checks(backend);
     for (const int64_t width : { 1, 128, 256, 512 }) {
         for (const ggml_type output_type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
             for (const ggml_type index_type : { GGML_TYPE_I32, GGML_TYPE_I64 }) {

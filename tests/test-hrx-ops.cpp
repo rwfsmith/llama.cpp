@@ -5,6 +5,11 @@
 #include "dispatch_registration/dispatch-qwen-preamble.h"
 #include "dispatch_registration/dispatch-rmsnorm.h"
 #include "dispatch_registration/dispatch-add.h"
+#include "dispatch_registration/dispatch-copy.h"
+#include "dispatch_registration/dispatch-gather-add.h"
+#include "dispatch_registration/dispatch-elementwise.h"
+#include "dispatch_registration/dispatch-gated-delta-net.h"
+#include "dispatch_registration/dispatch-qwen4exp-rope.h"
 #include "dispatch_registration/dispatch-swiglu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -36,6 +41,35 @@
             std::abort();                                                                            \
         }                                                                                            \
     } while (false)
+
+class ScopedHrxEnvironment {
+  public:
+    ScopedHrxEnvironment(const char * key, const char * value) : key(key) {
+        const char * previous = std::getenv(key);
+        had_previous = previous != nullptr;
+        if (had_previous) {
+            saved = previous;
+        }
+        set(value);
+    }
+
+    ~ScopedHrxEnvironment() {
+        set(had_previous ? saved.c_str() : nullptr);
+    }
+
+  private:
+    void set(const char * value) {
+#ifdef _WIN32
+        REQUIRE(_putenv_s(key, value != nullptr ? value : "") == 0);
+#else
+        REQUIRE((value != nullptr ? setenv(key, value, 1) : unsetenv(key)) == 0);
+#endif
+    }
+
+    const char * key;
+    bool        had_previous = false;
+    std::string saved;
+};
 
 static constexpr float   kQwenRmsNormEps        = 0.000001f;
 static constexpr int64_t kQwenFlashHeadSize     = 128;
@@ -281,21 +315,23 @@ static ggml_tensor * build_qwen_flash_attention_graph(ggml_context * ctx,
 
 static ggml_tensor * build_qwen_router_top8_graph(ggml_context * ctx,
                                                   ggml_tensor *  logits,
-                                                  ggml_tensor ** route_ids = nullptr) {
+                                                  ggml_tensor ** route_ids = nullptr,
+                                                  int64_t expert_count = kQwenRouterExpertCount,
+                                                  int64_t route_count = kQwenRouterRouteCount) {
     ggml_tensor * probs = ggml_soft_max(ctx, logits);
     REQUIRE(probs != nullptr);
-    ggml_tensor * probs_reshaped = ggml_reshape_3d(ctx, probs, 1, kQwenRouterExpertCount, logits->ne[1]);
+    ggml_tensor * probs_reshaped = ggml_reshape_3d(ctx, probs, 1, expert_count, logits->ne[1]);
     REQUIRE(probs_reshaped != nullptr);
     ggml_tensor * argsort = ggml_argsort(ctx, probs, GGML_SORT_ORDER_DESC);
     REQUIRE(argsort != nullptr);
-    ggml_tensor * topk = ggml_view_2d(ctx, argsort, kQwenRouterRouteCount, logits->ne[1], argsort->nb[1], 0);
+    ggml_tensor * topk = ggml_view_2d(ctx, argsort, route_count, logits->ne[1], argsort->nb[1], 0);
     REQUIRE(topk != nullptr);
     if (route_ids != nullptr) {
         *route_ids = topk;
     }
     ggml_tensor * selected = ggml_get_rows(ctx, probs_reshaped, topk);
     REQUIRE(selected != nullptr);
-    ggml_tensor * selected_reshaped = ggml_reshape_2d(ctx, selected, kQwenRouterRouteCount, logits->ne[1]);
+    ggml_tensor * selected_reshaped = ggml_reshape_2d(ctx, selected, route_count, logits->ne[1]);
     REQUIRE(selected_reshaped != nullptr);
     ggml_tensor * sum = ggml_sum_rows(ctx, selected_reshaped);
     REQUIRE(sum != nullptr);
@@ -303,7 +339,7 @@ static ggml_tensor * build_qwen_router_top8_graph(ggml_context * ctx,
     REQUIRE(clamped_sum != nullptr);
     ggml_tensor * normalized = ggml_div(ctx, selected_reshaped, clamped_sum);
     REQUIRE(normalized != nullptr);
-    ggml_tensor * output = ggml_reshape_3d(ctx, normalized, 1, kQwenRouterRouteCount, logits->ne[1]);
+    ggml_tensor * output = ggml_reshape_3d(ctx, normalized, 1, route_count, logits->ne[1]);
     REQUIRE(output != nullptr);
     return output;
 }
@@ -481,6 +517,71 @@ static void run_alternate_value_alias_lookup_checks() {
     const ggml::hrx::CommandPlanAlternateValue * through_partial_alias =
         ggml::hrx::find_alternate_value(graph, plan, partial_alias, GGML_TYPE_Q8_1, q8_bytes);
     REQUIRE(through_partial_alias == nullptr);
+}
+
+static void run_set_rows_trusted_producer_checks() {
+    ggml_init_params params = {};
+    params.mem_size         = 1024 * 1024;
+    params.no_alloc         = true;
+    ggml_context * ctx      = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+
+    REQUIRE(!ggml::hrx::is_trusted_host_index_producer(nullptr));
+
+    // A leaf with no producer op, but never marked as a graph input (e.g. a resident weight
+    // or scratch allocation), must not be trusted: nothing here proves host code, rather than
+    // uninitialized or stale device memory, populated it before this command runs.
+    ggml_tensor * plain_leaf = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 8);
+    REQUIRE(plain_leaf != nullptr);
+    REQUIRE(plain_leaf->op == GGML_OP_NONE);
+    REQUIRE(!ggml::hrx::is_trusted_host_index_producer(plain_leaf));
+
+    // A leaf explicitly marked as a graph input mirrors llama-kv-cache.cpp's k_idxs/v_idxs:
+    // host code writes it via a raw CPU pointer before the graph runs, so it is trusted.
+    ggml_tensor * host_input_leaf = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 8);
+    REQUIRE(host_input_leaf != nullptr);
+    ggml_set_input(host_input_leaf);
+    REQUIRE(ggml::hrx::is_trusted_host_index_producer(host_input_leaf));
+
+    // A tensor with a real producer op is never trusted, even if something also marked it as
+    // an input -- e.g. the QSA/routing case (a view of a GPU-computed top-k selection). The
+    // op check, not just the input flag, is what rules out GPU-computed producers.
+    ggml_tensor * source          = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 8);
+    ggml_tensor * view_of_gpu_op = ggml_view_1d(ctx, source, 4, 0);
+    REQUIRE(source != nullptr);
+    REQUIRE(view_of_gpu_op != nullptr);
+    REQUIRE(view_of_gpu_op->op != GGML_OP_NONE);
+    ggml_set_input(view_of_gpu_op);
+    REQUIRE(!ggml::hrx::is_trusted_host_index_producer(view_of_gpu_op));
+
+    for (const char * flag : { "0", "1", "1x" }) {
+        ScopedHrxEnvironment environment("HRX_ENABLE_TRUSTED_INDEX_VIEWS", flag);
+        ggml_tensor * slice = ggml_view_1d(ctx, host_input_leaf, 6, sizeof(int64_t));
+        ggml_tensor * nested = ggml_view_1d(ctx, slice, 2, sizeof(int64_t));
+        const bool enabled = std::strcmp(flag, "1") == 0;
+        REQUIRE(ggml::hrx::is_trusted_host_index_producer(slice) == enabled);
+        REQUIRE(ggml::hrx::is_trusted_host_index_producer(nested) == enabled);
+        ggml_tensor * empty = ggml_view_1d(ctx, host_input_leaf, 0, ggml_nbytes(host_input_leaf));
+        REQUIRE(ggml::hrx::is_trusted_host_index_producer(empty) == enabled);
+        REQUIRE(!ggml::hrx::is_trusted_host_index_producer(view_of_gpu_op));
+        ggml_tensor * computed = ggml_add_inplace(ctx, host_input_leaf, source);
+        ggml_set_input(computed);
+        ggml_tensor * computed_view = ggml_view_1d(ctx, computed, 2, 0);
+        REQUIRE(computed_view->view_src == host_input_leaf);
+        REQUIRE(!ggml::hrx::is_trusted_host_index_producer(computed_view));
+        ggml_tensor * retyped = ggml_view_1d(ctx, host_input_leaf, 2, 0);
+        retyped->type = GGML_TYPE_I32;
+        REQUIRE(!ggml::hrx::is_trusted_host_index_producer(retyped));
+        ggml_tensor * strided = ggml_view_2d(ctx, host_input_leaf, 1, 2, 2 * sizeof(int64_t), 0);
+        REQUIRE(!ggml::hrx::is_trusted_host_index_producer(strided));
+        ggml_tensor * misaligned = ggml_view_1d(ctx, host_input_leaf, 2, 1);
+        REQUIRE(!ggml::hrx::is_trusted_host_index_producer(misaligned));
+        ggml_tensor * outside_parent = ggml_view_1d(ctx, nested, 1, 0);
+        outside_parent->view_offs = ggml_nbytes(host_input_leaf);
+        REQUIRE(!ggml::hrx::is_trusted_host_index_producer(outside_parent));
+    }
+
+    ggml_free(ctx);
 }
 
 static std::vector<float> make_pattern_f32(size_t element_count, int seed, float scale = 0.01f) {
@@ -690,6 +791,11 @@ static AttentionPostprocessGraph build_attention_postprocess_graph(ggml_context 
     REQUIRE(graph.value_cache != nullptr);
     REQUIRE(graph.key_cache_indices != nullptr);
     REQUIRE(graph.value_cache_indices != nullptr);
+    // Match llama-kv-cache.cpp's build_input_k_idxs/build_input_v_idxs: real KV-cache slot
+    // indices are host-populated graph-input leaves, which is what makes the SET_ROWS
+    // trusted-producer bypass (see DispatchBinding::trusted) apply to them.
+    ggml_set_input(graph.key_cache_indices);
+    ggml_set_input(graph.value_cache_indices);
 
     graph.key_output   = ggml_set_rows(ctx, graph.key_cache, key_cache_rows, graph.key_cache_indices);
     graph.value_output = ggml_set_rows(ctx, graph.value_cache, value_cache_rows, graph.value_cache_indices);
@@ -952,6 +1058,19 @@ static void run_rmsnorm_support_checks() {
     ggml_build_forward_expand(wrong_weight_graph, wrong_weight_output);
     const ggml::hrx::GraphSupportResult wrong_weight_support = executor.can_execute(*wrong_weight_graph);
     REQUIRE(!wrong_weight_support.supported);
+
+    // 131072 rows (48 indexer heads * 2048 real prefill tokens) is the widened per-head cap;
+    // one row over that must still fall back rather than silently become unlimited.
+    ggml_tensor * row_cap_input  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 131073);
+    ggml_tensor * row_cap_weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+    REQUIRE(row_cap_input != nullptr);
+    REQUIRE(row_cap_weight != nullptr);
+    ggml_tensor * row_cap_output = build_rmsnorm_mul_graph(ctx, row_cap_input, row_cap_weight);
+    ggml_cgraph * row_cap_graph  = ggml_new_graph(ctx);
+    REQUIRE(row_cap_graph != nullptr);
+    ggml_build_forward_expand(row_cap_graph, row_cap_output);
+    const ggml::hrx::GraphSupportResult row_cap_support = executor.can_execute(*row_cap_graph);
+    REQUIRE(!row_cap_support.supported);
 
     ggml_free(ctx);
 }
@@ -1653,35 +1772,6 @@ static void run_dense_matmul_cpu_reference_case(ggml_type    weight_type,
     ggml_backend_free(hrx_backend);
 }
 
-class ScopedHrxEnvironment {
-  public:
-    ScopedHrxEnvironment(const char * key, const char * value) : key(key) {
-        const char * previous = std::getenv(key);
-        had_previous = previous != nullptr;
-        if (had_previous) {
-            saved = previous;
-        }
-        set(value);
-    }
-
-    ~ScopedHrxEnvironment() {
-        set(had_previous ? saved.c_str() : nullptr);
-    }
-
-  private:
-    void set(const char * value) {
-#ifdef _WIN32
-        REQUIRE(_putenv_s(key, value != nullptr ? value : "") == 0);
-#else
-        REQUIRE((value != nullptr ? setenv(key, value, 1) : unsetenv(key)) == 0);
-#endif
-    }
-
-    const char * key;
-    bool        had_previous = false;
-    std::string saved;
-};
-
 static void require_zero_device_timing_calls(const ggml::hrx::DeviceTimingTestSnapshot & snapshot) {
     REQUIRE(snapshot.init_attempts == 0);
     REQUIRE(snapshot.event_create_calls == 0);
@@ -1735,54 +1825,70 @@ static void run_q8_embedding_scheduling_checks() {
     for (const char * flag : { static_cast<const char *>(nullptr), "", "0", "true", "01", "1x", "1" }) {
         ScopedHrxEnvironment environment("HRX_ENABLE_Q8_EMBEDDING", flag);
         for (int64_t tokens : { 1, 7, 32, 2048 }) {
-            ggml_init_params params = {};
-            params.mem_size = 1024 * 1024;
-            params.no_alloc = true;
-            ggml_context * ctx = ggml_init(params);
-            REQUIRE(ctx != nullptr);
-            ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 248320);
-            ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
-            ggml_tensor * output = ggml_get_rows(ctx, weight, ids);
-            ggml_cgraph * graph = ggml_new_graph(ctx);
-            ggml_build_forward_expand(graph, output);
-            const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0;
-            REQUIRE(ggml::hrx::supports_q8_embedding_dispatch(output) == enabled);
-            auto imported = ggml::hrx::import_ggml_graph(*graph);
-            REQUIRE(imported.valid());
-            ggml::hrx::DispatchScheduler scheduler;
-            REQUIRE(scheduler.schedule_graph(imported.graph, { "gfx1151" }) == enabled);
-            if (enabled) {
-                const auto & plan = scheduler.plan();
-                REQUIRE(plan.dispatches.size() == 1);
-                REQUIRE(plan.transients.empty());
-                REQUIRE(plan.constant_initializations.empty());
-                const auto & dispatch = plan.dispatches[0];
-                REQUIRE(kernel_name_for_id(dispatch.kernel.kernel_id) == "hrx_owned:ggml_token_embedding_q8_0_f32");
-                REQUIRE(dispatch.kernel.integer_parameters.at("hidden_size") == 2560);
-                REQUIRE(dispatch.kernel.integer_parameters.at("vocabulary_count") == 248320);
-                REQUIRE(dispatch.kernel.integer_parameters.at("token_count") == tokens);
-                REQUIRE(dispatch.kernel.compile_parameters.empty());
-                REQUIRE(dispatch.bindings.size() == 3);
-                REQUIRE(dispatch.bindings[0].value == imported.graph.values().find_tensor(weight)->id);
-                REQUIRE(dispatch.bindings[0].length == ggml_nbytes(weight));
-                REQUIRE(dispatch.bindings[1].value == imported.graph.values().find_tensor(ids)->id);
-                REQUIRE(dispatch.bindings[1].length == ggml_nbytes(ids));
-                REQUIRE(dispatch.bindings[2].length == ggml_nbytes(output));
-                for (bool initialization : { false, true }) {
-                    ggml::hrx::PreparedCommandProgram prepared;
-                    ggml::hrx::PreparedCommand command;
-                    command.kind = ggml::hrx::CommandKind::Kernel;
-                    command.kernel.specialization = dispatch.kernel;
-                    (initialization ? prepared.initialization_commands : prepared.commands).push_back(command);
-                    ggml::hrx::RecordedCommandGraph recorded;
-                    const auto replay = ggml::hrx::bind_and_launch_recorded_command_graph(
-                        {}, {}, {}, prepared, recorded);
-                    REQUIRE(!replay.success);
-                    REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::Ineligible);
-                    REQUIRE(replay.ineligible_reason == "q8_embedding_requires_index_validation");
+            // ids marked as a graph input mirrors llama-graph.cpp's build_inp_embd() (inp->tokens);
+            // unmarked mirrors any hypothetical GPU-computed producer, which must stay untrusted.
+            for (bool trusted_producer : { false, true }) {
+                ggml_init_params params = {};
+                params.mem_size = 1024 * 1024;
+                params.no_alloc = true;
+                ggml_context * ctx = ggml_init(params);
+                REQUIRE(ctx != nullptr);
+                ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2560, 248320);
+                ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+                if (trusted_producer) {
+                    ggml_set_input(ids);
                 }
+                ggml_tensor * output = ggml_get_rows(ctx, weight, ids);
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, output);
+                const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0;
+                REQUIRE(ggml::hrx::supports_q8_embedding_dispatch(output) == enabled);
+                auto imported = ggml::hrx::import_ggml_graph(*graph);
+                REQUIRE(imported.valid());
+                ggml::hrx::DispatchScheduler scheduler;
+                REQUIRE(scheduler.schedule_graph(imported.graph, { "gfx1151" }) == enabled);
+                if (enabled) {
+                    const auto & plan = scheduler.plan();
+                    REQUIRE(plan.dispatches.size() == 1);
+                    REQUIRE(plan.transients.empty());
+                    REQUIRE(plan.constant_initializations.empty());
+                    const auto & dispatch = plan.dispatches[0];
+                    REQUIRE(kernel_name_for_id(dispatch.kernel.kernel_id) == "hrx_owned:ggml_token_embedding_q8_0_f32");
+                    REQUIRE(dispatch.kernel.integer_parameters.at("hidden_size") == 2560);
+                    REQUIRE(dispatch.kernel.integer_parameters.at("vocabulary_count") == 248320);
+                    REQUIRE(dispatch.kernel.integer_parameters.at("token_count") == tokens);
+                    REQUIRE(dispatch.kernel.compile_parameters.empty());
+                    REQUIRE(dispatch.bindings.size() == 3);
+                    REQUIRE(dispatch.bindings[0].value == imported.graph.values().find_tensor(weight)->id);
+                    REQUIRE(dispatch.bindings[0].length == ggml_nbytes(weight));
+                    REQUIRE(dispatch.bindings[1].value == imported.graph.values().find_tensor(ids)->id);
+                    REQUIRE(dispatch.bindings[1].length == ggml_nbytes(ids));
+                    REQUIRE(dispatch.bindings[1].trusted == trusted_producer);
+                    REQUIRE(dispatch.bindings[2].length == ggml_nbytes(output));
+                    for (bool initialization : { false, true }) {
+                        ggml::hrx::PreparedCommandProgram prepared;
+                        ggml::hrx::PreparedCommand command;
+                        command.kind = ggml::hrx::CommandKind::Kernel;
+                        command.kernel.specialization = dispatch.kernel;
+                        command.kernel.bindings.resize(dispatch.bindings.size());
+                        for (size_t i = 0; i < dispatch.bindings.size(); ++i) {
+                            command.kernel.bindings[i].binding.trusted = dispatch.bindings[i].trusted;
+                        }
+                        (initialization ? prepared.initialization_commands : prepared.commands).push_back(command);
+                        ggml::hrx::RecordedCommandGraph recorded;
+                        const auto replay = ggml::hrx::bind_and_launch_recorded_command_graph(
+                            {}, {}, {}, prepared, recorded);
+                        REQUIRE(!replay.success);
+                        if (trusted_producer) {
+                            REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::BuildFailed);
+                        } else {
+                            REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::Ineligible);
+                            REQUIRE(replay.ineligible_reason == "q8_embedding_requires_index_validation");
+                        }
+                    }
+                }
+                ggml_free(ctx);
             }
-            ggml_free(ctx);
         }
     }
     ScopedHrxEnvironment environment("HRX_ENABLE_Q8_EMBEDDING", "1");
@@ -1836,83 +1942,99 @@ static void run_q4_embedding_scheduling_checks() {
     for (const char * flag : { static_cast<const char *>(nullptr), "", "0", "true", "01", "1x", "1" }) {
         ScopedHrxEnvironment environment("HRX_ENABLE_Q4_EMBEDDING", flag);
         for (int64_t tokens : { 1, 2, 3, 4, 8, 9 }) {
-            ggml_init_params params = {};
-            params.mem_size = 1024 * 1024;
-            params.no_alloc = true;
-            ggml_context * ctx = ggml_init(params);
-            REQUIRE(ctx != nullptr);
-            ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 2560, 248320);
-            ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
-            ggml_tensor * output = ggml_get_rows(ctx, weight, ids);
-            const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0 && tokens <= 8;
-            REQUIRE(ggml::hrx::supports_q4_embedding_dispatch(output) == enabled);
-            REQUIRE(!ggml::hrx::supports_q8_embedding_dispatch(output));
-            ggml_cgraph * graph = ggml_new_graph(ctx);
-            // qwen4exp MTP build_norm(tok_embd, nextn.enorm) requires learned gamma.
-            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
-            ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, output, kQwenRmsNormEps), gamma);
-            ggml_build_forward_expand(graph, normalized);
-            auto imported = ggml::hrx::import_ggml_graph(*graph);
-            REQUIRE(imported.valid());
-            ggml::hrx::DispatchScheduler scheduler;
-            ggml::hrx::DispatchScheduleDiagnostics diagnostics;
-            const bool scheduled = scheduler.schedule_graph(imported.graph, { "gfx1151" }, &diagnostics);
-            if (scheduled != enabled) {
-                std::fprintf(stderr, "Q4 embedding scheduling: flag=%s T=%lld expected=%d scheduled=%d\n",
-                             flag == nullptr ? "<unset>" : flag, static_cast<long long>(tokens),
-                             enabled ? 1 : 0, scheduled ? 1 : 0);
-                for (const auto & error : scheduler.plan().status.errors()) {
-                    std::fprintf(stderr, "scheduler error: %s\n", error.c_str());
+            // ids marked as a graph input mirrors qwen4exp.cpp's MTP draft embedding (inp->tokens);
+            // unmarked mirrors any hypothetical GPU-computed producer, which must stay untrusted.
+            for (bool trusted_producer : { false, true }) {
+                ggml_init_params params = {};
+                params.mem_size = 1024 * 1024;
+                params.no_alloc = true;
+                ggml_context * ctx = ggml_init(params);
+                REQUIRE(ctx != nullptr);
+                ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 2560, 248320);
+                ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+                if (trusted_producer) {
+                    ggml_set_input(ids);
                 }
-                std::fprintf(stderr, "unsupported: %s\n", diagnostics.unsupported_message.c_str());
-                for (const auto & attempt : diagnostics.match.attempts) {
-                    std::fprintf(stderr, "  attempt %s matched=%d\n", attempt.name.c_str(), attempt.matched ? 1 : 0);
+                ggml_tensor * output = ggml_get_rows(ctx, weight, ids);
+                const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0 && tokens <= 8;
+                REQUIRE(ggml::hrx::supports_q4_embedding_dispatch(output) == enabled);
+                REQUIRE(!ggml::hrx::supports_q8_embedding_dispatch(output));
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                // qwen4exp MTP build_norm(tok_embd, nextn.enorm) requires learned gamma.
+                ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2560);
+                ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, output, kQwenRmsNormEps), gamma);
+                ggml_build_forward_expand(graph, normalized);
+                auto imported = ggml::hrx::import_ggml_graph(*graph);
+                REQUIRE(imported.valid());
+                ggml::hrx::DispatchScheduler scheduler;
+                ggml::hrx::DispatchScheduleDiagnostics diagnostics;
+                const bool scheduled = scheduler.schedule_graph(imported.graph, { "gfx1151" }, &diagnostics);
+                if (scheduled != enabled) {
+                    std::fprintf(stderr, "Q4 embedding scheduling: flag=%s T=%lld expected=%d scheduled=%d\n",
+                                 flag == nullptr ? "<unset>" : flag, static_cast<long long>(tokens),
+                                 enabled ? 1 : 0, scheduled ? 1 : 0);
+                    for (const auto & error : scheduler.plan().status.errors()) {
+                        std::fprintf(stderr, "scheduler error: %s\n", error.c_str());
+                    }
+                    std::fprintf(stderr, "unsupported: %s\n", diagnostics.unsupported_message.c_str());
+                    for (const auto & attempt : diagnostics.match.attempts) {
+                        std::fprintf(stderr, "  attempt %s matched=%d\n", attempt.name.c_str(), attempt.matched ? 1 : 0);
+                    }
                 }
+                REQUIRE(scheduled == enabled);
+                if (enabled) {
+                    const auto & plan = scheduler.plan();
+                    REQUIRE(plan.dispatches.size() == 2);
+                    REQUIRE(kernel_name_for_id(plan.dispatches[1].kernel.kernel_id) == "qwen3_moe:qwen3_moe_rmsnorm_f32");
+                    REQUIRE(plan.dispatches[1].bindings.size() == 3);
+                    REQUIRE(plan.dispatches[1].bindings[0].value == imported.graph.values().find_tensor(output)->id);
+                    REQUIRE(plan.dispatches[1].bindings[1].value == imported.graph.values().find_tensor(gamma)->id);
+                    REQUIRE(plan.dispatches[1].bindings[2].value == imported.graph.values().find_tensor(normalized)->id);
+                    const auto & dispatch = plan.dispatches.front();
+                    REQUIRE(kernel_name_for_id(dispatch.kernel.kernel_id) == "hrx_owned:ggml_token_embedding_q4_k_f32");
+                    REQUIRE(dispatch.kernel.integer_parameters.at("hidden_size") == 2560);
+                    REQUIRE(dispatch.kernel.integer_parameters.at("vocabulary_count") == 248320);
+                    REQUIRE(dispatch.kernel.integer_parameters.at("token_count") == tokens);
+                    REQUIRE(dispatch.kernel.compile_parameters.empty());
+                    REQUIRE(dispatch.bindings.size() == 3);
+                    REQUIRE(dispatch.bindings[0].value == imported.graph.values().find_tensor(weight)->id);
+                    REQUIRE(dispatch.bindings[0].length == ggml_nbytes(weight));
+                    REQUIRE(dispatch.bindings[1].value == imported.graph.values().find_tensor(ids)->id);
+                    REQUIRE(dispatch.bindings[1].length == ggml_nbytes(ids));
+                    REQUIRE(dispatch.bindings[1].trusted == trusted_producer);
+                    REQUIRE(dispatch.bindings[2].value == imported.graph.values().find_tensor(output)->id);
+                    REQUIRE(dispatch.bindings[2].length == ggml_nbytes(output));
+                    for (bool initialization : { false, true }) {
+                        ggml::hrx::PreparedCommandProgram prepared;
+                        ggml::hrx::PreparedCommand command;
+                        command.kind = ggml::hrx::CommandKind::Kernel;
+                        command.kernel.specialization = dispatch.kernel;
+                        command.kernel.bindings.resize(dispatch.bindings.size());
+                        for (size_t i = 0; i < dispatch.bindings.size(); ++i) {
+                            command.kernel.bindings[i].binding.trusted = dispatch.bindings[i].trusted;
+                        }
+                        (initialization ? prepared.initialization_commands : prepared.commands).push_back(command);
+                        ggml::hrx::RecordedCommandGraph recorded;
+                        const auto replay = ggml::hrx::bind_and_launch_recorded_command_graph(
+                            {}, {}, {}, prepared, recorded);
+                        REQUIRE(!replay.success);
+                        if (trusted_producer) {
+                            REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::BuildFailed);
+                        } else {
+                            REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::Ineligible);
+                            REQUIRE(replay.ineligible_reason == "q4_embedding_requires_index_validation");
+                        }
+                    }
+                }
+                // Original Qwen3 Q4 kernel remains selected regardless of the new flag.
+                weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 2048, 65);
+                output = ggml_get_rows(ctx, weight, ids);
+                REQUIRE(!ggml::hrx::supports_q4_embedding_dispatch(output));
+                graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, output);
+                require_kernel_subsequence(scheduled_kernel_sequence(graph), { "qwen3_moe:qwen_token_embedding_q4k" });
+                ggml_free(ctx);
             }
-            REQUIRE(scheduled == enabled);
-            if (enabled) {
-                const auto & plan = scheduler.plan();
-                REQUIRE(plan.dispatches.size() == 2);
-                REQUIRE(kernel_name_for_id(plan.dispatches[1].kernel.kernel_id) == "qwen3_moe:qwen3_moe_rmsnorm_f32");
-                REQUIRE(plan.dispatches[1].bindings.size() == 3);
-                REQUIRE(plan.dispatches[1].bindings[0].value == imported.graph.values().find_tensor(output)->id);
-                REQUIRE(plan.dispatches[1].bindings[1].value == imported.graph.values().find_tensor(gamma)->id);
-                REQUIRE(plan.dispatches[1].bindings[2].value == imported.graph.values().find_tensor(normalized)->id);
-                const auto & dispatch = plan.dispatches.front();
-                REQUIRE(kernel_name_for_id(dispatch.kernel.kernel_id) == "hrx_owned:ggml_token_embedding_q4_k_f32");
-                REQUIRE(dispatch.kernel.integer_parameters.at("hidden_size") == 2560);
-                REQUIRE(dispatch.kernel.integer_parameters.at("vocabulary_count") == 248320);
-                REQUIRE(dispatch.kernel.integer_parameters.at("token_count") == tokens);
-                REQUIRE(dispatch.kernel.compile_parameters.empty());
-                REQUIRE(dispatch.bindings.size() == 3);
-                REQUIRE(dispatch.bindings[0].value == imported.graph.values().find_tensor(weight)->id);
-                REQUIRE(dispatch.bindings[0].length == ggml_nbytes(weight));
-                REQUIRE(dispatch.bindings[1].value == imported.graph.values().find_tensor(ids)->id);
-                REQUIRE(dispatch.bindings[1].length == ggml_nbytes(ids));
-                REQUIRE(dispatch.bindings[2].value == imported.graph.values().find_tensor(output)->id);
-                REQUIRE(dispatch.bindings[2].length == ggml_nbytes(output));
-                for (bool initialization : { false, true }) {
-                    ggml::hrx::PreparedCommandProgram prepared;
-                    ggml::hrx::PreparedCommand command;
-                    command.kind = ggml::hrx::CommandKind::Kernel;
-                    command.kernel.specialization = dispatch.kernel;
-                    (initialization ? prepared.initialization_commands : prepared.commands).push_back(command);
-                    ggml::hrx::RecordedCommandGraph recorded;
-                    const auto replay = ggml::hrx::bind_and_launch_recorded_command_graph(
-                        {}, {}, {}, prepared, recorded);
-                    REQUIRE(!replay.success);
-                    REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::Ineligible);
-                    REQUIRE(replay.ineligible_reason == "q4_embedding_requires_index_validation");
-                }
-            }
-            // Original Qwen3 Q4 kernel remains selected regardless of the new flag.
-            weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 2048, 65);
-            output = ggml_get_rows(ctx, weight, ids);
-            REQUIRE(!ggml::hrx::supports_q4_embedding_dispatch(output));
-            graph = ggml_new_graph(ctx);
-            ggml_build_forward_expand(graph, output);
-            require_kernel_subsequence(scheduled_kernel_sequence(graph), { "qwen3_moe:qwen_token_embedding_q4k" });
-            ggml_free(ctx);
         }
     }
     ScopedHrxEnvironment environment("HRX_ENABLE_Q4_EMBEDDING", "1");
@@ -1954,6 +2076,260 @@ static void run_q4_embedding_scheduling_checks() {
         }
         ggml_free(ctx);
     }
+}
+
+static void run_set_rows_scheduling_checks() {
+    // End-to-end: the trust flag match_set_rows_dispatch (dispatch-copy.cpp) computes for the
+    // ids binding must actually reach CommandBinding::trusted and flip requires_validation's
+    // replay-eligibility decision in bind_and_launch_recorded_command_graph.
+    ScopedHrxEnvironment environment("HRX_ENABLE_SET_ROWS", "1");
+    for (bool trusted_producer : { false, true }) {
+        ggml_init_params set_rows_params = {};
+        set_rows_params.mem_size = 1024 * 1024;
+        set_rows_params.no_alloc = true;
+        ggml_context * set_rows_ctx = ggml_init(set_rows_params);
+        REQUIRE(set_rows_ctx != nullptr);
+        ggml_tensor * cache  = ggml_new_tensor_2d(set_rows_ctx, GGML_TYPE_F32, 128, 64);
+        ggml_tensor * source = ggml_new_tensor_2d(set_rows_ctx, GGML_TYPE_F32, 128, 4);
+        ggml_tensor * ids    = ggml_new_tensor_1d(set_rows_ctx, GGML_TYPE_I64, 4);
+        REQUIRE(cache != nullptr);
+        REQUIRE(source != nullptr);
+        REQUIRE(ids != nullptr);
+        if (trusted_producer) {
+            // Mirrors llama-kv-cache.cpp's k_idxs/v_idxs: a host-populated graph-input leaf.
+            ggml_set_input(ids);
+        }
+        ggml_tensor * output = ggml_set_rows(set_rows_ctx, cache, source, ids);
+        REQUIRE(output != nullptr);
+        REQUIRE(ggml::hrx::supports_set_rows_dispatch(output));
+
+        ggml_cgraph * graph = ggml_new_graph(set_rows_ctx);
+        ggml_build_forward_expand(graph, output);
+        auto imported = ggml::hrx::import_ggml_graph(*graph);
+        REQUIRE(imported.valid());
+        ggml::hrx::DispatchScheduler scheduler;
+        REQUIRE(scheduler.schedule_graph(imported.graph, { "gfx1151" }));
+        const auto & plan = scheduler.plan();
+        REQUIRE(plan.dispatches.size() == 1);
+        const auto & dispatch = plan.dispatches[0];
+        REQUIRE(kernel_name_for_id(dispatch.kernel.kernel_id) == "hrx_owned:ggml_set_rows_f32");
+        REQUIRE(dispatch.bindings.size() == 3);
+        REQUIRE(dispatch.bindings[1].value == imported.graph.values().find_tensor(ids)->id);
+        REQUIRE(dispatch.bindings[1].trusted == trusted_producer);
+
+        for (bool initialization : { false, true }) {
+            ggml::hrx::PreparedCommandProgram prepared;
+            ggml::hrx::PreparedCommand command;
+            command.kind = ggml::hrx::CommandKind::Kernel;
+            command.kernel.specialization = dispatch.kernel;
+            // Carry the scheduled trust decision into the prepared command, the same way
+            // append_command() does for a real command program.
+            command.kernel.bindings.resize(dispatch.bindings.size());
+            for (size_t i = 0; i < dispatch.bindings.size(); ++i) {
+                command.kernel.bindings[i].binding.trusted = dispatch.bindings[i].trusted;
+            }
+            (initialization ? prepared.initialization_commands : prepared.commands).push_back(command);
+            ggml::hrx::RecordedCommandGraph recorded;
+            const auto replay = ggml::hrx::bind_and_launch_recorded_command_graph(
+                {}, {}, {}, prepared, recorded);
+            REQUIRE(!replay.success);
+            if (trusted_producer) {
+                // Trust bypasses the ineligibility gate entirely; the empty execution context
+                // then fails the very next check instead (still no device access required).
+                REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::BuildFailed);
+            } else {
+                REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::Ineligible);
+                REQUIRE(replay.ineligible_reason == "set_rows_requires_index_validation");
+            }
+        }
+        ggml_free(set_rows_ctx);
+    }
+    std::fprintf(stderr,
+                 "SET_ROWS scheduling checks passed (dispatch + trusted-producer replay-eligibility, no device initialization)\n");
+}
+
+static void run_f32_get_rows_scheduling_checks() {
+    for (const char * flag : { static_cast<const char *>(nullptr), "", "0", "true", "01", "1x", "1" }) {
+        ScopedHrxEnvironment environment("HRX_ENABLE_F32_GET_ROWS", flag);
+        for (int64_t tokens : { 1, 4, 16 }) {
+            // ids marked as a graph input mirrors llama-graph.cpp's build_inp_out_ids()
+            // (inp->out_ids); unmarked mirrors a hypothetical GPU-computed producer, which
+            // must stay untrusted.
+            for (bool trusted_producer : { false, true }) {
+                ggml_init_params params = {};
+                params.mem_size = 1024 * 1024;
+                params.no_alloc = true;
+                ggml_context * ctx = ggml_init(params);
+                REQUIRE(ctx != nullptr);
+                ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 32);
+                ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+                if (trusted_producer) {
+                    ggml_set_input(ids);
+                }
+                ggml_tensor * output = ggml_get_rows(ctx, source, ids);
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, output);
+                // supports_f32_get_rows_dispatch() only inspects the first character (unlike the
+                // exact "1" match used by the Q8/Q4 embedding flags), so "true" and "1x" count too.
+                const bool enabled = flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+                REQUIRE(ggml::hrx::supports_f32_get_rows_dispatch(output) == enabled);
+                auto imported = ggml::hrx::import_ggml_graph(*graph);
+                REQUIRE(imported.valid());
+                ggml::hrx::DispatchScheduler scheduler;
+                REQUIRE(scheduler.schedule_graph(imported.graph, { "gfx1151" }) == enabled);
+                if (enabled) {
+                    const auto & plan = scheduler.plan();
+                    REQUIRE(plan.dispatches.size() == 1);
+                    const auto & dispatch = plan.dispatches[0];
+                    REQUIRE(kernel_name_for_id(dispatch.kernel.kernel_id) == "hrx_owned:ggml_get_rows_f32");
+                    REQUIRE(dispatch.kernel.integer_parameters.at("hidden_size") == 8);
+                    REQUIRE(dispatch.kernel.integer_parameters.at("vocabulary_count") == 32);
+                    REQUIRE(dispatch.kernel.integer_parameters.at("token_count") == tokens);
+                    REQUIRE(dispatch.bindings.size() == 3);
+                    REQUIRE(dispatch.bindings[0].value == imported.graph.values().find_tensor(source)->id);
+                    REQUIRE(dispatch.bindings[0].length == ggml_nbytes(source));
+                    REQUIRE(dispatch.bindings[1].value == imported.graph.values().find_tensor(ids)->id);
+                    REQUIRE(dispatch.bindings[1].length == ggml_nbytes(ids));
+                    REQUIRE(dispatch.bindings[1].trusted == trusted_producer);
+                    REQUIRE(dispatch.bindings[2].value == imported.graph.values().find_tensor(output)->id);
+                    REQUIRE(dispatch.bindings[2].length == ggml_nbytes(output));
+                    for (bool initialization : { false, true }) {
+                        ggml::hrx::PreparedCommandProgram prepared;
+                        ggml::hrx::PreparedCommand command;
+                        command.kind = ggml::hrx::CommandKind::Kernel;
+                        command.kernel.specialization = dispatch.kernel;
+                        command.kernel.bindings.resize(dispatch.bindings.size());
+                        for (size_t i = 0; i < dispatch.bindings.size(); ++i) {
+                            command.kernel.bindings[i].binding.trusted = dispatch.bindings[i].trusted;
+                        }
+                        (initialization ? prepared.initialization_commands : prepared.commands).push_back(command);
+                        ggml::hrx::RecordedCommandGraph recorded;
+                        const auto replay = ggml::hrx::bind_and_launch_recorded_command_graph(
+                            {}, {}, {}, prepared, recorded);
+                        REQUIRE(!replay.success);
+                        if (trusted_producer) {
+                            REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::BuildFailed);
+                        } else {
+                            REQUIRE(replay.event == ggml::hrx::HrxGraphReplayEvent::Ineligible);
+                            REQUIRE(replay.ineligible_reason == "f32_get_rows_requires_index_validation");
+                        }
+                    }
+                }
+                ggml_free(ctx);
+            }
+        }
+    }
+
+    // A representative malformed battery: the scheduler must decline exactly when
+    // supports_f32_get_rows_dispatch() does, regardless of the trust extension above.
+    ScopedHrxEnvironment enabled_environment("HRX_ENABLE_F32_GET_ROWS", "1");
+    for (int malformed = 0; malformed < 6; ++malformed) {
+        ggml_init_params params = {};
+        params.mem_size = 1024 * 1024;
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        REQUIRE(ctx != nullptr);
+        ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 32);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_tensor * output = ggml_get_rows(ctx, source, ids);
+        if (malformed == 0) { source->type = GGML_TYPE_F16; }
+        if (malformed == 1) { ids->type = GGML_TYPE_I64; }
+        if (malformed == 2) { output->type = GGML_TYPE_F16; }
+        if (malformed == 3) { source->nb[1] += 4; }
+        if (malformed == 4) { ids->nb[0] *= 2; }
+        if (malformed == 5) { output->nb[1] += 4; }
+        REQUIRE(!ggml::hrx::supports_f32_get_rows_dispatch(output));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        auto imported = ggml::hrx::import_ggml_graph(*graph);
+        if (imported.valid()) {
+            ggml::hrx::DispatchScheduler scheduler;
+            REQUIRE(!scheduler.schedule_graph(imported.graph, { "gfx1151" }));
+        }
+        ggml_free(ctx);
+    }
+    std::fprintf(stderr, "F32 GET_ROWS scheduling checks passed (flag gating, trusted-producer wiring, malformed rejection)\n");
+}
+
+static void run_trusted_index_view_reference_checks() {
+    ScopedHrxEnvironment get_rows("HRX_ENABLE_F32_GET_ROWS", "1");
+    for (bool enabled : { false, true }) {
+        ScopedHrxEnvironment views("HRX_ENABLE_TRUSTED_INDEX_VIEWS", enabled ? "1" : "0");
+        for (int64_t width : { 128, 30720 }) {
+            for (int64_t tokens : { 1, 4, 16 }) {
+                ggml_backend_t backend = ggml_backend_hrx_init(0);
+                ggml_backend_t cpu = ggml_backend_cpu_init();
+                REQUIRE(backend != nullptr && cpu != nullptr);
+                ggml_init_params params = {};
+                params.mem_size = 1024 * 1024;
+                params.no_alloc = true;
+                ggml_context * ctx = ggml_init(params);
+                ggml_context * host_ctx = ggml_init(params);
+                REQUIRE(ctx != nullptr && host_ctx != nullptr);
+                ggml_tensor * ids_storage = ggml_new_tensor_1d(host_ctx, GGML_TYPE_I32, tokens + 2);
+                ggml_set_input(ids_storage);
+                ggml_tensor * slice = ggml_view_1d(host_ctx, ids_storage, tokens + 1, sizeof(int32_t));
+                ggml_tensor * ids = ggml_view_1d(host_ctx, slice, tokens, sizeof(int32_t));
+                ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, 8);
+                ggml_tensor * output = ggml_get_rows(ctx, source, ids);
+                ggml_tensor * consumer = ggml_scale(ctx, output, 2.0f);
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, consumer);
+                auto imported = ggml::hrx::import_ggml_graph(*graph);
+                REQUIRE(imported.valid());
+                ggml::hrx::DispatchScheduler scheduler;
+                REQUIRE(scheduler.schedule_graph(imported.graph, { "gfx1151" }));
+                bool found = false;
+                for (const auto & dispatch : scheduler.plan().dispatches) {
+                    if (ggml::hrx::is_f32_get_rows_kernel(dispatch.kernel.kernel_id)) {
+                        REQUIRE(dispatch.bindings[1].trusted == enabled);
+                        found = true;
+                    }
+                }
+                REQUIRE(found);
+                ggml_backend_buffer_t host_buffer = ggml_backend_alloc_ctx_tensors(host_ctx, cpu);
+                ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+                REQUIRE(host_buffer != nullptr && buffer != nullptr);
+                std::vector<int32_t> indices(tokens + 2);
+                std::vector<float> expected(width * tokens);
+                const std::vector<float> dirty(width * tokens, -12345.0f);
+                for (int replay = 0; replay < 4; ++replay) {
+                    const auto values = make_pattern_f32(width * 8, replay);
+                    for (size_t i = 0; i < indices.size(); ++i) {
+                        indices[i] = static_cast<int32_t>((i + replay * 3) % 8);
+                    }
+                    ggml_backend_tensor_set(ids_storage, indices.data(), 0, indices.size() * sizeof(int32_t));
+                    set_tensor_bytes(backend, source, values.data(), values.size() * sizeof(float));
+                    set_tensor_bytes(backend, output, dirty.data(), dirty.size() * sizeof(float));
+                    set_tensor_bytes(backend, consumer, dirty.data(), dirty.size() * sizeof(float));
+                    for (int64_t token = 0; token < tokens; ++token) {
+                        std::copy_n(values.begin() + indices[token + 2] * width, width,
+                                    expected.begin() + token * width);
+                    }
+                    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+                    REQUIRE(get_f32_tensor(backend, output) == expected);
+                    for (float & value : expected) { value *= 2.0f; }
+                    REQUIRE(get_f32_tensor(backend, consumer) == expected);
+                }
+                if (!enabled) {
+                    indices.back() = 8;
+                    ggml_backend_tensor_set(ids_storage, indices.data(), 0, indices.size() * sizeof(int32_t));
+                    set_tensor_bytes(backend, output, dirty.data(), dirty.size() * sizeof(float));
+                    set_tensor_bytes(backend, consumer, dirty.data(), dirty.size() * sizeof(float));
+                    REQUIRE(ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS);
+                    REQUIRE(get_f32_tensor(backend, output) == dirty);
+                    REQUIRE(get_f32_tensor(backend, consumer) == dirty);
+                }
+                ggml_backend_buffer_free(buffer);
+                ggml_backend_buffer_free(host_buffer);
+                ggml_free(ctx);
+                ggml_free(host_ctx);
+                ggml_backend_free(backend);
+                ggml_backend_free(cpu);
+            }
+        }
+    }
+    std::fprintf(stderr, "Trusted index view GPU checks passed (host slices, changed IDs/data, replay, validation control)\n");
 }
 
 static std::vector<uint8_t> make_q8_embedding_row(int64_t width, int32_t id) {
@@ -5643,7 +6019,7 @@ static void run_swiglu_merged_ffn_scheduling_checks() {
     }
 }
 
-static uint64_t next_swiglu_graph_uid() {
+static uint64_t next_hrx_test_graph_uid() {
     static uint64_t next = 1;
     return next++;
 }
@@ -5664,7 +6040,7 @@ static void run_swiglu_cache_contract_checks() {
             REQUIRE(lookup.valid() && lookup.uncached_program != nullptr);
             REQUIRE(cache.stats().builds == 0 && cache.stats().hits == 0);
         }
-        tensors.graph->uid = next_swiglu_graph_uid();
+        tensors.graph->uid = next_hrx_test_graph_uid();
         ggml::hrx::GraphProgram * first = nullptr;
         for (uint64_t replay = 0; replay < 3; ++replay) {
             auto lookup = cache.get_or_build(*tensors.graph, corpus, "gfx1151");
@@ -5774,7 +6150,7 @@ static void run_swiglu_reference_case(ggml_backend_t cpu, ggml_backend_t hrx, in
     const auto c = build_swiglu_graph(cpu_ctx, width, tokens, alias, reverse);
     const auto h = build_swiglu_graph(hrx_ctx, width, tokens, alias, reverse);
     // UID=0 intentionally bypasses both persistent graph and prepared-program reuse.
-    h.graph->uid = next_swiglu_graph_uid();
+    h.graph->uid = next_hrx_test_graph_uid();
     check_swiglu_plan(h, true, hrx);
     auto cpu_buffer = ggml_backend_alloc_ctx_tensors(cpu_ctx, cpu);
     auto hrx_buffer = ggml_backend_alloc_ctx_tensors(hrx_ctx, hrx);
@@ -5857,10 +6233,27 @@ static void run_swiglu_reference_checks() {
     std::fprintf(stderr, "SwiGLU checks passed (640 T=1/2/3/4/8, tails, CPU, ordering, aliases, replay)\n");
 }
 
+#include "test-hrx-f32-router.inc"
+#include "test-hrx-recurrent-concat.inc"
+#include "test-hrx-qsa-projections.inc"
+#include "test-hrx-qsa-glue.inc"
+#include "test-hrx-qsa-rope.inc"
+#include "test-hrx-gdn-prefill.inc"
+#include "test-hrx-iq-packets.inc"
+#include "test-hrx-gdn-conv-prefill.inc"
+#include "test-hrx-qsa-f16-gather.inc"
+#include "test-hrx-device-rebind.inc"
+#include "test-hrx-qsa-dense-bypass.inc"
+#include "test-hrx-dense-f32-gemv.inc"
+#include "test-hrx-gdn-norm-prefill.inc"
+#include "test-hrx-qsa-mask.inc"
+
 int main(int argc, char ** argv) {
     bool q8_selected = false;
     bool mtp_hc_projection_selected = false;
     bool dense_f32_accum_selected = false;
+    bool dense_f32_gemv_selected = false;
+    bool dense_rounded_gemv_selected = false;
     bool device_timing_selected = false;
     bool device_timing_schedule_selected = false;
     bool device_timing_schedule_only = argc > 1;
@@ -5870,6 +6263,7 @@ int main(int argc, char ** argv) {
     bool q8_embedding_selected = false;
     bool q4_embedding_selected = false;
     bool iq_selected = false;
+    bool iq_packet4_selected = false;
     bool q4_experts_selected = false;
     bool q4_ids_selected = false;
     bool q4_ids_only = argc > 1;
@@ -5879,12 +6273,40 @@ int main(int argc, char ** argv) {
     bool swiglu_selected = false;
     bool swiglu_schedule_selected = false;
     bool swiglu_schedule_only = argc > 1;
+    bool set_rows_trusted_producer_selected = false;
+    bool set_rows_trusted_producer_only = argc > 1;
+    bool f32_get_rows_scheduling_selected = false;
+    bool f32_get_rows_scheduling_only = argc > 1;
+    bool trusted_index_views_selected = false;
+    bool f32_router_selected = false;
+    bool recurrent_concat_selected = false;
+    bool qsa_projections_selected = false;
+    bool qsa_glue_selected = false;
+    bool qsa_rope_selected = false;
+    bool gdn_prefill_selected = false;
+    bool gdn_conv_prefill_selected = false;
+    bool gdn_norm_prefill_selected = false;
+    bool qsa_f16_gather_selected = false;
+    bool device_rebind_selected = false;
+    bool qsa_dense_bypass_selected = false;
+    bool qsa_dense_bypass_only = argc > 1;
+    bool qsa_mask_selected = false;
+    bool qsa_mask_schedule_selected = false;
+    bool qsa_mask_schedule_only = argc > 1;
     bool q8_benchmark = false;
     for (int i = 1; i < argc; ++i) {
+        qsa_mask_schedule_only = qsa_mask_schedule_only &&
+            (std::strcmp(argv[i], "--qsa-mask-scheduling") == 0 ||
+             std::strcmp(argv[i], "--qsa-dense-bypass") == 0);
+        qsa_dense_bypass_only = qsa_dense_bypass_only && std::strcmp(argv[i], "--qsa-dense-bypass") == 0;
         q4_ids_only = q4_ids_only && std::strcmp(argv[i], "--q4-expert-ids") == 0;
         swiglu_schedule_only = swiglu_schedule_only && std::strcmp(argv[i], "--swiglu-schedule") == 0;
         device_timing_schedule_only =
             device_timing_schedule_only && std::strcmp(argv[i], "--device-timing-schedule") == 0;
+        set_rows_trusted_producer_only =
+            set_rows_trusted_producer_only && std::strcmp(argv[i], "--set-rows-trusted-producer") == 0;
+        f32_get_rows_scheduling_only =
+            f32_get_rows_scheduling_only && std::strcmp(argv[i], "--f32-get-rows-scheduling") == 0;
         q8_narrow_cpu_only = q8_narrow_cpu_only &&
             (std::strcmp(argv[i], "--q8-narrow-cpu") == 0 ||
              std::strcmp(argv[i], "--q4-expert-ids") == 0 || std::strcmp(argv[i], "--swiglu-schedule") == 0 ||
@@ -5895,6 +6317,10 @@ int main(int argc, char ** argv) {
             mtp_hc_projection_selected = true;
         } else if (std::strcmp(argv[i], "--dense-f32-accum") == 0) {
             dense_f32_accum_selected = true;
+        } else if (std::strcmp(argv[i], "--dense-f32-gemv") == 0) {
+            dense_f32_gemv_selected = true;
+        } else if (std::strcmp(argv[i], "--dense-rounded-gemv") == 0) {
+            dense_rounded_gemv_selected = true;
         } else if (std::strcmp(argv[i], "--device-timing") == 0) {
             device_timing_selected = true;
         } else if (std::strcmp(argv[i], "--device-timing-schedule") == 0) {
@@ -5909,6 +6335,8 @@ int main(int argc, char ** argv) {
             q4_embedding_selected = true;
         } else if (std::strcmp(argv[i], "--iq-experts") == 0) {
             iq_selected = true;
+        } else if (std::strcmp(argv[i], "--iq-packets") == 0) {
+            iq_packet4_selected = true;
         } else if (std::strcmp(argv[i], "--q4-experts") == 0) {
             q4_experts_selected = true;
         } else if (std::strcmp(argv[i], "--q4-expert-ids") == 0) {
@@ -5923,22 +6351,89 @@ int main(int argc, char ** argv) {
             swiglu_selected = true;
         } else if (std::strcmp(argv[i], "--swiglu-schedule") == 0) {
             swiglu_schedule_selected = true;
+        } else if (std::strcmp(argv[i], "--set-rows-trusted-producer") == 0) {
+            set_rows_trusted_producer_selected = true;
+        } else if (std::strcmp(argv[i], "--f32-get-rows-scheduling") == 0) {
+            f32_get_rows_scheduling_selected = true;
+        } else if (std::strcmp(argv[i], "--trusted-index-views") == 0) {
+            trusted_index_views_selected = true;
+        } else if (std::strcmp(argv[i], "--f32-router") == 0) {
+            f32_router_selected = true;
+        } else if (std::strcmp(argv[i], "--recurrent-concat") == 0) {
+            recurrent_concat_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-projections") == 0) {
+            qsa_projections_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-glue") == 0) {
+            qsa_glue_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-rope") == 0) {
+            qsa_rope_selected = true;
+        } else if (std::strcmp(argv[i], "--gdn-prefill") == 0) {
+            gdn_prefill_selected = true;
+        } else if (std::strcmp(argv[i], "--gdn-conv-prefill") == 0) {
+            gdn_conv_prefill_selected = true;
+        } else if (std::strcmp(argv[i], "--gdn-norm-prefill") == 0) {
+            gdn_norm_prefill_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-f16-gather") == 0) {
+            qsa_f16_gather_selected = true;
+        } else if (std::strcmp(argv[i], "--device-rebind") == 0) {
+            device_rebind_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-dense-bypass") == 0) {
+            qsa_dense_bypass_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-mask") == 0) {
+            qsa_mask_selected = true;
+        } else if (std::strcmp(argv[i], "--qsa-mask-scheduling") == 0) {
+            qsa_mask_schedule_selected = true;
         } else if (std::strcmp(argv[i], "--q8-benchmark") == 0) {
             q8_selected = true;
             q8_benchmark = true;
         } else {
-            std::fprintf(stderr, "usage: %s [--q8-gemv] [--q8-narrow] [--q8-narrow-cpu] [--q8-embedding] [--q4-embedding] [--mtp-hc-projection] [--dense-f32-accum] [--device-timing] [--device-timing-schedule] [--iq-experts] [--q4-experts] [--q4-expert-ids] [--moe-small-batch] [--hc-small-batch] [--small-batch-glue] [--swiglu] [--swiglu-schedule] [--q8-benchmark]\n", argv[0]);
+            std::fprintf(stderr,
+                "usage: %s [--q8-gemv] [--q8-narrow] [--q8-narrow-cpu] [--q8-embedding] [--q4-embedding]"
+                " [--mtp-hc-projection] [--dense-f32-accum] [--dense-f32-gemv] [--dense-rounded-gemv]"
+                " [--device-timing] [--device-timing-schedule]"
+                " [--iq-experts] [--iq-packets] [--q4-experts] [--q4-expert-ids] [--moe-small-batch]"
+                " [--hc-small-batch] [--small-batch-glue] [--swiglu] [--swiglu-schedule]"
+                " [--set-rows-trusted-producer] [--f32-get-rows-scheduling] [--trusted-index-views]"
+                " [--f32-router] [--recurrent-concat] [--qsa-projections] [--qsa-glue] [--qsa-rope]"
+                " [--gdn-prefill] [--gdn-conv-prefill] [--gdn-norm-prefill] [--qsa-f16-gather] [--device-rebind]"
+                " [--qsa-dense-bypass] [--qsa-mask] [--qsa-mask-scheduling] [--q8-benchmark]\n", argv[0]);
             return 1;
         }
     }
     // Legacy selectors keep their old-kernel assertions even when the caller enables this experiment.
     ScopedHrxEnvironment dense_default("HRX_ENABLE_DENSE_F32_ACCUM", "0");
+    ScopedHrxEnvironment dense_gemv_default("HRX_ENABLE_DENSE_F32_GEMV", "0");
+    ScopedHrxEnvironment dense_rounded_default("HRX_ENABLE_DENSE_ROUNDED_GEMV", "0");
+    ScopedHrxEnvironment gdn_norm_default("HRX_ENABLE_GDN_NORM_PREFILL", "0");
+    ScopedHrxEnvironment qsa_mask_default("HRX_ENABLE_QSA_MASK", "0");
+    ScopedHrxEnvironment iq_default("HRX_ENABLE_IQ_PACKET4", "0");
     const bool selected_only = argc > 1;
+    if (!selected_only || qsa_mask_selected || qsa_mask_schedule_selected) {
+        run_qsa_mask_scheduling_checks();
+    }
+    if (qsa_dense_bypass_selected) {
+        run_qsa_dense_bypass_checks();
+    }
+    if (qsa_dense_bypass_only) {
+        std::fprintf(stderr, "QSA dense-bypass checks completed without device initialization\n");
+        return 0;
+    }
+    if (qsa_mask_schedule_only) {
+        std::fprintf(stderr, "QSA mask scheduling/snapshot checks passed without device initialization\n");
+        return 0;
+    }
     if (!selected_only || swiglu_selected || swiglu_schedule_selected) {
         run_swiglu_scheduling_checks();
     }
     if (!selected_only || device_timing_selected || device_timing_schedule_selected) {
         run_device_timing_schedule_checks();
+    }
+    if (!selected_only || set_rows_trusted_producer_selected || trusted_index_views_selected) {
+        run_set_rows_trusted_producer_checks();
+        run_set_rows_scheduling_checks();
+    }
+    if (!selected_only || f32_get_rows_scheduling_selected) {
+        run_f32_get_rows_scheduling_checks();
     }
     if (swiglu_schedule_only) {
         std::fprintf(stderr, "SwiGLU scheduling checks passed (no device initialization)\n");
@@ -5946,6 +6441,14 @@ int main(int argc, char ** argv) {
     }
     if (device_timing_schedule_only) {
         std::fprintf(stderr, "Device timing schedule checks passed (flag-off path performs no HIP calls)\n");
+        return 0;
+    }
+    if (set_rows_trusted_producer_only) {
+        std::fprintf(stderr, "SET_ROWS trusted-producer checks passed (no device initialization)\n");
+        return 0;
+    }
+    if (f32_get_rows_scheduling_only) {
+        std::fprintf(stderr, "F32 GET_ROWS scheduling checks passed (no device initialization)\n");
         return 0;
     }
     if (!selected_only || q4_experts_selected || q4_ids_selected) {
@@ -5972,6 +6475,14 @@ int main(int argc, char ** argv) {
             run_dense_f32_accum_reference_case(type, 512, 65, 3, false, true, false);
         }
     }
+    if (!selected_only || dense_f32_gemv_selected) {
+        run_dense_f32_gemv_scheduling_checks();
+        run_dense_f32_gemv_reference_checks(false);
+    }
+    if (!selected_only || dense_rounded_gemv_selected) {
+        run_dense_rounded_gemv_scheduling_checks();
+        run_dense_rounded_gemv_reference_checks(false);
+    }
     if (!selected_only || mtp_hc_projection_selected) {
         run_mtp_hc_projection_scheduling_checks();
     }
@@ -5996,6 +6507,9 @@ int main(int argc, char ** argv) {
     if (!selected_only || iq_selected) {
         run_iq_expert_scheduling_checks();
         run_iq_down_pack_scheduling_checks();
+    }
+    if (iq_packet4_selected) {
+        run_iq_packet4_scheduling_checks();
     }
     if (!selected_only || q4_experts_selected) {
         run_q4_expert_scheduling_checks();
@@ -6032,6 +6546,14 @@ int main(int argc, char ** argv) {
         if (dense_f32_accum_selected) {
             run_dense_f32_accum_reference_checks();
         }
+        if (dense_f32_gemv_selected) {
+            run_dense_f32_gemv_reference_checks();
+            std::fprintf(stderr, "Dense raw-F32 GEMV scheduling/reference/cached replay checks passed\n");
+        }
+        if (dense_rounded_gemv_selected) {
+            run_dense_rounded_gemv_reference_checks();
+            std::fprintf(stderr, "Dense rounded GEMV scheduling/reference/cached replay checks passed\n");
+        }
         if (device_timing_selected) {
             run_device_timing_gpu_checks();
         }
@@ -6054,6 +6576,49 @@ int main(int argc, char ** argv) {
         if (q8_embedding_selected) {
             run_q8_embedding_reference_checks();
             std::fprintf(stderr, "Q8 embedding checks passed (raw rows, exact CPU decode, invalid-ID failure)\n");
+        }
+        if (trusted_index_views_selected) {
+            run_trusted_index_view_reference_checks();
+        }
+        if (f32_router_selected) {
+            run_f32_router_projection_checks();
+        }
+        if (recurrent_concat_selected) {
+            run_recurrent_concat_checks();
+        }
+        if (qsa_projections_selected) {
+            run_qsa_projection_checks();
+        }
+        if (qsa_glue_selected) {
+            run_qsa_glue_checks();
+        }
+        if (qsa_rope_selected) {
+            run_qsa_rope_checks();
+        }
+        if (gdn_prefill_selected) {
+            run_gdn_prefill_scheduling_checks();
+            run_gdn_prefill_reference_checks();
+        }
+        if (gdn_conv_prefill_selected) {
+            run_gdn_conv_prefill_scheduling_checks();
+            run_gdn_conv_prefill_reference_checks();
+        }
+        if (gdn_norm_prefill_selected) {
+            run_gdn_norm_prefill_checks();
+            std::fprintf(stderr, "GDN strided norm packing/reference/cached replay checks passed\n");
+        }
+        if (qsa_f16_gather_selected) {
+            run_qsa_f16_gather_checks();
+        }
+        if (qsa_mask_selected) {
+            run_qsa_mask_reference_checks();
+        }
+        if (device_rebind_selected) {
+            run_device_binding_refresh_checks();
+        }
+        if (iq_packet4_selected) {
+            run_iq_packet4_reference_checks();
+            std::fprintf(stderr, "IQ packet4 scalar/CPU/replay checks passed (T1..8)\n");
         }
         if (q4_embedding_selected) {
             run_q4_embedding_reference_checks();
@@ -6093,6 +6658,8 @@ int main(int argc, char ** argv) {
     run_add_f32_cpu_reference_case();
     run_swiglu_reference_checks();
     run_dense_f32_accum_reference_checks();
+    run_dense_f32_gemv_reference_checks();
+    run_dense_rounded_gemv_reference_checks();
     run_mtp_hc_projection_reference_checks();
     run_small_batch_glue_reference_checks();
     run_uniform_row_add_checks(true);
@@ -6100,7 +6667,17 @@ int main(int argc, char ** argv) {
     run_hc_collapse_reference_checks();
     run_moe_small_batch_reference_checks();
     run_gather_add_f32_cpu_reference_case();
+    run_trusted_index_view_reference_checks();
+    run_f32_router_projection_checks();
+    run_recurrent_concat_checks();
+    run_qsa_projection_checks();
+    run_qsa_glue_checks();
+    run_qsa_rope_checks();
+    run_gdn_prefill_scheduling_checks();
+    run_gdn_prefill_reference_checks();
+    run_gdn_norm_prefill_checks();
     run_token_embedding_q4k_cpu_reference_case();
+    run_qsa_mask_reference_checks();
     run_q8_embedding_reference_checks();
     run_q4_embedding_reference_checks();
     run_dense_matmul_cpu_reference_case(GGML_TYPE_Q4_K, "qwen3_moe:qwen3_moe_dense_linear_q4k_f16_wmma", 2, 128);
@@ -6127,6 +6704,12 @@ int main(int argc, char ** argv) {
     run_rmsnorm_mul_case(256, 1);
     run_rmsnorm_mul_case(256, 4);
     run_rmsnorm_mul_case(2048, 1);
+    // Per-head norm shapes (qwen4exp indexer q_norm reshapes to [idx_dim=128, heads, real_tokens]
+    // before RMS_NORM) collapse to a flat row count of heads * real_tokens here, which exceeds the
+    // 2048 real-token cap well before any realistic prefill batch. 2496 reproduces the exact crash
+    // shape observed at 48 indexer heads * 52 real tokens; 131072 exercises the new cap boundary.
+    run_rmsnorm_mul_case(128, 2496);
+    run_rmsnorm_mul_case(128, 131072);
     run_router_projection_case(4);
     run_router_top8_case(4);
     run_qwen_flash_attention_case();

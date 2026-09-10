@@ -245,3 +245,113 @@ kernel.def target(@ggml_dense_f32_accum_wave64) export("ggml_dense_q8_0_f32_accu
   func.apply<hrx.dense_f32_accum.body>(%format, %tokens, %width, %outputs, %ct, %tt, %input, %weight, %output) : (index, index, index, index, index, index, buffer, buffer, buffer)
   kernel.return
 }
+
+// T1 alternative with exactly the WMMA operand conversion boundaries:
+// call the same F16 weight decoder and round each F32 activation to F16 once.
+// Four wave32 rows per workgroup, four contiguous coefficients per lane,
+// no LDS staging or unused token tiles. Products and accumulators remain F32.
+amdgpu.target<gfx11-generic> @ggml_dense_rounded_gemv_wave32 {subgroup_size = 32}
+
+func.template<hrx.dense_rounded_gemv.body> device @ggml_dense_rounded_gemv_body(
+    %iq6: i1, %input_size: index, %output_size: index,
+    %input: buffer, %weight: buffer, %output: buffer) {
+  %width = index.assume %input_size [range(%input_size, 256, 32768), mul(%input_size, 256)] : index
+  %outputs = index.assume %output_size [range(%output_size, 1, 262144)] : index
+  %tile = kernel.workgroup.id<x> : index
+  %wave0 = kernel.subgroup.id : index
+  %wave = index.assume %wave0 [range(%wave0, 0, 3)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %c0 = index.constant 0 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %off0 = index.constant 0 : offset
+  %off210 = index.constant 210 : offset
+  %off272 = index.constant 272 : offset
+  %zero = scalar.constant 0.0 : f32
+  %zero_vector = vector.constant 0.0 : vector<4xf32>
+  %row_base = index.mul %tile, %c4 : index
+  %row = index.add %row_base, %wave : index
+  %valid = index.cmp ult, %row, %outputs : index
+  %blocks = index.div %width, %c256 : index
+  %block_bytes = scf.select %iq6, %off210, %off272 : offset
+  %row_bytes = index.scale %blocks, %block_bytes : index, offset -> offset
+  %packets = index.div %width, %c4 : index
+  %x = buffer.view %input[%off0] : buffer -> view<[%packets]x4xf32>
+  %y = buffer.view %output[%off0] : buffer -> view<[%outputs]xf32>
+  %lane_sum = scf.if %valid -> (f32) {
+    %safe_row = index.assume %row [lt(%row, %outputs)] : index
+    %row_offset = index.scale %safe_row, %row_bytes : index, offset -> offset
+    %accumulated = scf.for %p0 = [%lane to %packets step %c32](%acc = %zero_vector : vector<4xf32>) -> (vector<4xf32>) {
+      %p = index.assume %p0 [lt(%p0, %packets)] : index
+      %block = index.div %p, %c64 : index
+      %within = index.rem %p, %c64 : index
+      %group = index.div %within, %c8 : index
+      %packet = index.rem %within, %c8 : index
+      %half_weight = scf.if %iq6 -> (vector<4xf16>) {
+        %q6 = func.call @ggml_q6k_f16_vector4(%weight, %row_offset, %block, %group, %packet) : (buffer, offset, index, index, index) -> (vector<4xf16>)
+        scf.yield %q6 : vector<4xf16>
+      } else {
+        %q8 = func.call @qwen3_moe_dense_q8_0_wmma_vector4(%weight, %row_offset, %block, %group, %packet) : (buffer, offset, index, index, index) -> (vector<4xf16>)
+        scf.yield %q8 : vector<4xf16>
+      }
+      %loaded = vector.load %x[%p, %c0] : view<[%packets]x4xf32> -> vector<4xf32>
+      %half_input = vector.fptrunc %loaded : vector<4xf32> to vector<4xf16>
+      %inputs = vector.extf %half_input : vector<4xf16> to vector<4xf32>
+      %weights = vector.extf %half_weight : vector<4xf16> to vector<4xf32>
+      %products = vector.mulf %weights, %inputs : vector<4xf32>
+      %next = vector.addf %acc, %products : vector<4xf32>
+      scf.yield %next : vector<4xf32>
+    }
+    %sum = vector.reduce<addf> %accumulated, %zero : vector<4xf32>, f32
+    scf.yield %sum : f32
+  } else {
+    scf.yield %zero : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %lane_sum : f32
+  %leader = index.cmp eq, %lane, %c0 : index
+  %writer = scalar.andi %valid, %leader : i1
+  scf.if %writer {
+    %safe_row = index.assume %row [lt(%row, %outputs)] : index
+    view.store %sum, %y[%safe_row] : f32, view<[%outputs]xf32>
+  }
+  func.return
+}
+
+func.template<hrx.dense_rounded_gemv.launch> host @ggml_dense_rounded_gemv_launch(%outputs: index) -> (index, index, index) {
+  %one = index.constant 1 : index
+  %three = index.constant 3 : index
+  %four = index.constant 4 : index
+  %threads = index.constant 128 : index
+  %rounded = index.add %outputs, %three : index
+  %groups = index.div %rounded, %four : index
+  func.return %groups, %one, %threads : index, index, index
+}
+
+kernel.def target(@ggml_dense_rounded_gemv_wave32) export("ggml_dense_q8_0_rounded_gemv") @ggml_dense_q8_0_rounded_gemv(%token_count: index) {
+  %outputs = config.get @qwen3_moe.dense_quantized.output_size : index
+  %groups, %one, %threads = func.apply<hrx.dense_rounded_gemv.launch>(%outputs) : (index) -> (index, index, index)
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%token_count: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %tokens = index.assume %token_count [range(%token_count, 1, 1)] : index
+  %width = config.get @qwen3_moe.dense_quantized.input_size : index
+  %outputs = config.get @qwen3_moe.dense_quantized.output_size : index
+  %iq6 = scalar.constant false : i1
+  func.apply<hrx.dense_rounded_gemv.body>(%iq6, %width, %outputs, %input, %weight, %output) : (i1, index, index, buffer, buffer, buffer)
+  kernel.return
+}
+
+kernel.def target(@ggml_dense_rounded_gemv_wave32) export("ggml_dense_q6k_rounded_gemv") @ggml_dense_q6k_rounded_gemv(%token_count: index) {
+  %outputs = config.get @qwen3_moe.dense_quantized.output_size : index
+  %groups, %one, %threads = func.apply<hrx.dense_rounded_gemv.launch>(%outputs) : (index) -> (index, index, index)
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%token_count: index, %input: buffer, %weight: buffer, %output: buffer) {
+  %tokens = index.assume %token_count [range(%token_count, 1, 1)] : index
+  %width = config.get @qwen3_moe.dense_quantized.input_size : index
+  %outputs = config.get @qwen3_moe.dense_quantized.output_size : index
+  %iq6 = scalar.constant true : i1
+  func.apply<hrx.dense_rounded_gemv.body>(%iq6, %width, %outputs, %input, %weight, %output) : (i1, index, index, buffer, buffer, buffer)
+  kernel.return
+}

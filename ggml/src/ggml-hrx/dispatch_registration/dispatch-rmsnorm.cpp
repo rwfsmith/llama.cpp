@@ -80,6 +80,23 @@ static bool is_supported_token_count(int64_t token_count) {
     return is_llm_supported_query_length(kQwen30BMoeDispatchProfile, token_count);
 }
 
+// qwen3_moe_rmsnorm_f32 launches one workgroup per row of %hidden_size elements and has no
+// positional/causal semantics (see attention_prepare_quantized.loom): %token_count is purely a
+// parallel row count. match_qwen_rmsnorm_f32 below derives it as output->element_count /
+// output->ne[0], which is the real sequence length for a flat [hidden_size, real_tokens] call
+// but becomes heads * real_tokens for a per-head call whose output is genuinely
+// [head_dim, heads, real_tokens, 1] (qwen4exp's indexer q_norm, and the standard per-head
+// attention q/k norm before RoPE). Reusing kQwen30BMoeDispatchProfile.max_token_count (2048,
+// meant for real sequence length) there silently caps real prefill batches at
+// 2048/heads tokens for this op alone -- e.g. only ~42 tokens for the indexer's 48 query heads --
+// while every other op in the graph tolerates real batches up to 2048. This kernel's row count
+// has no such coupling to sequence length, so give it independent, more generous headroom
+// (48 heads * 2048 real tokens = 98304) instead of quietly bottlenecking prefill here.
+static bool is_supported_rmsnorm_row_count(int64_t row_count) {
+    constexpr int64_t kMaxRowCount = 131072;
+    return row_count >= 1 && row_count <= kMaxRowCount;
+}
+
 static bool has_decode_q8_consumer(const Graph & graph, ValueId value) {
     if (!graph.has_index()) {
         return false;
@@ -180,7 +197,7 @@ static RmsNormMatch match_qwen_rmsnorm_f32(const Graph & graph, const GraphNode 
         return {};
     }
     const int64_t token_count = output->element_count / hidden_size;
-    if (!is_supported_token_count(token_count)) {
+    if (!is_supported_rmsnorm_row_count(token_count)) {
         return {};
     }
 

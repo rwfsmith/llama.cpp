@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 
+#include <cstdint>
 #include <variant>
 
 struct ggml_tensor;
@@ -66,6 +67,10 @@ struct ScaleParams {
     float bias  = 0.0f;
 };
 
+struct FillParams {
+    uint32_t value_bits = 0;
+};
+
 // clang-format off
 using OpParams = std::variant<
     std::monostate,
@@ -79,7 +84,8 @@ using OpParams = std::variant<
     L2NormParams,
     UnaryParams,
     GatedDeltaNetParams,
-    ScaleParams>;
+    ScaleParams,
+    FillParams>;
 // clang-format on
 
 template <typename T> const T * op_params_as(const OpParams & params) {

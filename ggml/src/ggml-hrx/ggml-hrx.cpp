@@ -5,9 +5,13 @@
 #include "dispatch_registration/dispatch-copy.h"
 #include "dispatch_registration/dispatch-add.h"
 #include "dispatch_registration/dispatch-gather-add.h"
+#include "dispatch_registration/dispatch-elementwise.h"
+#include "dispatch_registration/dispatch-qsa-mask.h"
+#include "dispatch_registration/dispatch-gated-delta-net.h"
 #include "dispatch_registration/dispatch-llm-matmul.h"
 #include "dispatch_registration/dispatch-qwen-preamble.h"
 #include "dispatch_registration/dispatch-qwen4exp-flash-attention.h"
+#include "dispatch_registration/dispatch-qwen4exp-rope.h"
 #include "dispatch_registration/dispatch-rmsnorm.h"
 #include "dispatch_registration/dispatch-swiglu.h"
 #include "ggml-backend-impl.h"
@@ -831,7 +835,8 @@ static constexpr uint64_t kHrxTimeReportInterval = 1000;
 
 static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto * context = static_cast<ggml_backend_hrx_context *>(backend->context);
-    const bool timing = hrx_time_compute_enabled();
+    static const bool profile_splits = environment_flag_enabled("HRX_PROFILE_SPLITS");
+    const bool timing = hrx_time_compute_enabled() || profile_splits;
     using clock = std::chrono::steady_clock;
     const clock::time_point t_entry = timing ? clock::now() : clock::time_point{};
     ggml::hrx::DeviceTimingManager::GraphMeasurement device_measurement =
@@ -873,6 +878,8 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     }
     if (timing) {
         const clock::time_point t_synced = clock::now();
+        static std::mutex timing_mutex;
+        const std::lock_guard<std::mutex> timing_lock(timing_mutex);
         const auto              elapsed  = [](clock::time_point a, clock::time_point b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
@@ -884,6 +891,27 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
         nodes += static_cast<uint64_t>(graph->n_nodes);
         submit_ms += elapsed(t_entry, t_submitted);
         sync_wait_ms += elapsed(t_submitted, t_synced);
+        if (profile_splits && graph->n_nodes > 0) {
+            int first_index = 0;
+            int last_index = graph->n_nodes - 1;
+            while (first_index < last_index && ggml::hrx::is_layout_alias_op(graph->nodes[first_index]->op)) {
+                ++first_index;
+            }
+            while (last_index > first_index && ggml::hrx::is_layout_alias_op(graph->nodes[last_index]->op)) {
+                --last_index;
+            }
+            const ggml_tensor * first = graph->nodes[first_index];
+            const ggml_tensor * last = graph->nodes[last_index];
+            // These are host wall times for a split, not isolated device kernel durations.
+            GGML_LOG_INFO("HRX split cost: ok=%d nodes=%d submit_ms=%.6f wait_ms=%.6f "
+                          "first=%s[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                          "src_type=%s last=%s[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                          result.success() && synchronized ? 1 : 0, graph->n_nodes,
+                          elapsed(t_entry, t_submitted), elapsed(t_submitted, t_synced),
+                          ggml_op_desc(first), first->ne[0], first->ne[1], first->ne[2], first->ne[3],
+                          first->src[0] ? ggml_type_name(first->src[0]->type) : "none",
+                          ggml_op_desc(last), last->ne[0], last->ne[1], last->ne[2], last->ne[3]);
+        }
         if (splits % kHrxTimeReportInterval == 0) {
             GGML_LOG_INFO("HRX time: splits=%" PRIu64 " nodes=%" PRIu64 " submit=%.1fms sync_wait=%.1fms total=%.1fms\n",
                           splits, nodes, submit_ms, sync_wait_ms, submit_ms + sync_wait_ms);
@@ -1045,15 +1073,11 @@ static bool eager_capability_declared(enum ggml_op op) {
         case GGML_OP_ADD:
         case GGML_OP_ARGSORT:
         case GGML_OP_CLAMP:
-        // GGML_OP_CONCAT is deliberately NOT declared. HRX has no CONCAT kernel and no dispatch
-        // matcher roots at one: qwen4exp.gdn_conv_prepare_decode roots at SSM_CONV and binds the
-        // CONCAT's output as an already-materialized external value (see the header comment on
-        // ConvPrepareMatch in dispatch_registration/dispatch-gated-delta-net.cpp). Declaring CONCAT
-        // would let the scheduler place a node on HRX that nothing can execute, stranding the split
-        // it lands in with "unsupported HRX node ... CONCAT".
+        case GGML_OP_CONCAT:
         case GGML_OP_CONT:
         case GGML_OP_CPY:
         case GGML_OP_DIV:
+        case GGML_OP_FILL:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_GET_ROWS:
@@ -1504,9 +1528,8 @@ static bool hrx_gdn_gated_delta_net_decode_supported(const ggml_tensor * op) {
 // true on FLOPs and wrong on topology: qwen4exp's ssm_alpha/ssm_beta gates sit mid-chain in the GDN
 // prelude, so declining them also forced ADD/SOFTPLUS/MUL/SIGMOID downstream onto the CPU.
 //
-// The 256-output bound is a correctness guard, not a kernel limit -- it keeps the MoE router logits
-// projection (the only other F32 MUL_MAT here, n_expert = 512 wide) on the CPU where
-// dispatch-moe-router.cpp's SOFT_MAX-rooted match can still reach the GET_ROWS below it.
+// Share the shape/flag guard with the matcher, including the opt-in 512-expert
+// router projection now that its full downstream routing chain is supported.
 static bool hrx_dense_matmul_f32_supported(const ggml_tensor * op) {
     const ggml_tensor * weight = op->src[0];
     const ggml_tensor * input  = op->src[1];
@@ -1525,8 +1548,7 @@ static bool hrx_dense_matmul_f32_supported(const ggml_tensor * op) {
     const int64_t output_size = weight->ne[1];
     const int64_t token_count = input->ne[1];
     return input->ne[0] == input_size && op->ne[0] == output_size && op->ne[1] == token_count &&
-           input_size >= 1 && input_size <= 131072 && output_size >= 1 && output_size <= 256 &&
-           token_count >= 1 && token_count <= kHrxDenseMatmulMaxTokenCount;
+           ggml::hrx::dense_f32_shape_supported(input_size, output_size, token_count);
 }
 
 // Bisect switches, mirrored in dispatch_registration/dispatch-elementwise.cpp. The two copies must
@@ -1693,6 +1715,9 @@ static bool hrx_unary_f32_supported(const ggml_tensor * op) {
 // Mirrors dispatch-elementwise.cpp's match_l2_norm_f32_dispatch(). ggml normalizes over ne[0] only, so
 // any contiguous f32 tensor works: the kernel treats ne[1]*ne[2]*ne[3] as an independent row count.
 static bool hrx_l2_norm_f32_supported(const ggml_tensor * op) {
+    if (ggml::hrx::gdn_norm_prefill_supported(op)) {
+        return true;
+    }
     if (op == nullptr || op->type != GGML_TYPE_F32 || op->src[0] == nullptr ||
         op->src[0]->type != GGML_TYPE_F32) {
         return false;
@@ -2370,6 +2395,9 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
                         hrx_legacy_leaf_f32_gather_supported(op) ||
                         (hrx_qwen4exp_router_dispatch_enabled() && hrx_moe_router_gather_qwen4exp(op)));
             }
+            if (ggml::hrx::supports_qsa_f16_gather_dispatch(op)) {
+                return !hrx_dispatch_group_disabled("embed");
+            }
             return op->src[0] == nullptr ||
                    (!hrx_dispatch_group_disabled("embed") && hrx_weight_quant_supported(op->src[0]->type) &&
                     (!hrx_non_leaf_gather_qwen4exp(op) ||
@@ -2380,6 +2408,9 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
             }
             if (hrx_dispatch_group_disabled("matmul") || hrx_mul_mat_ne0_declined(op)) {
                 return false;
+            }
+            if (op->src[0]->type == GGML_TYPE_BF16 && ggml::hrx::qsa_bf16_projection_supported(op)) {
+                return true;
             }
             // Each Q8 route must pair capability with an actual single-op matcher.
             if (op->src[0]->type == GGML_TYPE_Q8_0) {
@@ -2442,7 +2473,9 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // can tell the two halves of the GDN pipeline apart; "gdn" disables both.
         // The prelude's feeding CONCAT stays on CPU by design -- see eager_capability_declared().
         case GGML_OP_SSM_CONV:
-            return !hrx_gdn_group_disabled("gdnconv") && hrx_gdn_ssm_conv_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdnconv") &&
+                   (hrx_gdn_ssm_conv_decode_supported(op) ||
+                    ggml::hrx::supports_gdn_conv_prefill_dispatch(op));
         // L2_NORM is qwen4exp's per-head q/k normalization inside the GDN prelude: 72 nodes, two per
         // linear-attention layer. It used never to be a registered dispatch root -- it only ever ran as
         // a covered node inside the fused qwen4exp.gdn_conv_prepare_decode match, which deliberately
@@ -2452,7 +2485,8 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         case GGML_OP_L2_NORM:
             return hrx_l2_norm_f32_supported(op);
         case GGML_OP_GATED_DELTA_NET:
-            return !hrx_gdn_group_disabled("gdncore") && hrx_gdn_gated_delta_net_decode_supported(op);
+            return !hrx_gdn_group_disabled("gdncore") &&
+                   (hrx_gdn_gated_delta_net_decode_supported(op) || ggml::hrx::supports_gdn_prefill_dispatch(op));
         // common.unary_f32 covers SIGMOID/SILU/RELU/SOFTPLUS on any contiguous f32 node, which is what
         // lets the GDN prelude and the MoE router stay on one backend. The narrower, shape-scoped
         // hrx_gdn_unary_decode_supported() is still consulted for the conv-prepare SILU so that the
@@ -2493,28 +2527,41 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // and the SSM_CONV, so leaving it on the CPU splits the conv-prepare chain across backends and
         // strands the CONCAT in a split of its own where no matcher can root at it.
         case GGML_OP_CONT:
-            return hrx_copy_f32_supported(op);
+            return hrx_copy_f32_supported(op) || ggml::hrx::supports_qsa_mask_dispatch(op);
+        case GGML_OP_FILL:
+            return ggml::hrx::supports_qsa_mask_dispatch(op);
         // Each remaining guard names a specific qwen4exp shape that no matcher roots at. The GDN
         // alpha/gate prelude used to be one of them; common.add_f32 / common.mul_f32 now cover it.
         case GGML_OP_ADD:
+            if (ggml::hrx::supports_qsa_add_dispatch(op) || ggml::hrx::supports_qsa_mask_dispatch(op)) {
+                return true;
+            }
             return !hrx_add_non_f32(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
                    (ggml::hrx::supports_add_f32_dispatch(op) ||
                     (!hrx_dispatch_group_disabled("matmul") && ggml::hrx::supports_fused_moe_add(op)));
         case GGML_OP_MUL:
             return hrx_mul_supported(op);
         case GGML_OP_RMS_NORM:
+            if (ggml::hrx::qwen4exp_qsa_norm_supported(op)) {
+                return true;
+            }
             return !hrx_gdn_norm_gate_row(op) && !hrx_attention_head_major_qwen4exp(op) &&
                    !hrx_qsa_indexer_row_qwen4exp(op) && !hrx_hc_grouped_norm_row_qwen4exp(op) &&
                    (!(op->ne[0] == kHrxHiddenSizeQwen4Exp && op->ne[1] == kHrxHcMultiplierQwen4Exp) ||
                     ggml::hrx::qwen4exp_hc_grouped_norm_rms_supported(op));
         case GGML_OP_REPEAT:
             return hrx_repeat_dispatch_enabled() && hrx_repeat_f32_supported(op);
+        case GGML_OP_CONCAT:
+            return ggml::hrx::recurrent_concat_supported(op);
         // VIEW is deliberately absent from these shape guards. It is a pure layout alias that the
         // dispatch scheduler elides rather than dispatching, so HRX can always "run" one -- declining it
         // states a capability HRX does have. It also cannot be declined safely: the KV and QSA caches are
         // pre-allocated in HRX buffers, and ggml_backend_sched aborts instead of falling back when a
         // pre-allocated tensor's backend refuses its op, so refusing a view of cache_k_l* is fatal.
         case GGML_OP_ROPE:
+            if (ggml::hrx::qwen4exp_qsa_rope_supported(op)) {
+                return true;
+            }
             return !hrx_attention_head_major_qwen4exp(op) && !hrx_qsa_indexer_row_qwen4exp(op) &&
                    !hrx_hc_grouped_norm_row_qwen4exp(op);
         case GGML_OP_CLAMP:

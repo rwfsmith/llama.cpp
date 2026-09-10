@@ -307,12 +307,32 @@ def with_owned_kernels(manifest: dict, corpus_dir: pathlib.Path) -> dict:
     iq_bindings = ["weight", "input", "ids", "tables", "output"]
     iq_access = ["read", "read", "read", "read", "write"]
     owned_sources = [
+        ("../hrx_owned/qwen4exp_norm.loom", [
+            ("ggml_qsa_norm_f32", ["width", "heads", "tokens", "source_stride"],
+             ["input", "output"], ["read", "write"]),
+        ]),
+        ("../hrx_owned/qwen4exp_rope.loom", [
+            ("ggml_qsa_rope_f32", ["width", "heads", "tokens"],
+             ["input", "positions", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/qsa_bf16_projection.loom", [
+            ("ggml_qsa_bf16_projection", ["output_size", "token_count"],
+             ["weight", "input", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/recurrent_concat_f32.loom", [
+            ("ggml_recurrent_concat_f32", ["history_count", "token_count", "input_transposed"],
+             ["history", "input", "output"], ["read", "read", "write"]),
+        ]),
         ("../hrx_owned/swiglu_split_f32.loom", [
             ("ggml_swiglu_split_f32", ["element_count"],
              ["gate", "up", "output"], ["read", "read", "write"]),
         ]),
         ("../hrx_owned/get_rows_f32.loom", [
             ("ggml_get_rows_f32", ["hidden_size", "vocabulary_count", "token_count"],
+             ["source", "ids", "output"], ["read", "read", "write"]),
+        ]),
+        ("../hrx_owned/qsa_get_rows_f16.loom", [
+            ("ggml_qsa_get_rows_f16", ["hidden_size", "vocabulary_count", "token_count"],
              ["source", "ids", "output"], ["read", "read", "write"]),
         ]),
         ("../hrx_owned/token_embedding_q4_k.loom", [
@@ -348,11 +368,22 @@ def with_owned_kernels(manifest: dict, corpus_dir: pathlib.Path) -> dict:
         ("../hrx_owned/dense_quantized_f32_accum.loom", [
             (name, ["token_count"], ["input", "weight", "output"], ["read", "read", "write"])
             for name in ("ggml_dense_q4k_f32_accum", "ggml_dense_q6k_f32_accum",
-                         "ggml_dense_q8_0_f32_accum")
+                         "ggml_dense_q8_0_f32_accum", "ggml_dense_q8_0_rounded_gemv",
+                         "ggml_dense_q6k_rounded_gemv")
+        ]),
+        ("../hrx_owned/qsa_mask.loom", [
+            ("ggml_qsa_mask_fill", ["element_count", "element_bytes", "value_bits"],
+             ["output"], ["write"]),
+            ("ggml_qsa_mask_cast", ["element_count", "source_f16"],
+             ["input", "output"], ["read", "write"]),
+            ("ggml_qsa_mask_add_f16", ["element_count", "rhs_count"],
+             ["lhs", "rhs", "output"], ["read", "read", "write"]),
         ]),
         ("../hrx_owned/mul_mat_id_iq.loom", [
             ("ggml_mul_mat_id_iq3_xxs_f32", iq_parameters, iq_bindings, iq_access),
             ("ggml_mul_mat_id_iq4_xs_f32", iq_parameters, iq_bindings, iq_access),
+            ("ggml_mul_mat_id_iq3_xxs_f32_packet4", iq_parameters, iq_bindings, iq_access),
+            ("ggml_mul_mat_id_iq4_xs_f32_packet4", iq_parameters, iq_bindings, iq_access),
         ]),
         ("../hrx_owned/moe_small_down.loom", [
             (name, ["token_count", "input_size", "route_count", "route_id_stride",

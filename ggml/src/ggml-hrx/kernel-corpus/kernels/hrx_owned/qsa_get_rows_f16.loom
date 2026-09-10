@@ -1,0 +1,38 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_qsa_get_rows_f16_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_qsa_get_rows_f16_wave64) export("ggml_qsa_get_rows_f16") @ggml_qsa_get_rows_f16(
+    %hidden_size: index, %vocabulary_count: index, %token_count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 128 : index
+  kernel.launch.config workgroups(%token_count, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%hidden_size: index, %vocabulary_count: index, %token_count: index, %source: buffer, %ids: buffer, %output: buffer) {
+  %width = index.assume %hidden_size [range(%hidden_size, 128, 128)] : index
+  %capacity = index.assume %vocabulary_count [range(%vocabulary_count, 1, 4096)] : index
+  %count = index.assume %token_count [range(%token_count, 1, 4096)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %count)] : index
+  %lane0 = kernel.workitem.id<x> : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 127), lt(%lane0, %width)] : index
+  %offset = index.constant 0 : offset
+  %iv = buffer.view %ids[%offset] : buffer -> view<[%count]xi32>
+  %id32 = view.load %iv[%row] : view<[%count]xi32> -> i32
+  %zero = scalar.constant 0 : i32
+  %capacity32 = index.cast %capacity : index to i32
+  %nonnegative = scalar.cmpi sge, %id32, %zero : i32
+  %below_limit = scalar.cmpi slt, %id32, %capacity32 : i32
+  %valid = scalar.andi %nonnegative, %below_limit : i1
+  // Untrusted IDs fail host validation before launch. Keep a device guard as well.
+  scf.if %valid {
+    %id0 = index.cast %id32 : i32 to index
+    %id = index.assume %id0 [range(%id0, 0, 4095), lt(%id0, %capacity)] : index
+    %sv = buffer.view %source[%offset] : buffer -> view<[%capacity]x[%width]xf16>
+    %ov = buffer.view %output[%offset] : buffer -> view<[%count]x[%width]xf32>
+    %half = view.load %sv[%id, %lane] : view<[%capacity]x[%width]xf16> -> f16
+    %value = scalar.extf %half : f16 to f32
+    view.store %value, %ov[%row, %lane] : f32, view<[%count]x[%width]xf32>
+  }
+  kernel.return
+}

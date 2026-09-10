@@ -96,6 +96,8 @@ static bool gated_delta_net_params_equivalent(const OpParams & lhs, const OpPara
 
 OpParams import_op_params(const ggml_tensor & tensor) {
     switch (tensor.op) {
+        case GGML_OP_FILL:
+            return FillParams{ static_cast<uint32_t>(ggml_get_op_params_i32(&tensor, 0)) };
         case GGML_OP_RMS_NORM:
             return RmsNormParams{ ggml_get_op_params_f32(&tensor, 0) };
         case GGML_OP_SOFT_MAX:
@@ -145,6 +147,11 @@ OpParams import_op_params(const ggml_tensor & tensor) {
 
 bool op_params_equivalent(ggml_op op, const OpParams & lhs, const OpParams & rhs) {
     switch (op) {
+        case GGML_OP_FILL: {
+            const auto * a = op_params_as<FillParams>(lhs);
+            const auto * b = op_params_as<FillParams>(rhs);
+            return a != nullptr && b != nullptr && a->value_bits == b->value_bits;
+        }
         case GGML_OP_RMS_NORM:
             return rms_norm_params_equivalent(lhs, rhs);
         case GGML_OP_SOFT_MAX:
