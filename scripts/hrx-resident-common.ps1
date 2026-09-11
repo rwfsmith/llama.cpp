@@ -240,6 +240,11 @@ function New-HrxStartupConfiguration($Options) {
     }
     $environment.HRX_ENABLE_Q8_GEMV = '0'
     $environment.HRX_MUL_CLAIM_MASK = '0x7F'
+    # Not an HRX-specific flag: this is a core llama.cpp model-graph optimization (skips the
+    # lightning-indexer top-k/sparse-mask subgraph whenever n_kv already fits within the top-k
+    # budget, since sparse selection would be a no-op). Applies equally to Vulkan; kept here only
+    # because this harness is HRX-only, not because it's an HRX bring-up setting.
+    $environment.LLAMA_QSA_DENSE_BYPASS = '1'
     if ($Options.MicroBatch -gt 1 -or $Options.Mtp) {
         foreach ($flag in @('MOE_SMALL_BATCH', 'HC_SMALL_BATCH', 'SMALL_BATCH_GLUE', 'SWIGLU')) {
             $environment["HRX_ENABLE_$flag"] = '1'
