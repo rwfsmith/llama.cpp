@@ -230,6 +230,12 @@
       "owner": "ggml-hrx"
     },
     {
+      "path": "../hrx_owned/scale_unary_f32.loom",
+      "sha256": "db945c9278c73ea7ea2074ae3f990fcff8ceabca363c0f782ae7a29d0f502121",
+      "size": 9817,
+      "owner": "ggml-hrx"
+    },
+    {
       "path": "../hrx_owned/mul_f32.loom",
       "sha256": "3920b5cafec8ecd229c4b08a3257428080ea64b062672c61d368c4bf2b7b90a0",
       "size": 10701,
@@ -795,6 +801,108 @@
         "mode": "direct",
         "primary_sources": [
           "../hrx_owned/scale_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_scale_silu_f32",
+      "symbol": "ggml_scale_silu_f32",
+      "source": "../hrx_owned/scale_unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/scale_unary_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_scale_sigmoid_f32",
+      "symbol": "ggml_scale_sigmoid_f32",
+      "source": "../hrx_owned/scale_unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/scale_unary_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_scale_softplus_f32",
+      "symbol": "ggml_scale_softplus_f32",
+      "source": "../hrx_owned/scale_unary_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "input",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/scale_unary_f32.loom"
         ],
         "library_sources": []
       },

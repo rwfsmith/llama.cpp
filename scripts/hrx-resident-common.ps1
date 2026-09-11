@@ -236,7 +236,8 @@ function New-HrxStartupConfiguration($Options) {
                          'PLE_CONV_FUSION', 'F32_ROUTER', 'QWEN4EXP_ROUTER',
                          'RECURRENT_CONCAT', 'GDN_CONV_PREFILL', 'GDN_PREFILL', 'GDN_NORM_PREFILL',
                          'QSA_MASK', 'QSA_PROJECTIONS', 'QSA_F16_GATHER', 'TRUSTED_INDEX_VIEWS',
-                         'DENSE_F32_GEMV', 'IQ_PACKET4', 'SILU_MUL_FUSION', 'QSA_GLUE')) {
+                         'DENSE_F32_GEMV', 'IQ_PACKET4', 'SILU_MUL_FUSION', 'QSA_GLUE',
+                         'SCALE_UNARY_FUSION')) {
         $environment["HRX_ENABLE_$flag"] = '1'
     }
     $environment.HRX_ENABLE_Q8_GEMV = '0'

@@ -595,6 +595,9 @@ static bool match_repeat_f32_dispatch(const DispatchMatchContext & context, Disp
 }
 
 static constexpr KernelCatalogRef kScaleF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_scale_f32");
+static constexpr KernelCatalogRef kScaleSiluF32Kernel     = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_scale_silu_f32");
+static constexpr KernelCatalogRef kScaleSigmoidF32Kernel  = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_scale_sigmoid_f32");
+static constexpr KernelCatalogRef kScaleSoftplusF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_scale_softplus_f32");
 
 // GGML_OP_SCALE: dst = src*scale + bias, both floats in op_params. See the header comment on
 // hrx_owned/scale_f32.loom -- SCALE is the most common first-op of a CPU split in a qwen4exp decode
@@ -629,6 +632,92 @@ static bool match_scale_f32_dispatch(const DispatchMatchContext & context, Dispa
     dispatch.kernel.integer_parameters.emplace("element_count", output->element_count);
     dispatch.kernel.compile_parameters.emplace("ggml.scale_f32.scale", scale_text);
     dispatch.kernel.compile_parameters.emplace("ggml.scale_f32.bias", bias_text);
+    dispatch.bindings.push_back({ input->id, 0, input->byte_count });
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+
+    match.covered_nodes.push_back(context.root_index);
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
+}
+
+static bool scale_unary_fusion_enabled() {
+    const char * flag = std::getenv("HRX_ENABLE_SCALE_UNARY_FUSION");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+// Fuses GGML_OP_SCALE -> GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) (out = act(src*scale + bias)) into
+// one kernel, covering both nodes. A live HRX_TRACE_SCALE_CONSUMER trace on qwen4exp found about
+// half of all decode-graph SCALE nodes feed exactly one UNARY consumer this way -- qwen4exp's
+// hyper-connection (HC) mixing math applies a plain affine rescale immediately before an
+// activation in build_hc_split() (`silu(scale(lo, 1/hc))`) and build_hc_combine()
+// (`sigmoid(scale(inject, 1/hc))`). See the header comment on hrx_owned/scale_unary_f32.loom.
+//
+// Rooted at the SCALE node itself (it is always visited before its UNARY consumer in topological
+// order), looking *forward* to claim that consumer, exactly like match_silu_mul_f32_dispatch above
+// claims its MUL consumer. Registered at priority 200 for root_op == GGML_OP_SCALE so it wins over
+// common.scale_f32 (priority 0) for the same node; when it declines, common.scale_f32 and
+// common.unary_f32 still pick up the two nodes unfused, so this never costs an extra dispatch even
+// in the worst case (an activation feeding a MUL leaves that MUL free either way).
+static bool match_scale_unary_f32_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    if (!scale_unary_fusion_enabled()) {
+        return false;
+    }
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_SCALE || node->inputs.size() != 1 ||
+        !context.graph.has_index()) {
+        return false;
+    }
+    const ScaleParams * params = op_params_as<ScaleParams>(node->params);
+    if (params == nullptr || (params->scale == 0.0f && params->bias == 0.0f)) {
+        return false;  // Leave the zero-fill form to common.zero_f32, same as match_scale_f32_dispatch.
+    }
+    const Graph & graph = context.graph;
+    const std::vector<const GraphNode *> & consumers = graph.index().consumers(node->output);
+    if (consumers.size() != 1 || consumers.front() == nullptr) {
+        return false;  // The SCALE output feeds something else too; it still has to run unfused.
+    }
+    const GraphNode * activation = consumers.front();
+    if (activation->op != GGML_OP_UNARY || activation->inputs.size() != 1) {
+        return false;
+    }
+    const UnaryParams * unary_params = op_params_as<UnaryParams>(activation->params);
+    if (unary_params == nullptr) {
+        return false;
+    }
+    KernelCatalogRef kernel;
+    switch (unary_params->op) {
+        case GGML_UNARY_OP_SILU:     kernel = kScaleSiluF32Kernel;     break;
+        case GGML_UNARY_OP_SIGMOID:  kernel = kScaleSigmoidF32Kernel;  break;
+        case GGML_UNARY_OP_SOFTPLUS: kernel = kScaleSoftplusF32Kernel; break;
+        default: return false;
+    }
+    const Value * input  = elementwise_graph_value(graph, node->inputs[0]);
+    const Value * output = elementwise_graph_value(graph, activation->output);
+    if (input == nullptr || output == nullptr) {
+        return false;
+    }
+    if (input->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 ||
+        !input->contiguous || !output->contiguous || !elementwise_same_shape(*input, *output)) {
+        return false;
+    }
+    if (output->element_count <= 0 ||
+        static_cast<uint64_t>(output->element_count) > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    if (!append_covered_node_index_once(context.graph, context.covered_nodes, activation, match.covered_nodes)) {
+        return false;  // The UNARY was already claimed by an earlier-registered dispatch; leave this alone.
+    }
+
+    char scale_text[32];
+    char bias_text[32];
+    std::snprintf(scale_text, sizeof(scale_text), "%.9g", static_cast<double>(params->scale));
+    std::snprintf(bias_text, sizeof(bias_text), "%.9g", static_cast<double>(params->bias));
+
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kernel);
+    dispatch.kernel.integer_parameters.emplace("element_count", output->element_count);
+    dispatch.kernel.compile_parameters.emplace("ggml.scale_unary_f32.scale", scale_text);
+    dispatch.kernel.compile_parameters.emplace("ggml.scale_unary_f32.bias", bias_text);
     dispatch.bindings.push_back({ input->id, 0, input->byte_count });
     dispatch.bindings.push_back({ output->id, 0, output->byte_count });
 
@@ -832,6 +921,20 @@ void register_elementwise_dispatches(DispatchRegistryBuilder & registry) {
         0,
         DispatchSource::Common,
         match_scale_f32_dispatch,
+    });
+    registry.add({
+        // Rooted at GGML_OP_SCALE (not GGML_OP_UNARY) and priority 200 so this wins over
+        // common.scale_f32 (priority 0, same root op) for the SCALE node itself -- nodes are
+        // visited in topological order, so SCALE is always visited before its UNARY consumer.
+        // Opt-in (HRX_ENABLE_SCALE_UNARY_FUSION) so it can be A/B tested; when disabled it always
+        // declines and common.scale_f32 / common.unary_f32 pick the two nodes up unfused exactly
+        // as before.
+        "common.scale_unary_f32",
+        GGML_OP_SCALE,
+        DispatchMatchKind::Fused,
+        200,
+        DispatchSource::Common,
+        match_scale_unary_f32_dispatch,
     });
     registry.add({
         // Rooted at GGML_OP_UNARY (not GGML_OP_MUL) and priority 200 so this is tried, and wins,

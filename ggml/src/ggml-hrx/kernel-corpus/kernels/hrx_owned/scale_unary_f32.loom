@@ -1,0 +1,177 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Fused act(x*scale + bias) (GGML_OP_SCALE followed by
+// GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS)) for qwen4exp's hyper-connection (HC)
+// mixing math: build_hc_split()'s `ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f /
+// hc))` and build_hc_combine()'s `ggml_sigmoid(ctx0, ggml_scale(ctx0, inject,
+// 1.0f / hc))` both apply a plain affine rescale immediately before an
+// activation, and every SCALE in these two shapes is consumed by exactly one
+// activation node. A live HRX_TRACE_SCALE_CONSUMER trace on qwen4exp found
+// about half of all decode-graph SCALE nodes feed a single GGML_OP_UNARY
+// consumer this way; each was still two command-buffer submissions where one
+// suffices.
+//
+// scale and bias arrive as compile-time config, matching
+// hrx_owned/scale_f32.loom's own convention (KernelSpecialization carries no
+// f32 launch-scalar channel).
+
+amdgpu.target<gfx11-generic> @ggml_scale_unary_gfx11_wave64 {subgroup_size = 64}
+
+config.decl @ggml.scale_unary_f32.scale : f32
+config.decl @ggml.scale_unary_f32.bias : f32
+
+kernel.def target(@ggml_scale_unary_gfx11_wave64) export("ggml_scale_silu_f32") @ggml_scale_silu_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %input: buffer, %output: buffer) {
+  %scale = config.get @ggml.scale_unary_f32.scale : f32
+  %bias = config.get @ggml.scale_unary_f32.bias : f32
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
+  %input_view = buffer.view %input_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %raw_value = view.load %input_view[%linear] : view<[%count]xf32> -> f32
+    %scaled = scalar.mulf %raw_value, %scale : f32
+    %value = scalar.addf %scaled, %bias : f32
+    // ggml op_silu: x/(1 + expf(-x)). Same intrinsic hrx_owned/unary_f32.loom uses.
+    %result = scalar.siluf %value : f32
+    view.store %result, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+kernel.def target(@ggml_scale_unary_gfx11_wave64) export("ggml_scale_sigmoid_f32") @ggml_scale_sigmoid_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %input: buffer, %output: buffer) {
+  %scale = config.get @ggml.scale_unary_f32.scale : f32
+  %bias = config.get @ggml.scale_unary_f32.bias : f32
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
+  %input_view = buffer.view %input_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %raw_value = view.load %input_view[%linear] : view<[%count]xf32> -> f32
+    %scaled = scalar.mulf %raw_value, %scale : f32
+    %value = scalar.addf %scaled, %bias : f32
+    // ggml op_sigmoid: 1/(1 + expf(-x)). Same intrinsic hrx_owned/unary_f32.loom uses.
+    %result = scalar.logisticf<afn> %value : f32
+    view.store %result, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+kernel.def target(@ggml_scale_unary_gfx11_wave64) export("ggml_scale_softplus_f32") @ggml_scale_softplus_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %input: buffer, %output: buffer) {
+  %scale = config.get @ggml.scale_unary_f32.scale : f32
+  %bias = config.get @ggml.scale_unary_f32.bias : f32
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %input_noalias, %output_noalias = buffer.assume.noalias %input, %output : buffer, buffer
+  %input_view = buffer.view %input_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %raw_value = view.load %input_view[%linear] : view<[%count]xf32> -> f32
+    %scaled = scalar.mulf %raw_value, %scale : f32
+    %value = scalar.addf %scaled, %bias : f32
+    // ggml op_softplus: (x > 20) ? x : logf(1 + expf(x)). Same saturation
+    // guard hrx_owned/unary_f32.loom uses -- qwen4exp feeds this the raw
+    // ssm_dt projection, which is unbounded, and expf(x) overflows near x==88.
+    %twenty = scalar.constant 20.0 : f32
+    %saturated = scalar.cmpf ogt, %value, %twenty : f32
+    %exponential = scalar.expf<afn> %value : f32
+    %unit = scalar.constant 1.0 : f32
+    %shifted = scalar.addf %exponential, %unit : f32
+    %logarithm = scalar.logf<afn> %shifted : f32
+    %result = scf.select %saturated, %value, %logarithm : f32
+    view.store %result, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+// scale=1.5, bias=0.5, input=2.0 -> pre = 3.5. A non-trivial affine before
+// each activation so a dropped scale, dropped bias, or swapped operand order
+// in the fused kernel would all diverge from these hand-computed references.
+check.case public @ggml_scale_silu_f32_case {
+  %four = check.literal value(4) : index
+  %input = check.generate.fill value(2.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<4xf32>
+  // silu(3.5) == 3.5 * sigmoid(3.5) == 3.397407192370253.
+  %expected = check.generate.fill value(3.397407192370253) : tensor<4xf32>
+  func.call @ggml_scale_silu_f32(%four, %input, %output) : (index, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.00001) rtol(0.00001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.case public @ggml_scale_sigmoid_f32_case {
+  %four = check.literal value(4) : index
+  %input = check.generate.fill value(2.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<4xf32>
+  // sigmoid(3.5) == 1/(1 + exp(-3.5)) == 0.9706877692486436.
+  %expected = check.generate.fill value(0.9706877692486436) : tensor<4xf32>
+  func.call @ggml_scale_sigmoid_f32(%four, %input, %output) : (index, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.00001) rtol(0.00001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.case public @ggml_scale_softplus_f32_case {
+  %four = check.literal value(4) : index
+  %input = check.generate.fill value(2.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<4xf32>
+  // softplus(3.5) == logf(1 + expf(3.5)) == 3.5297504182726205.
+  %expected = check.generate.fill value(3.5297504182726205) : tensor<4xf32>
+  func.call @ggml_scale_softplus_f32(%four, %input, %output) : (index, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.00001) rtol(0.00001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+// 1000 elements is not a multiple of the 256-wide workgroup, so the tail
+// workgroup runs with most lanes masked off and must not write past the end.
+check.case public @ggml_scale_silu_f32_ragged_tail_case {
+  %element_count = check.literal value(1000) : index
+  %input = check.generate.iota offset(0.0) step(1.0) : tensor<1000xf32>
+  %output = check.generate.fill value(0.0) : tensor<1000xf32>
+  func.call @ggml_scale_silu_f32(%element_count, %input, %output) : (index, tensor<1000xf32>, tensor<1000xf32>)
+  check.return
+}
+
+check.benchmark<@ggml_scale_silu_f32_ragged_tail_case> @ggml_scale_silu_f32_ragged_tail

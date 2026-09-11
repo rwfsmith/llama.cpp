@@ -58,6 +58,7 @@ try {
     Assert-Test ($configuration.Environment.HRX_ENABLE_IQ_PACKET4 -eq '1') 'IQ 4-wide packet GEMM enabled by default'
     Assert-Test ($configuration.Environment.HRX_ENABLE_SILU_MUL_FUSION -eq '1') 'SILU/SIGMOID/SOFTPLUS+MUL fusion enabled by default'
     Assert-Test ($configuration.Environment.HRX_ENABLE_QSA_GLUE -eq '1') 'QSA row-bias ADD fusion (128-wide, up to 65536 rows) enabled by default'
+    Assert-Test ($configuration.Environment.HRX_ENABLE_SCALE_UNARY_FUSION -eq '1') 'SCALE+SILU/SIGMOID/SOFTPLUS fusion enabled by default'
     Assert-Test ($configuration.Environment.LLAMA_QSA_DENSE_BYPASS -eq '1') 'lightning-indexer dense bypass enabled by default'
     Assert-Test ($configuration.Models.Count -eq 1) 'MTP is opt-in'
     $previousLlvmPath = $env:LLVM_PATH
