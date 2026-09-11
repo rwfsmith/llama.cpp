@@ -56,6 +56,7 @@ try {
     Assert-Test ($configuration.Environment.HRX_ENABLE_PLE_CONV_FUSION -eq '1') 'PLE convolution fusion enabled by default'
     Assert-Test ($configuration.Environment.HRX_ENABLE_DENSE_F32_GEMV -eq '1') 'raw-F32 decode-only GEMV enabled by default'
     Assert-Test ($configuration.Environment.HRX_ENABLE_IQ_PACKET4 -eq '1') 'IQ 4-wide packet GEMM enabled by default'
+    Assert-Test ($configuration.Environment.HRX_ENABLE_SILU_MUL_FUSION -eq '1') 'SILU/SIGMOID/SOFTPLUS+MUL fusion enabled by default'
     Assert-Test ($configuration.Environment.LLAMA_QSA_DENSE_BYPASS -eq '1') 'lightning-indexer dense bypass enabled by default'
     Assert-Test ($configuration.Models.Count -eq 1) 'MTP is opt-in'
     $previousLlvmPath = $env:LLVM_PATH
