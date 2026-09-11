@@ -1,0 +1,105 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+
+amdgpu.target<gfx11-generic> @ggml_ple_conv_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_ple_conv_wave64) export("ggml_ple_conv_f32")
+    @ggml_ple_conv_f32(%token_count: index) {
+  %one = index.constant 1 : index
+  %groups = index.constant 40 : index
+  %threads = index.constant 256 : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%token_count: index,
+         %activation0: buffer, %weight0: buffer,
+         %activation1: buffer, %weight1: buffer,
+         %activation2: buffer, %weight2: buffer,
+         %activation3: buffer, %weight3: buffer,
+         %output: buffer) {
+  %tokens = index.assume %token_count [range(%token_count, 1, 8)] : index
+  %history = index.constant 9 : index
+  %activation_stride = index.add %tokens, %history : index
+  %weight_stride = index.constant 4 : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %threads = index.constant 256 : index
+  %base = index.mul %group, %threads : index
+  %channel0 = index.add %base, %lane : index
+  %channel = index.assume %channel0 [range(%channel0, 0, 10239)] : index
+  %activation_extent = index.mul %activation_stride, %channel : index
+  %activation_count = index.add %activation_extent, %tokens : index
+  %weight_extent = index.mul %weight_stride, %channel : index
+  %weight_count = index.add %weight_extent, %weight_stride : index
+  %offset = index.constant 0 : offset
+  %a0 = buffer.view %activation0[%offset] : buffer -> view<[%activation_count]xf32>
+  %a1 = buffer.view %activation1[%offset] : buffer -> view<[%activation_count]xf32>
+  %a2 = buffer.view %activation2[%offset] : buffer -> view<[%activation_count]xf32>
+  %a3 = buffer.view %activation3[%offset] : buffer -> view<[%activation_count]xf32>
+  %w0v = buffer.view %weight0[%offset] : buffer -> view<[%weight_count]xf32>
+  %w1v = buffer.view %weight1[%offset] : buffer -> view<[%weight_count]xf32>
+  %w2v = buffer.view %weight2[%offset] : buffer -> view<[%weight_count]xf32>
+  %w3v = buffer.view %weight3[%offset] : buffer -> view<[%weight_count]xf32>
+  %out = buffer.view %output[%offset] : buffer -> view<[%tokens]x10240xf32>
+  %weight_index = index.mul %channel, %weight_stride : index
+  %w0 = view.load %w0v[%weight_index] : view<[%weight_count]xf32> -> f32
+  %w1 = view.load %w1v[%weight_index] : view<[%weight_count]xf32> -> f32
+  %w2 = view.load %w2v[%weight_index] : view<[%weight_count]xf32> -> f32
+  %w3 = view.load %w3v[%weight_index] : view<[%weight_count]xf32> -> f32
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %zero_f32 = scalar.constant 0.0 : f32
+  scf.for %token = [%zero to %tokens step %one] {
+    %activation_base = index.mul %channel, %activation_stride : index
+    %activation_index = index.add %activation_base, %token : index
+    %activation_in_bounds = index.cmp ult, %activation_index, %activation_count : index
+    scf.if %activation_in_bounds {
+      %v0 = view.load %a0[%activation_index] : view<[%activation_count]xf32> -> f32
+      %v1 = view.load %a1[%activation_index] : view<[%activation_count]xf32> -> f32
+      %v2 = view.load %a2[%activation_index] : view<[%activation_count]xf32> -> f32
+      %v3 = view.load %a3[%activation_index] : view<[%activation_count]xf32> -> f32
+      %p0 = scalar.mulf %v0, %w0 : f32
+      %p1 = scalar.mulf %v1, %w1 : f32
+      %p2 = scalar.mulf %v2, %w2 : f32
+      %p3 = scalar.mulf %v3, %w3 : f32
+      %sum0 = scalar.addf %zero_f32, %p0 : f32
+      %sum1 = scalar.addf %sum0, %p1 : f32
+      %sum2 = scalar.addf %sum1, %p2 : f32
+      %sum3 = scalar.addf %sum2, %p3 : f32
+      %activated = scalar.siluf %sum3 : f32
+      view.store %activated, %out[%token, %channel] : f32, view<[%tokens]x10240xf32>
+    }
+  }
+  kernel.return
+}
+
+check.case public @ggml_ple_conv_f32_t1_case {
+  %tokens = check.literal value(1) : index
+  %activation = check.generate.fill value(0.125) : tensor<102400xf32>
+  %weight = check.generate.fill value(0.25) : tensor<40960xf32>
+  %output = check.generate.fill value(0.0) : tensor<1x10240xf32>
+  kernel.launch @ggml_ple_conv_f32[%tokens](
+      %tokens, %activation, %weight, %activation, %weight,
+      %activation, %weight, %activation, %weight, %output)
+      : [index](index, tensor<102400xf32>, tensor<40960xf32>,
+         tensor<102400xf32>, tensor<40960xf32>,
+         tensor<102400xf32>, tensor<40960xf32>,
+         tensor<102400xf32>, tensor<40960xf32>, tensor<1x10240xf32>)
+  check.return
+}
+
+check.case public @ggml_ple_conv_f32_t8_case {
+  %tokens = check.literal value(8) : index
+  %activation = check.generate.fill value(0.125) : tensor<174080xf32>
+  %weight = check.generate.fill value(0.25) : tensor<40960xf32>
+  %output = check.generate.fill value(0.0) : tensor<8x10240xf32>
+  kernel.launch @ggml_ple_conv_f32[%tokens](
+      %tokens, %activation, %weight, %activation, %weight,
+      %activation, %weight, %activation, %weight, %output)
+      : [index](index, tensor<174080xf32>, tensor<40960xf32>,
+         tensor<174080xf32>, tensor<40960xf32>,
+         tensor<174080xf32>, tensor<40960xf32>,
+         tensor<174080xf32>, tensor<40960xf32>, tensor<8x10240xf32>)
+  check.return
+}
+
+check.benchmark<@ggml_ple_conv_f32_t1_case> @ggml_ple_conv_f32_t1
+check.benchmark<@ggml_ple_conv_f32_t8_case> @ggml_ple_conv_f32_t8

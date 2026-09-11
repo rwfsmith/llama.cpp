@@ -175,6 +175,20 @@ Status HostTransferManager::download_synchronous(hrx_stream_t stream,
         wait_ms += elapsed(t_entry, t_synced);
         copy_ms += elapsed(t_synced, t_copied);
         bytes += size;
+        static const bool registered_download_atexit = [] {
+            std::atexit([] {
+                if (downloads == 0) {
+                    return;
+                }
+                const double total = wait_ms + copy_ms;
+                GGML_LOG_INFO(
+                    "HRX download (final): n=%llu gpu_wait=%.1fms(%.0f%%) d2h_copy=%.1fms(%.0f%%) bytes=%.1fMB\n",
+                    static_cast<unsigned long long>(downloads), wait_ms, total > 0.0 ? 100.0 * wait_ms / total : 0.0,
+                    copy_ms, total > 0.0 ? 100.0 * copy_ms / total : 0.0, bytes / 1048576.0);
+            });
+            return true;
+        }();
+        (void) registered_download_atexit;
         if (downloads % 5000 == 0) {
             const double total = wait_ms + copy_ms;
             GGML_LOG_INFO("HRX download: n=%llu gpu_wait=%.1fms(%.0f%%) d2h_copy=%.1fms(%.0f%%) bytes=%.1fMB\n",

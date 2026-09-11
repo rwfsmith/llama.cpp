@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "graph/graph-matcher.h"
 #include "kernel-corpus/kernel-corpus-catalog-verify.h"
 
 #include <cstdint>
@@ -83,6 +84,9 @@ static constexpr KernelCatalogRef kMulF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe
 static constexpr KernelCatalogRef kMulOuterF32Kernel =
     GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_mul_outer_f32");
 static constexpr KernelCatalogRef kRepeatF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_repeat_f32");
+static constexpr KernelCatalogRef kSiluMulF32Kernel     = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_silu_mul_f32");
+static constexpr KernelCatalogRef kSigmoidMulF32Kernel  = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_sigmoid_mul_f32");
+static constexpr KernelCatalogRef kSoftplusMulF32Kernel = GGML_HRX_KERNEL_REF("qwen3_moe", "ggml_softplus_mul_f32");
 // Matches the index.assume ranges in hrx_owned/repeat_f32.loom.
 static constexpr int64_t kRepeatF32MaxPeriod = 1048576;
 static constexpr int64_t kRepeatF32MaxTile   = 65536;
@@ -333,6 +337,93 @@ static bool match_l2_norm_f32_dispatch(const DispatchMatchContext & context, Dis
     match.covered_nodes.push_back(context.root_index);
     match.dispatches.push_back(std::move(dispatch));
     return true;
+}
+
+static bool silu_mul_fusion_enabled() {
+    const char * flag = std::getenv("HRX_ENABLE_SILU_MUL_FUSION");
+    return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+// Fuses GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) -> GGML_OP_MUL (out = act(gate) * up) into one
+// kernel, covering both nodes. build_moe_ffn()'s SwiGLU-style activation takes the SILU shape; the
+// dedicated gate/up+SwiGLU dispatch in dispatch-routed-ffn.cpp already fuses that for Q4_K-quantized
+// weights, but declines any other quant type (in particular UD-Q3_K_XL's IQ3_XXS/IQ4_XS routed
+// expert weights, whose own matmul kernel lives in hrx_owned/mul_mat_id_iq.loom). The
+// gated-delta-net (GDN) recurrence separately emits the SIGMOID and SOFTPLUS shapes for its gating
+// projections -- per hrx_owned/unary_f32.loom's header, qwen4exp's decode graph has 496 of these
+// standalone activation nodes (326 SIGMOID, 134 SILU, 36 SOFTPLUS), and every one is consumed by
+// exactly one MUL. Without this, each pair fell through to two separate generic dispatches here --
+// one activation, one MUL -- doubling the command-buffer submissions for all 496. Rooting the
+// match at the MUL (rather than the activation) lets one pass prove both nodes at once and hand the
+// whole pair to a single kernel launch.
+//
+// Opt-in behind HRX_ENABLE_SILU_MUL_FUSION so it can be A/B tested independently of the existing
+// generic activation/MUL dispatches (match_unary_f32_dispatch, match_mul_f32_dispatch below) it
+// competes with; those still fire for any activation/MUL this declines (an unrelated MUL, or an
+// activation with more than one consumer).
+static bool match_silu_mul_f32_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    if (!silu_mul_fusion_enabled()) {
+        return false;
+    }
+    const GraphNode * node = context.root_node;
+    if (node == nullptr || node->op != GGML_OP_MUL || node->inputs.size() != 2 || !context.graph.has_index()) {
+        return false;
+    }
+    const Graph & graph = context.graph;
+    // Either operand may be the activation's producer; both must already be same-shape f32 for the
+    // match below to succeed, so there is no broadcast-direction ambiguity to resolve first.
+    for (int gate_index = 0; gate_index < 2; ++gate_index) {
+        const int          other_index = 1 - gate_index;
+        const GraphNode *  activation   = graph.index().producer(node->inputs[gate_index]);
+        if (activation == nullptr || activation->op != GGML_OP_UNARY || activation->inputs.size() != 1) {
+            continue;
+        }
+        const UnaryParams * params = op_params_as<UnaryParams>(activation->params);
+        if (params == nullptr) {
+            continue;
+        }
+        KernelCatalogRef kernel;
+        switch (params->op) {
+            case GGML_UNARY_OP_SILU:     kernel = kSiluMulF32Kernel;     break;
+            case GGML_UNARY_OP_SIGMOID:  kernel = kSigmoidMulF32Kernel;  break;
+            case GGML_UNARY_OP_SOFTPLUS: kernel = kSoftplusMulF32Kernel; break;
+            default: continue;
+        }
+        const std::vector<const GraphNode *> & consumers = graph.index().consumers(node->inputs[gate_index]);
+        if (consumers.size() != 1 || consumers.front() != node) {
+            continue;  // The activation output feeds something else too; it still has to run unfused.
+        }
+        const Value * gate   = elementwise_graph_value(graph, activation->inputs[0]);
+        const Value * up     = elementwise_graph_value(graph, node->inputs[other_index]);
+        const Value * output = elementwise_graph_value(graph, node->output);
+        if (gate == nullptr || up == nullptr || output == nullptr) {
+            continue;
+        }
+        if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 ||
+            !gate->contiguous || !up->contiguous || !output->contiguous ||
+            !elementwise_same_shape(*gate, *output) || !elementwise_same_shape(*up, *output)) {
+            continue;
+        }
+        if (output->element_count <= 0 ||
+            static_cast<uint64_t>(output->element_count) > std::numeric_limits<uint32_t>::max()) {
+            continue;
+        }
+        if (!append_covered_node_index_once(context.graph, context.covered_nodes, activation, match.covered_nodes)) {
+            continue;  // Activation already claimed by an earlier-registered dispatch; leave this MUL alone.
+        }
+
+        Dispatch dispatch;
+        dispatch.kernel = make_kernel_specialization(kernel);
+        dispatch.kernel.integer_parameters.emplace("element_count", output->element_count);
+        dispatch.bindings.push_back({ gate->id, 0, gate->byte_count });
+        dispatch.bindings.push_back({ up->id, 0, up->byte_count });
+        dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+
+        match.covered_nodes.push_back(context.root_index);
+        match.dispatches.push_back(std::move(dispatch));
+        return true;
+    }
+    return false;
 }
 
 // GGML_OP_MUL. See the header comment on hrx_owned/mul_f32.loom: device_supports_op() has always
@@ -726,6 +817,18 @@ void register_elementwise_dispatches(DispatchRegistryBuilder & registry) {
         0,
         DispatchSource::Common,
         match_scale_f32_dispatch,
+    });
+    registry.add({
+        // Priority 200 so this wins over common.mul_f32 (0) and common.unary_f32 (0) whenever it
+        // matches, folding both nodes into one dispatch. Opt-in (HRX_ENABLE_SILU_MUL_FUSION) so it
+        // can be A/B tested; when disabled it always declines and the two priority-0 fallbacks below
+        // pick the nodes up exactly as before.
+        "common.silu_mul_f32",
+        GGML_OP_MUL,
+        DispatchMatchKind::Fused,
+        200,
+        DispatchSource::Common,
+        match_silu_mul_f32_dispatch,
     });
     registry.add({
         // Priority 0: the routed-FFN dispatch fuses its own MULs and registers above this, so this

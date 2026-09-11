@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -46,6 +47,17 @@ static void apply_graph_replay_result(PreparedCommandProgramCacheExecutionResult
 
 static bool graph_replay_should_fallback(HrxGraphReplayEvent event) {
     return event == HrxGraphReplayEvent::Ineligible || event == HrxGraphReplayEvent::BuildFailed;
+}
+
+// Mirrors the graph-executor.cpp flag of the same name: forces every command through the
+// per-kernel list path so execute_prepared_kernel_command can bracket individual kernel
+// launches with real HIP-event device timing. Diagnostic only.
+static bool hrx_profile_dispatches_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("HRX_PROFILE_DISPATCHES");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
 }
 
 }  // namespace
@@ -119,6 +131,15 @@ PreparedCommandProgramCacheExecutionResult PreparedCommandProgramCache::execute_
     std::lock_guard<std::mutex> entry_lock(entry->mutex);
     if (entry->has_program && entry->program.valid()) {
         record_hit();
+        if (hrx_profile_dispatches_enabled()) {
+            result.graph_replay_event             = HrxGraphReplayEvent::Ineligible;
+            result.graph_replay_ineligible_reason = "profiling_forces_per_kernel_path";
+            result.success = bind_and_execute_prepared_command_program(context, commands, bindings, entry->program);
+            if (!result.success) {
+                result.status.log("execute cached HRX command program failed");
+            }
+            return result;
+        }
         const RecordedCommandGraphExecutionResult replay =
             bind_and_launch_recorded_command_graph(context, commands, bindings, entry->program, entry->recorded);
         apply_graph_replay_result(result, replay);
@@ -155,6 +176,16 @@ PreparedCommandProgramCacheExecutionResult PreparedCommandProgramCache::execute_
     entry->program     = std::move(prepared);
     entry->has_program = true;
     record_build();
+
+    if (hrx_profile_dispatches_enabled()) {
+        result.graph_replay_event             = HrxGraphReplayEvent::Ineligible;
+        result.graph_replay_ineligible_reason = "profiling_forces_per_kernel_path";
+        result.success = bind_and_execute_prepared_command_program(context, commands, bindings, entry->program);
+        if (!result.success) {
+            result.status.log("execute prepared HRX command program failed");
+        }
+        return result;
+    }
 
     const RecordedCommandGraphExecutionResult replay =
         bind_and_launch_recorded_command_graph(context, commands, bindings, entry->program, entry->recorded);

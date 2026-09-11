@@ -27,6 +27,8 @@ Environment is inherited, then HIP/known-good HRX defaults, then Env overrides.
 Inherited LLVM_PATH is removed: a build compiler override can break HIP's internal
 kernel compilation and hang stream creation. Use Env only for deliberate overrides;
 the parent process and machine environment are not modified.
+The known-good defaults include fused Qwen4exp PLE depthwise convolution and SILU
+for 1-8 tokens. Set Env @{ HRX_ENABLE_PLE_CONV_FUSION = '0' } only for comparison.
 Env @{ HRX_ENABLE_TRUSTED_INDEX_VIEWS = '1' } enables replay through validated
 host-index VIEW chains used by recurrent-state gathers. It remains opt-in.
 Env @{ HRX_ENABLE_F32_ROUTER = '1' } enables the Qwen4exp 2560x512 F32
@@ -69,14 +71,14 @@ This model-level opt-in applies equally to HRX and Vulkan; sparse selection
 resumes above the budget. Graph reuse checks include this transition.
 LLAMA_ARG_LOG_VERBOSITY=5 emits dense/sparse branch diagnostics.
 For diagnostic split wall times, set HRX_PROFILE_SPLITS=1 and
-LLAMA_ARG_LOG_VERBOSITY=4. These are not isolated GPU kernel timings;
+use -LogVerbosity 4. These are not isolated GPU kernel timings;
 do not compare instrumented throughput with the normal benchmark runs.
 TopLogprobs 1-20 records pre-sampling token log probabilities in response.json
 for identical-prefix numerical comparisons without reloading model weights.
 Leave it at 0 for throughput comparisons.
-Its fingerprint is stored, not its potentially sensitive values. SWIGLU is not
-enabled by default. MTP defaults off; enable explicitly for the full sidecar.
-MicroBatch > 1 enables the MOE, HC and glue small-batch flags even without MTP.
+Its fingerprint is stored, not its potentially sensitive values.
+MTP defaults off; enable explicitly for the full sidecar.
+MicroBatch > 1 enables the MOE, HC, glue and SWIGLU small-batch paths even without MTP.
 Threads defaults to 1 and KV offload is enabled; use -OffloadKV:$false to disable.
 .EXAMPLE
 .\scripts\run-hrx-resident.ps1 -Prompt 'The capital of France is' -N 16 -ExpectedOutput Paris
@@ -106,6 +108,7 @@ param(
     [ValidateRange(1, 512)][int]$MicroBatch = 8,
     [ValidateRange(512, 32768)][int]$Context = 512,
     [ValidateRange(0, 256)][int]$Threads = 1,
+    [ValidateRange(0, 5)][int]$LogVerbosity = 3,
     [switch]$OffloadKV = $true,
     [ValidateNotNullOrEmpty()][string]$Prompt = 'The capital of France is',
     [string]$PromptFile = '',
@@ -175,7 +178,7 @@ try {
     $options = @{
         Binary = $Binary; Model = $Model; DraftModel = $DraftModel; Mtp = $Mtp.IsPresent
         DraftTokens = $DraftTokens; DraftThreads = $DraftThreads; MicroBatch = $MicroBatch
-        Context = $Context; Threads = $Threads; OffloadKV = $OffloadKV.IsPresent
+        Context = $Context; Threads = $Threads; LogVerbosity = $LogVerbosity; OffloadKV = $OffloadKV.IsPresent
         Port = $Port; HipPath = $HipPath; PinnedBin = $PinnedBin; Env = $Env; ApiKeyFile = $authentication.Path
     }
     $configuration = New-HrxStartupConfiguration $options

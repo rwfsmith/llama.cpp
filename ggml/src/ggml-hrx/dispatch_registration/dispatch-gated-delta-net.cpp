@@ -31,6 +31,8 @@ static constexpr KernelCatalogRef kQwenGdnRecurrentPrefillKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_recurrent_prefill");
 static constexpr KernelCatalogRef kQwenGdnNormGateDecodeKernel =
     GGML_HRX_KERNEL_REF("qwen4exp", "qwen38_gdn_norm_gate_decode");
+static constexpr KernelCatalogRef kPleConvFusionKernel =
+    GGML_HRX_KERNEL_REF("hrx_owned", "ggml_ple_conv_f32");
 
 // qwen4exp GDN decode-only (K=1, single token, single sequence) shape profile. Field names mirror
 // qwen4exp.cpp's build_layer_attn_linear()/build_conv_state_at(), where head_k_dim = head_v_dim =
@@ -110,6 +112,33 @@ static bool gdn_prefill_owns_output(const ggml_tensor & value) {
 
 static bool gdn_prefill_owns_output(const Value & value) {
     return value.alias_source.value < 0;
+}
+
+static bool ple_conv_fusion_enabled() {
+    const char * enabled = std::getenv("HRX_ENABLE_PLE_CONV_FUSION");
+    return enabled != nullptr && enabled[0] == '1' && enabled[1] == '\0';
+}
+
+static bool ple_shifted_cont(const ggml_tensor * op) {
+    if (!ple_conv_fusion_enabled() || op == nullptr || op->op != GGML_OP_CONT ||
+        op->type != GGML_TYPE_F32 || op->ne[0] != 10240 || op->ne[1] < 1 || op->ne[1] > 8 ||
+        op->ne[2] != 1 || op->ne[3] != 1 || !ggml_is_contiguous(op) || op->src[0] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * source = op->src[0];
+    return source->type == GGML_TYPE_F32 && source->ne[0] == 10240 &&
+           source->ne[1] == op->ne[1] &&
+           source->nb[1] == sizeof(float) &&
+           source->nb[0] == static_cast<size_t>(op->ne[1] + 9) * sizeof(float);
+}
+
+static bool ple_weight_cont(const ggml_tensor * op) {
+    return op != nullptr && op->op == GGML_OP_CONT && op->type == GGML_TYPE_F32 &&
+           op->ne[0] == 1 && op->ne[1] == 10240 && op->ne[2] == 1 && op->ne[3] == 1 &&
+           ggml_is_contiguous(op) && op->src[0] != nullptr && op->src[0]->op == GGML_OP_VIEW &&
+           op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 1 &&
+           op->src[0]->ne[1] == 10240 && op->src[0]->nb[0] == sizeof(float) &&
+           op->src[0]->nb[1] == 4 * sizeof(float);
 }
 
 template<class T>
@@ -408,6 +437,172 @@ static NormGateMatch match_qwen4exp_gdn_norm_gate(const Graph & graph, const Gra
 bool supports_gdn_conv_prefill_dispatch(const ggml_tensor * op) {
     return op != nullptr && op->op == GGML_OP_SSM_CONV &&
            gdn_conv_prefill_supported(op->src[0], op->src[1], op);
+}
+
+bool supports_ple_conv_fusion_dispatch(const ggml_tensor * op) {
+    return ple_shifted_cont(op);
+}
+
+struct PleConvTerm {
+    const GraphNode * activation_cont = nullptr;
+    const GraphNode * weight_cont = nullptr;
+    const GraphNode * mul = nullptr;
+    const Value * activation = nullptr;
+    const Value * weight = nullptr;
+};
+
+static const GraphNode * ple_materializing_producer(const Graph & graph, ValueId value) {
+    const GraphNode * producer = graph.index().producer(value);
+    while (producer != nullptr && producer->inputs.size() == 1 &&
+           (producer->op == GGML_OP_RESHAPE || producer->op == GGML_OP_VIEW ||
+            producer->op == GGML_OP_TRANSPOSE || producer->op == GGML_OP_PERMUTE)) {
+        producer = graph.index().producer(producer->inputs[0]);
+    }
+    return producer;
+}
+
+static bool match_ple_conv_term(const Graph & graph, ValueId value, PleConvTerm & term) {
+    const GraphNode * mul = graph.index().producer(value);
+    if (mul == nullptr || mul->op != GGML_OP_MUL || mul->inputs.size() != 2) {
+        return false;
+    }
+    for (ValueId input : mul->inputs) {
+        const GraphNode * producer = ple_materializing_producer(graph, input);
+        const Value * produced = producer == nullptr ? nullptr : graph_value(graph, producer->output);
+        if (producer == nullptr || produced == nullptr || producer->op != GGML_OP_CONT ||
+            producer->inputs.size() != 1) {
+            return false;
+        }
+        if (ple_shifted_cont(produced->tensor)) {
+            term.activation_cont = producer;
+            term.activation = graph_value(graph, producer->inputs[0]);
+        } else if (ple_weight_cont(produced->tensor)) {
+            term.weight_cont = producer;
+            term.weight = graph_value(graph, producer->inputs[0]);
+        } else {
+            return false;
+        }
+    }
+    term.mul = mul;
+    return term.activation_cont != nullptr && term.weight_cont != nullptr &&
+           term.activation != nullptr && term.weight != nullptr;
+}
+
+static bool match_ple_conv_fusion_dispatch(const DispatchMatchContext & context, DispatchMatch & match) {
+    const GraphNode * root = context.root_node;
+    const Value * root_output = root == nullptr ? nullptr : graph_value(context.graph, root->output);
+    if (!ple_conv_fusion_enabled() || root == nullptr || root->op != GGML_OP_CONT ||
+        root->inputs.size() != 1 || root_output == nullptr ||
+        !ple_shifted_cont(root_output->tensor) || !context.graph.has_index()) {
+        return false;
+    }
+
+    const auto & root_consumers = context.graph.index().consumers(root->output);
+    if (root_consumers.size() != 1 || root_consumers.front()->op != GGML_OP_MUL) {
+        return false;
+    }
+    const GraphNode * term0_mul = root_consumers.front();
+    const auto & term0_consumers = context.graph.index().consumers(term0_mul->output);
+    if (term0_consumers.size() != 1 || term0_consumers.front()->op != GGML_OP_ADD) {
+        return false;
+    }
+    const GraphNode * add0 = term0_consumers.front();
+    const auto & add0_consumers = context.graph.index().consumers(add0->output);
+    if (add0_consumers.size() != 1 || add0_consumers.front()->op != GGML_OP_ADD) {
+        return false;
+    }
+    const GraphNode * add1 = add0_consumers.front();
+    const auto & add1_consumers = context.graph.index().consumers(add1->output);
+    if (add1_consumers.size() != 1 || add1_consumers.front()->op != GGML_OP_ADD) {
+        return false;
+    }
+    const GraphNode * add2 = add1_consumers.front();
+    const auto & add2_consumers = context.graph.index().consumers(add2->output);
+    if (add2_consumers.size() != 1 || add2_consumers.front()->op != GGML_OP_UNARY) {
+        return false;
+    }
+    const GraphNode * silu = add2_consumers.front();
+    const UnaryParams * params = op_params_as<UnaryParams>(silu->params);
+    const Value * output = graph_value(context.graph, silu->output);
+    if (params == nullptr || params->op != GGML_UNARY_OP_SILU || output == nullptr ||
+        output->type != GGML_TYPE_F32 || output->ne[0] != 10240 ||
+        output->ne[1] < 1 || output->ne[1] > 8 || output->ne[2] != 1 ||
+        output->ne[3] != 1 || !output->contiguous) {
+        return false;
+    }
+
+    ValueId term1_id;
+    for (ValueId input : add0->inputs) {
+        if (input != term0_mul->output) {
+            term1_id = input;
+        }
+    }
+    ValueId term2_id;
+    for (ValueId input : add1->inputs) {
+        if (input != add0->output) {
+            term2_id = input;
+        }
+    }
+    ValueId term3_id;
+    for (ValueId input : add2->inputs) {
+        if (input != add1->output) {
+            term3_id = input;
+        }
+    }
+    if (term1_id.value < 0 || term2_id.value < 0 || term3_id.value < 0) {
+        return false;
+    }
+    const ValueId term_ids[4] = { term0_mul->output, term1_id, term2_id, term3_id };
+    PleConvTerm terms[4];
+    for (int i = 0; i < 4; ++i) {
+        if (!match_ple_conv_term(context.graph, term_ids[i], terms[i])) {
+            return false;
+        }
+        const Value * activation_output = graph_value(context.graph, terms[i].activation_cont->output);
+        if (activation_output == nullptr || activation_output->ne[1] != output->ne[1]) {
+            return false;
+        }
+    }
+    for (int i = 1; i < 4; ++i) {
+        if (terms[i].activation->storage != terms[0].activation->storage ||
+            terms[i].weight->storage != terms[0].weight->storage ||
+            terms[i].activation->storage_offset != terms[0].activation->storage_offset +
+                                                   static_cast<size_t>(3 * i) * sizeof(float) ||
+            terms[i].weight->storage_offset != terms[0].weight->storage_offset +
+                                               static_cast<size_t>(i) * sizeof(float)) {
+            return false;
+        }
+    }
+
+    for (const PleConvTerm & term : terms) {
+        if (!append_covered_node(context, term.activation_cont, match) ||
+            !append_covered_node(context, term.weight_cont, match) ||
+            !append_covered_node(context, term.mul, match)) {
+            return false;
+        }
+    }
+    for (const GraphNode * node : { add0, add1, add2, silu }) {
+        if (!append_covered_node(context, node, match)) {
+            return false;
+        }
+    }
+
+    Dispatch dispatch;
+    dispatch.kernel = make_kernel_specialization(kPleConvFusionKernel);
+    dispatch.kernel.integer_parameters.emplace("token_count", output->ne[1]);
+    for (const PleConvTerm & term : terms) {
+        const size_t activation_bytes =
+            (static_cast<size_t>(10239) * term.activation->nb[0] +
+             static_cast<size_t>(output->ne[1]) * sizeof(float));
+        const size_t weight_bytes = static_cast<size_t>(10239) * term.weight->nb[1] + sizeof(float);
+        dispatch.bindings.push_back({
+            term.activation->storage_root, term.activation->storage_offset, activation_bytes });
+        dispatch.bindings.push_back({
+            term.weight->storage_root, term.weight->storage_offset, weight_bytes });
+    }
+    dispatch.bindings.push_back({ output->id, 0, output->byte_count });
+    match.dispatches.push_back(std::move(dispatch));
+    return true;
 }
 
 static bool match_qwen4exp_gdn_conv_prefill_dispatch(const DispatchMatchContext & context,
@@ -803,6 +998,14 @@ static bool match_qwen4exp_gdn_norm_gate_decode_dispatch(const DispatchMatchCont
 }
 
 void register_gdn_dispatches(DispatchRegistryBuilder & registry) {
+    registry.add({
+        "qwen4exp.ple_conv_fusion",
+        GGML_OP_CONT,
+        DispatchMatchKind::Fused,
+        1100,
+        DispatchSource::Qwen,
+        match_ple_conv_fusion_dispatch,
+    });
     registry.add({
         "qwen4exp.gdn_conv_prefill",
         GGML_OP_SSM_CONV,

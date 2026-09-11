@@ -4,6 +4,7 @@
 #include "dispatch/command-program-resolver.h"
 #include "dispatch/command-program.h"
 #include "kernel-corpus/kernel-corpus.h"
+#include "runtime/device-timing.h"
 #include "runtime/graph-replay.h"
 #include "runtime/host-memory.h"
 
@@ -34,6 +35,9 @@ struct CommandProgramExecutionContext {
     TransientArena *        transient_arena    = nullptr;
     HostTransferManager *   host_transfers     = nullptr;
     HostWeightCache *       host_weights       = nullptr;
+    // Only consulted when HRX_PROFILE_DISPATCHES forces per-kernel device-time measurement;
+    // nullptr is safe (profiling is simply skipped) for callers that do not wire it through.
+    DeviceTimingManager *   device_timing      = nullptr;
 };
 
 struct PreparedCommandBinding {

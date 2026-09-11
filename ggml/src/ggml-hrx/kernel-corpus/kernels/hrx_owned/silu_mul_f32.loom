@@ -1,0 +1,209 @@
+// Copyright 2026 The HRX Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Fused act(gate) * up (GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) followed by
+// GGML_OP_MUL) for three gated-activation shapes qwen4exp's decode graph
+// emits directly (not through GGML_OP_GLU): the routed/shared FFN's SiLU
+// epilogue after gate/up projections the dedicated Q4_K SwiGLU dispatch
+// (dispatch-routed-ffn.cpp) does not cover (in particular IQ3_XXS/IQ4_XS
+// UD-Q3_K_XL expert weights), and the gated-delta-net (GDN) recurrence's
+// SIGMOID- and SOFTPLUS-gated projections. hrx_owned/unary_f32.loom's own
+// header measured 496 of these standalone activation nodes per decode graph
+// (326 SIGMOID, 134 SILU, 36 SOFTPLUS) -- each already runs as its own GPU
+// dispatch (dispatch-unary.cpp keeps them off the CPU), but every one is
+// immediately consumed by exactly one MUL, so each pair is still two
+// command-buffer submissions and a synchronization where one would do.
+// Fusing them into a single kernel halves that dispatch count for every
+// occurrence this matches.
+//
+// Both operands are known equal-shape f32 tensors by the time
+// dispatch-elementwise.cpp's match_silu_mul_f32_dispatch() proves the pattern
+// (SILU/SIGMOID/SOFTPLUS with a single MUL consumer, both contiguous, matching
+// shapes), so this is a flat %element_count map exactly like
+// hrx_owned/unary_f32.loom -- no broadcast handling is needed here.
+
+amdgpu.target<gfx11-generic> @ggml_silu_mul_gfx11_wave64 {subgroup_size = 64}
+
+kernel.def target(@ggml_silu_mul_gfx11_wave64) export("ggml_silu_mul_f32") @ggml_silu_mul_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %gate: buffer, %up: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %gate_noalias, %up_noalias, %output_noalias = buffer.assume.noalias %gate, %up, %output : buffer, buffer, buffer
+  %gate_view = buffer.view %gate_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %up_view = buffer.view %up_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %gate_value = view.load %gate_view[%linear] : view<[%count]xf32> -> f32
+    %up_value = view.load %up_view[%linear] : view<[%count]xf32> -> f32
+    // ggml op_silu: x/(1 + expf(-x)). Same intrinsic hrx_owned/unary_f32.loom uses.
+    %silu_value = scalar.siluf %gate_value : f32
+    %result = scalar.mulf %silu_value, %up_value : f32
+    view.store %result, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+kernel.def target(@ggml_silu_mul_gfx11_wave64) export("ggml_sigmoid_mul_f32") @ggml_sigmoid_mul_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %gate: buffer, %up: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %gate_noalias, %up_noalias, %output_noalias = buffer.assume.noalias %gate, %up, %output : buffer, buffer, buffer
+  %gate_view = buffer.view %gate_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %up_view = buffer.view %up_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %gate_value = view.load %gate_view[%linear] : view<[%count]xf32> -> f32
+    %up_value = view.load %up_view[%linear] : view<[%count]xf32> -> f32
+    // ggml op_sigmoid: 1/(1 + expf(-x)). Same intrinsic hrx_owned/unary_f32.loom uses.
+    %sigmoid_value = scalar.logisticf<afn> %gate_value : f32
+    %result = scalar.mulf %sigmoid_value, %up_value : f32
+    view.store %result, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+kernel.def target(@ggml_silu_mul_gfx11_wave64) export("ggml_softplus_mul_f32") @ggml_softplus_mul_f32(%element_count: index) {
+  %one = index.constant 1 : index
+  %twofiftysix = index.constant 256 : index
+  %rounding = index.constant 255 : index
+  %rounded = index.add %element_count, %rounding : index
+  %workgroup_count = index.div %rounded, %twofiftysix : index
+  kernel.launch.config workgroups(%workgroup_count, %one, %one) workgroup_size(%twofiftysix, %one, %one) : index
+} launch(%element_count: index, %gate: buffer, %up: buffer, %output: buffer) {
+  %count = index.assume %element_count [range(%element_count, 1, 134217728)] : index
+  %workgroup = kernel.workgroup.id<x> : index
+  %workitem = kernel.workitem.id<x> : index
+  %twofiftysix = index.constant 256 : index
+  %base0 = index.mul %workgroup, %twofiftysix : index
+  %linear0 = index.add %base0, %workitem : index
+  %linear = index.assume %linear0 [range(%linear0, 0, 134217983)] : index
+  %in_bounds = index.cmp ult, %linear, %count : index
+  %zero_offset = index.constant 0 : offset
+  %gate_noalias, %up_noalias, %output_noalias = buffer.assume.noalias %gate, %up, %output : buffer, buffer, buffer
+  %gate_view = buffer.view %gate_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %up_view = buffer.view %up_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  %output_view = buffer.view %output_noalias[%zero_offset] : buffer -> view<[%count]xf32>
+  scf.if %in_bounds {
+    %gate_value = view.load %gate_view[%linear] : view<[%count]xf32> -> f32
+    %up_value = view.load %up_view[%linear] : view<[%count]xf32> -> f32
+    // ggml op_softplus: (x > 20) ? x : logf(1 + expf(x)). Same saturation
+    // guard hrx_owned/unary_f32.loom uses -- qwen4exp feeds this the raw
+    // ssm_dt projection, which is unbounded, and expf(x) overflows near x==88.
+    %twenty = scalar.constant 20.0 : f32
+    %saturated = scalar.cmpf ogt, %gate_value, %twenty : f32
+    %exponential = scalar.expf<afn> %gate_value : f32
+    %unit = scalar.constant 1.0 : f32
+    %shifted = scalar.addf %exponential, %unit : f32
+    %logarithm = scalar.logf<afn> %shifted : f32
+    %softplus_value = scf.select %saturated, %gate_value, %logarithm : f32
+    %result = scalar.mulf %softplus_value, %up_value : f32
+    view.store %result, %output_view[%linear] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}
+
+check.case public @ggml_silu_mul_f32_known_case {
+  %four = check.literal value(4) : index
+  // silu(0) == 0, so 0 * up == 0 regardless of up -- covers the "does it even
+  // read up" question the trivial gate value alone would miss.
+  %gate = check.generate.fill value(0.0) : tensor<4xf32>
+  %up = check.generate.fill value(7.0) : tensor<4xf32>
+  %output = check.generate.fill value(1.0) : tensor<4xf32>
+  %expected = check.generate.fill value(0.0) : tensor<4xf32>
+  func.call @ggml_silu_mul_f32(%four, %gate, %up, %output) : (index, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.case public @ggml_silu_mul_f32_nontrivial_case {
+  %four = check.literal value(4) : index
+  // silu(2) == 2 * sigmoid(2) == 2 / (1 + exp(-2)) == 1.7615941559557649.
+  // Times up=3.0 == 5.284782467867295.
+  %gate = check.generate.fill value(2.0) : tensor<4xf32>
+  %up = check.generate.fill value(3.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<4xf32>
+  %expected = check.generate.fill value(5.284782467867295) : tensor<4xf32>
+  func.call @ggml_silu_mul_f32(%four, %gate, %up, %output) : (index, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.00001) rtol(0.00001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@ggml_silu_mul_f32_nontrivial_case> @ggml_silu_mul_f32_small
+
+check.case public @ggml_sigmoid_mul_f32_known_case {
+  %four = check.literal value(4) : index
+  // sigmoid(0) == 0.5, times up=7.0 == 3.5.
+  %gate = check.generate.fill value(0.0) : tensor<4xf32>
+  %up = check.generate.fill value(7.0) : tensor<4xf32>
+  %output = check.generate.fill value(1.0) : tensor<4xf32>
+  %expected = check.generate.fill value(3.5) : tensor<4xf32>
+  func.call @ggml_sigmoid_mul_f32(%four, %gate, %up, %output) : (index, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.000001) rtol(0.000001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.case public @ggml_sigmoid_mul_f32_nontrivial_case {
+  %four = check.literal value(4) : index
+  // sigmoid(2) == 1/(1+exp(-2)) == 0.8807970779778823. Times up=3.0 == 2.642391233933647.
+  %gate = check.generate.fill value(2.0) : tensor<4xf32>
+  %up = check.generate.fill value(3.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<4xf32>
+  %expected = check.generate.fill value(2.642391233933647) : tensor<4xf32>
+  func.call @ggml_sigmoid_mul_f32(%four, %gate, %up, %output) : (index, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.00001) rtol(0.00001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@ggml_sigmoid_mul_f32_nontrivial_case> @ggml_sigmoid_mul_f32_small
+
+check.case public @ggml_softplus_mul_f32_known_case {
+  %four = check.literal value(4) : index
+  // softplus(0) == log(2) == 0.6931471805599453. Times up=7.0 == 4.852030263919617.
+  %gate = check.generate.fill value(0.0) : tensor<4xf32>
+  %up = check.generate.fill value(7.0) : tensor<4xf32>
+  %output = check.generate.fill value(1.0) : tensor<4xf32>
+  %expected = check.generate.fill value(4.852030263919617) : tensor<4xf32>
+  func.call @ggml_softplus_mul_f32(%four, %gate, %up, %output) : (index, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.00001) rtol(0.00001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.case public @ggml_softplus_mul_f32_saturated_case {
+  %four = check.literal value(4) : index
+  // softplus(30) == 30 exactly (the saturation arm), times up=2.0 == 60.0.
+  %gate = check.generate.fill value(30.0) : tensor<4xf32>
+  %up = check.generate.fill value(2.0) : tensor<4xf32>
+  %output = check.generate.fill value(0.0) : tensor<4xf32>
+  %expected = check.generate.fill value(60.0) : tensor<4xf32>
+  func.call @ggml_softplus_mul_f32(%four, %gate, %up, %output) : (index, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
+  check.expect.close actual(%output) expected(%expected) atol(0.0001) rtol(0.0001) nan(same) : tensor<4xf32>
+  check.return
+}
+
+check.benchmark<@ggml_softplus_mul_f32_known_case> @ggml_softplus_mul_f32_small

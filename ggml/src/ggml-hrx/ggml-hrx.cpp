@@ -871,8 +871,9 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
     // calls ggml_backend_synchronize() itself. Retire the compute stream here so the buffer interface and
     // any host readback are guaranteed to see completed work.
     const bool synchronized = HRX_CHECK(hrx_stream_synchronize(context->stream));
+    std::optional<double> device_ms;
     if (synchronized) {
-        context->device_timing.finish_graph_measurement(device_measurement);
+        device_ms = context->device_timing.finish_graph_measurement(device_measurement);
     } else {
         context->device_timing.cancel_graph_measurement(device_measurement);
     }
@@ -887,10 +888,12 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
         static uint64_t nodes     = 0;
         static double   submit_ms = 0.0;
         static double   sync_wait_ms = 0.0;
+        static double   device_total_ms = 0.0;
         splits += 1;
         nodes += static_cast<uint64_t>(graph->n_nodes);
         submit_ms += elapsed(t_entry, t_submitted);
         sync_wait_ms += elapsed(t_submitted, t_synced);
+        device_total_ms += device_ms.value_or(0.0);
         if (profile_splits && graph->n_nodes > 0) {
             int first_index = 0;
             int last_index = graph->n_nodes - 1;
@@ -903,18 +906,21 @@ static enum ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * grap
             const ggml_tensor * first = graph->nodes[first_index];
             const ggml_tensor * last = graph->nodes[last_index];
             // These are host wall times for a split, not isolated device kernel durations.
-            GGML_LOG_INFO("HRX split cost: ok=%d nodes=%d submit_ms=%.6f wait_ms=%.6f "
+            GGML_LOG_INFO("HRX split cost: ok=%d nodes=%d submit_ms=%.6f wait_ms=%.6f device_ms=%.6f "
                           "first=%s[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
                           "src_type=%s last=%s[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
                           result.success() && synchronized ? 1 : 0, graph->n_nodes,
                           elapsed(t_entry, t_submitted), elapsed(t_submitted, t_synced),
+                          device_ms.value_or(-1.0),
                           ggml_op_desc(first), first->ne[0], first->ne[1], first->ne[2], first->ne[3],
                           first->src[0] ? ggml_type_name(first->src[0]->type) : "none",
                           ggml_op_desc(last), last->ne[0], last->ne[1], last->ne[2], last->ne[3]);
         }
         if (splits % kHrxTimeReportInterval == 0) {
-            GGML_LOG_INFO("HRX time: splits=%" PRIu64 " nodes=%" PRIu64 " submit=%.1fms sync_wait=%.1fms total=%.1fms\n",
-                          splits, nodes, submit_ms, sync_wait_ms, submit_ms + sync_wait_ms);
+            GGML_LOG_INFO("HRX time: splits=%" PRIu64 " nodes=%" PRIu64
+                          " submit=%.1fms sync_wait=%.1fms device=%.1fms total=%.1fms\n",
+                          splits, nodes, submit_ms, sync_wait_ms, device_total_ms,
+                          submit_ms + sync_wait_ms);
         }
     }
     hrx_verify_after(context, captures);
@@ -2527,7 +2533,8 @@ static bool device_supports_op(ggml_backend_dev_t device, const ggml_tensor * op
         // and the SSM_CONV, so leaving it on the CPU splits the conv-prepare chain across backends and
         // strands the CONCAT in a split of its own where no matcher can root at it.
         case GGML_OP_CONT:
-            return hrx_copy_f32_supported(op) || ggml::hrx::supports_qsa_mask_dispatch(op);
+            return hrx_copy_f32_supported(op) || ggml::hrx::supports_ple_conv_fusion_dispatch(op) ||
+                   ggml::hrx::supports_qsa_mask_dispatch(op);
         case GGML_OP_FILL:
             return ggml::hrx::supports_qsa_mask_dispatch(op);
         // Each remaining guard names a specific qwen4exp shape that no matcher roots at. The GDN

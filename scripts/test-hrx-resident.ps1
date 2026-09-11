@@ -35,7 +35,8 @@ try {
     $base = @{
         Binary = $binary; Model = $model; DraftModel = $draft; Mtp = $false
         DraftTokens = 1; DraftThreads = 0; MicroBatch = 8; Context = 512
-        Threads = 1; OffloadKV = $true; Port = 8087; HipPath = $fixture; PinnedBin = $dllDir; Env = @{}
+        Threads = 1; LogVerbosity = 3; OffloadKV = $true; Port = 8087
+        HipPath = $fixture; PinnedBin = $dllDir; Env = @{}
     }
     function Get-TestFingerprint($Options) {
         $configuration = New-HrxStartupConfiguration $Options
@@ -48,9 +49,11 @@ try {
     Assert-Test (($configuration.Arguments -join ' ') -match '-np 1') 'one server worker'
     Assert-Test (($configuration.Arguments -join ' ') -match '--host 127.0.0.1') 'loopback only'
     Assert-Test (($configuration.Arguments -join ' ') -match '-t 1 -tb 1') 'single CPU thread profile'
+    Assert-Test (($configuration.Arguments -join ' ') -match '-lv 3') 'default log verbosity'
     Assert-Test ($configuration.Arguments -notcontains '-nkvo') 'KV offload profile'
     Assert-Test ($configuration.Environment.HRX_ENABLE_Q8_GEMV -eq '0') 'Q8 GEMV stays disabled'
     Assert-Test ($configuration.Environment.HRX_MUL_CLAIM_MASK -eq '0x7F') 'known-good claim mask'
+    Assert-Test ($configuration.Environment.HRX_ENABLE_PLE_CONV_FUSION -eq '1') 'PLE convolution fusion enabled by default'
     Assert-Test ($configuration.Models.Count -eq 1) 'MTP is opt-in'
     $previousLlvmPath = $env:LLVM_PATH
     try {
@@ -85,19 +88,25 @@ try {
     Assert-Test (($withKeyConfiguration.Arguments -join ' ') -match
         [regex]::Escape("--api-key-file $($withKey.ApiKeyFile)")) 'api key file is passed via argument'
     Assert-Test (-not $withKeyConfiguration.Environment.ContainsKey('LLAMA_ARG_API_KEY_FILE')) 'api key file argument does not leak into environment'
-    foreach ($flag in @('MOE_SMALL_BATCH', 'HC_SMALL_BATCH', 'SMALL_BATCH_GLUE')) {
+    foreach ($flag in @('MOE_SMALL_BATCH', 'HC_SMALL_BATCH', 'SMALL_BATCH_GLUE', 'SWIGLU')) {
         Assert-Test ($configuration.Environment["HRX_ENABLE_$flag"] -eq '1') "$flag enabled for non-MTP microbatch > 1"
     }
-    $override = $base.Clone(); $override.Env = @{ HRX_ENABLE_SMALL_BATCH_GLUE = '0'; HRX_ENABLE_SWIGLU = '1' }
+    $override = $base.Clone()
+    $override.Env = @{
+        HRX_ENABLE_SMALL_BATCH_GLUE = '0'
+        HRX_ENABLE_SWIGLU = '0'
+        HRX_ENABLE_PLE_CONV_FUSION = '0'
+    }
     $overrideConfiguration = New-HrxStartupConfiguration $override
     Assert-Test ($overrideConfiguration.Environment.HRX_ENABLE_SMALL_BATCH_GLUE -eq '0') 'explicit Env overrides small-batch defaults'
-    Assert-Test ($overrideConfiguration.Environment.HRX_ENABLE_SWIGLU -eq '1') 'SWIGLU can be explicitly enabled'
+    Assert-Test ($overrideConfiguration.Environment.HRX_ENABLE_SWIGLU -eq '0') 'SWIGLU can be explicitly disabled'
+    Assert-Test ($overrideConfiguration.Environment.HRX_ENABLE_PLE_CONV_FUSION -eq '0') 'PLE convolution fusion can be explicitly disabled'
     foreach ($field in @('Prompt', 'PromptFile', 'Seed', 'Temperature', 'N', 'TopLogprobs', 'ExpectedOutput', 'CachePrompt', 'Tag')) {
         $changed = $base.Clone(); $changed[$field] = 'different-request'
         Assert-Test ($baseline -eq (Get-TestFingerprint $changed)) "$field does not restart"
     }
     foreach ($entry in @{
-        Context = 1024; Threads = 4; MicroBatch = 4; OffloadKV = $false
+        Context = 1024; Threads = 4; LogVerbosity = 5; MicroBatch = 4; OffloadKV = $false
         Mtp = $true; Port = 8088; Env = @{ HRX_ENABLE_Q8_GEMV = '1' }
     }.GetEnumerator()) {
         $changed = $base.Clone(); $changed[$entry.Key] = $entry.Value

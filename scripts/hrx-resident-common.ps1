@@ -232,13 +232,16 @@ function New-HrxStartupConfiguration($Options) {
     $environment.HIP_DEVICE_LIB_PATH = Join-Path $Options.HipPath 'lib\llvm\amdgcn\bitcode'
     $environment.PATH = "$(Join-Path $Options.HipPath 'bin');$($Options.PinnedBin);$($environment.PATH)"
     foreach ($flag in @('IQ_EXPERTS', 'Q8_NARROW', 'Q8_EMBEDDING', 'SET_ROWS', 'F32_GET_ROWS',
-                         'REPEAT', 'QSA_ATTN', 'DENSE_F32_ACCUM', 'GDN_NORM_GATE')) {
+                         'REPEAT', 'QSA_ATTN', 'QSA_ROPE', 'DENSE_F32_ACCUM', 'GDN_NORM_GATE',
+                         'PLE_CONV_FUSION', 'F32_ROUTER', 'QWEN4EXP_ROUTER',
+                         'RECURRENT_CONCAT', 'GDN_CONV_PREFILL', 'GDN_PREFILL', 'GDN_NORM_PREFILL',
+                         'QSA_MASK', 'QSA_PROJECTIONS', 'QSA_F16_GATHER', 'TRUSTED_INDEX_VIEWS')) {
         $environment["HRX_ENABLE_$flag"] = '1'
     }
     $environment.HRX_ENABLE_Q8_GEMV = '0'
     $environment.HRX_MUL_CLAIM_MASK = '0x7F'
     if ($Options.MicroBatch -gt 1 -or $Options.Mtp) {
-        foreach ($flag in @('MOE_SMALL_BATCH', 'HC_SMALL_BATCH', 'SMALL_BATCH_GLUE')) {
+        foreach ($flag in @('MOE_SMALL_BATCH', 'HC_SMALL_BATCH', 'SMALL_BATCH_GLUE', 'SWIGLU')) {
             $environment["HRX_ENABLE_$flag"] = '1'
         }
     }
@@ -262,7 +265,8 @@ function New-HrxStartupConfiguration($Options) {
     $environment.Remove('LLAMA_ARG_API_KEY_FILE')
     $arguments = @('-m', $Options.Model, '-ngl', '99', '-fit', 'off', '--no-warmup', '-fa', 'on',
         '-b', '512', '-ub', "$($Options.MicroBatch)", '-c', "$($Options.Context)",
-        '-np', '1', '--host', '127.0.0.1', '--port', "$($Options.Port)", '--jinja')
+        '-np', '1', '--host', '127.0.0.1', '--port', "$($Options.Port)", '--jinja',
+        '-lv', "$($Options.LogVerbosity)")
     if ($Options.ContainsKey('ApiKeyFile')) {
         $arguments += @('--api-key-file', $Options.ApiKeyFile)
     }

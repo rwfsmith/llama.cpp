@@ -236,6 +236,12 @@
       "owner": "ggml-hrx"
     },
     {
+      "path": "../hrx_owned/silu_mul_f32.loom",
+      "sha256": "1aceb696ba32cee6fd29a3cf45e9c45402ae44a016e55c6355ac2b8a8469e6be",
+      "size": 12099,
+      "owner": "ggml-hrx"
+    },
+    {
       "path": "../hrx_owned/repeat_f32.loom",
       "sha256": "8b67ce436ef9ecb3c06219c0ba72a10c527ad2c5513714d188426b3fd2252573",
       "size": 6780,
@@ -553,6 +559,114 @@
         "mode": "direct",
         "primary_sources": [
           "../hrx_owned/mul_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_silu_mul_f32",
+      "symbol": "ggml_silu_mul_f32",
+      "source": "../hrx_owned/silu_mul_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "gate",
+        "up",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/silu_mul_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_sigmoid_mul_f32",
+      "symbol": "ggml_sigmoid_mul_f32",
+      "source": "../hrx_owned/silu_mul_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "gate",
+        "up",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/silu_mul_f32.loom"
+        ],
+        "library_sources": []
+      },
+      "compile_dependencies": []
+    },
+    {
+      "name": "ggml_softplus_mul_f32",
+      "symbol": "ggml_softplus_mul_f32",
+      "source": "../hrx_owned/silu_mul_f32.loom",
+      "workload_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "launch_parameters": [
+        {
+          "name": "element_count",
+          "type": "index"
+        }
+      ],
+      "bindings": [
+        "gate",
+        "up",
+        "output"
+      ],
+      "binding_access": [
+        "read",
+        "read",
+        "read_write"
+      ],
+      "target_selector": "",
+      "compile_recipe": {
+        "mode": "direct",
+        "primary_sources": [
+          "../hrx_owned/silu_mul_f32.loom"
         ],
         "library_sources": []
       },

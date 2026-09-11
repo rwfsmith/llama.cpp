@@ -11,6 +11,7 @@ bool supports_gdn_prefill_dispatch(const ggml_tensor * op);
 // HRX_ENABLE_GDN_CONV_PREFILL=1: dense F32 four-tap SSM_CONV, T=2..8,
 // 10240 channels, one sequence. CONCAT, SILU and history writes stay separate.
 bool supports_gdn_conv_prefill_dispatch(const ggml_tensor * op);
+bool supports_ple_conv_fusion_dispatch(const ggml_tensor * op);
 
 void register_gdn_dispatches(DispatchRegistryBuilder & registry);
 

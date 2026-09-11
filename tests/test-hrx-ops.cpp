@@ -6247,6 +6247,7 @@ static void run_swiglu_reference_checks() {
 #include "test-hrx-dense-f32-gemv.inc"
 #include "test-hrx-gdn-norm-prefill.inc"
 #include "test-hrx-qsa-mask.inc"
+#include "test-hrx-ple-conv-fusion.inc"
 
 int main(int argc, char ** argv) {
     bool q8_selected = false;
@@ -6293,6 +6294,7 @@ int main(int argc, char ** argv) {
     bool qsa_mask_selected = false;
     bool qsa_mask_schedule_selected = false;
     bool qsa_mask_schedule_only = argc > 1;
+    bool ple_conv_fusion_selected = false;
     bool q8_benchmark = false;
     for (int i = 1; i < argc; ++i) {
         qsa_mask_schedule_only = qsa_mask_schedule_only &&
@@ -6383,6 +6385,8 @@ int main(int argc, char ** argv) {
             qsa_mask_selected = true;
         } else if (std::strcmp(argv[i], "--qsa-mask-scheduling") == 0) {
             qsa_mask_schedule_selected = true;
+        } else if (std::strcmp(argv[i], "--ple-conv-fusion") == 0) {
+            ple_conv_fusion_selected = true;
         } else if (std::strcmp(argv[i], "--q8-benchmark") == 0) {
             q8_selected = true;
             q8_benchmark = true;
@@ -6396,7 +6400,8 @@ int main(int argc, char ** argv) {
                 " [--set-rows-trusted-producer] [--f32-get-rows-scheduling] [--trusted-index-views]"
                 " [--f32-router] [--recurrent-concat] [--qsa-projections] [--qsa-glue] [--qsa-rope]"
                 " [--gdn-prefill] [--gdn-conv-prefill] [--gdn-norm-prefill] [--qsa-f16-gather] [--device-rebind]"
-                " [--qsa-dense-bypass] [--qsa-mask] [--qsa-mask-scheduling] [--q8-benchmark]\n", argv[0]);
+                " [--qsa-dense-bypass] [--qsa-mask] [--qsa-mask-scheduling] [--ple-conv-fusion]"
+                " [--q8-benchmark]\n", argv[0]);
             return 1;
         }
     }
@@ -6406,6 +6411,7 @@ int main(int argc, char ** argv) {
     ScopedHrxEnvironment dense_rounded_default("HRX_ENABLE_DENSE_ROUNDED_GEMV", "0");
     ScopedHrxEnvironment gdn_norm_default("HRX_ENABLE_GDN_NORM_PREFILL", "0");
     ScopedHrxEnvironment qsa_mask_default("HRX_ENABLE_QSA_MASK", "0");
+    ScopedHrxEnvironment ple_conv_fusion_default("HRX_ENABLE_PLE_CONV_FUSION", "0");
     ScopedHrxEnvironment iq_default("HRX_ENABLE_IQ_PACKET4", "0");
     const bool selected_only = argc > 1;
     if (!selected_only || qsa_mask_selected || qsa_mask_schedule_selected) {
@@ -6613,6 +6619,9 @@ int main(int argc, char ** argv) {
         if (qsa_mask_selected) {
             run_qsa_mask_reference_checks();
         }
+        if (ple_conv_fusion_selected) {
+            run_ple_conv_fusion_reference_checks();
+        }
         if (device_rebind_selected) {
             run_device_binding_refresh_checks();
         }
@@ -6678,6 +6687,7 @@ int main(int argc, char ** argv) {
     run_gdn_norm_prefill_checks();
     run_token_embedding_q4k_cpu_reference_case();
     run_qsa_mask_reference_checks();
+    run_ple_conv_fusion_reference_checks();
     run_q8_embedding_reference_checks();
     run_q4_embedding_reference_checks();
     run_dense_matmul_cpu_reference_case(GGML_TYPE_Q4_K, "qwen3_moe:qwen3_moe_dense_linear_q4k_f16_wmma", 2, 128);

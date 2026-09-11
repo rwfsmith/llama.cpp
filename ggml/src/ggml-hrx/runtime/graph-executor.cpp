@@ -38,6 +38,15 @@ static bool hrx_prepared_fast_path_disabled() {
     return disabled;
 }
 
+// Forces every dispatch through the per-kernel command-list path (bypassing both the trusted-graph
+// fast path here and HIP-graph replay in the prepared-command-program cache) so execute_prepared_kernel_command
+// can bracket each individual kernel launch with a real HIP-event device-time measurement. Diagnostic only:
+// this serializes on the GPU per kernel and is far slower than normal operation.
+static bool hrx_profile_dispatches_enabled() {
+    static const bool enabled = hrx_environment_flag("HRX_PROFILE_DISPATCHES");
+    return enabled;
+}
+
 // Attribute executor wall time to its four phases. Execution includes host-staging transfers and synchronization.
 static bool hrx_time_compute_enabled() {
     static const bool enabled = hrx_environment_flag("HRX_TIME_COMPUTE");
@@ -135,7 +144,7 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
         return result;
     }
 
-    const bool use_graph_prepared = !hrx_prepared_fast_path_disabled() &&
+    const bool use_graph_prepared = !hrx_prepared_fast_path_disabled() && !hrx_profile_dispatches_enabled() &&
                                     (!lookup.program->has_prepared_program() ||
                                      lookup.program->can_use_prepared_fast_path(graph));
     const clock::time_point t_looked_up = timing ? clock::now() : clock::time_point{};
@@ -165,6 +174,7 @@ GraphExecutionResult GraphExecutor::execute(const ggml_cgraph & graph) const {
         &context_.transient_arena,
         &context_.host_transfers,
         &context_.host_weights,
+        &context_.device_timing,
     };
     const PreparedCommandProgramCacheExecutionResult execution =
         use_graph_prepared ? lookup.program->execute_with_result(execution_context, bindings) :

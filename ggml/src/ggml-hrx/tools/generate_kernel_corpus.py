@@ -323,6 +323,12 @@ def with_owned_kernels(manifest: dict, corpus_dir: pathlib.Path) -> dict:
             ("ggml_recurrent_concat_f32", ["history_count", "token_count", "input_transposed"],
              ["history", "input", "output"], ["read", "read", "write"]),
         ]),
+        ("../hrx_owned/ple_conv_f32.loom", [
+            ("ggml_ple_conv_f32", ["token_count"],
+             ["activation0", "weight0", "activation1", "weight1",
+              "activation2", "weight2", "activation3", "weight3", "output"],
+             ["read", "read", "read", "read", "read", "read", "read", "read", "write"]),
+        ]),
         ("../hrx_owned/swiglu_split_f32.loom", [
             ("ggml_swiglu_split_f32", ["element_count"],
              ["gate", "up", "output"], ["read", "read", "write"]),

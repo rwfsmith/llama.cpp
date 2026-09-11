@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -61,6 +63,89 @@ static bool trace_launch_enabled() {
 static bool hrx_time_compute_enabled() {
     static const bool enabled = hrx_environment_flag("HRX_TIME_COMPUTE");
     return enabled;
+}
+
+// Forces individual dispatches through this per-kernel path (see the matching flags in
+// graph-executor.cpp/prepared-command-program-cache.cpp) and, when set, brackets each kernel launch
+// with a real HIP-event device-time measurement via context.device_timing. Diagnostic only: this
+// synchronizes the GPU once per kernel and is far slower than normal operation.
+static bool hrx_profile_dispatches_enabled() {
+    static const bool enabled = [] {
+        const bool value = hrx_environment_flag("HRX_PROFILE_DISPATCHES");
+        GGML_LOG_INFO("HRX dispatch profiling (command-program-executor.cpp): %s\n", value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
+struct DispatchProfileEntry {
+    uint64_t count    = 0;
+    double   total_ms = 0.0;
+    double   max_ms   = 0.0;
+};
+
+static std::mutex g_dispatch_profile_mutex;
+static std::unordered_map<uint64_t, DispatchProfileEntry> g_dispatch_profile_by_kernel_id;
+static uint64_t g_dispatch_profile_samples = 0;
+// Kept only so an atexit-time final summary (registered once, below) can still resolve kernel
+// names for short runs that never reach the periodic sample threshold. The pointed-to context
+// members live as long as the owning ggml_backend_hrx_context, i.e. for the process lifetime.
+static const CommandProgramExecutionContext * g_dispatch_profile_last_context = nullptr;
+
+static void log_dispatch_profile_summary_locked(const CommandProgramExecutionContext & context);
+
+static void flush_dispatch_profile_summary_at_exit() {
+    std::lock_guard<std::mutex> lock(g_dispatch_profile_mutex);
+    if (g_dispatch_profile_samples == 0 || g_dispatch_profile_last_context == nullptr) {
+        return;
+    }
+    GGML_LOG_INFO("HRX dispatch profile: final summary at process exit\n");
+    log_dispatch_profile_summary_locked(*g_dispatch_profile_last_context);
+}
+
+static void record_dispatch_profile_sample(uint64_t kernel_id, double device_ms,
+                                           const CommandProgramExecutionContext & context) {
+    std::lock_guard<std::mutex> lock(g_dispatch_profile_mutex);
+    static const bool registered_atexit = [] {
+        std::atexit(flush_dispatch_profile_summary_at_exit);
+        return true;
+    }();
+    (void) registered_atexit;
+    g_dispatch_profile_last_context = &context;
+    DispatchProfileEntry & entry = g_dispatch_profile_by_kernel_id[kernel_id];
+    entry.count += 1;
+    entry.total_ms += device_ms;
+    if (device_ms > entry.max_ms) {
+        entry.max_ms = device_ms;
+    }
+    ++g_dispatch_profile_samples;
+}
+
+static void log_dispatch_profile_summary_locked(const CommandProgramExecutionContext & context) {
+    std::vector<std::pair<uint64_t, DispatchProfileEntry>> ranked(g_dispatch_profile_by_kernel_id.begin(),
+                                                                   g_dispatch_profile_by_kernel_id.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
+        return a.second.total_ms > b.second.total_ms;
+    });
+    double grand_total_ms = 0.0;
+    for (const auto & entry : ranked) {
+        grand_total_ms += entry.second.total_ms;
+    }
+    GGML_LOG_INFO("HRX dispatch profile: samples=%llu unique_kernels=%zu total_device_ms=%.1f\n",
+                  static_cast<unsigned long long>(g_dispatch_profile_samples), ranked.size(), grand_total_ms);
+    const size_t top_n = ranked.size() < 25 ? ranked.size() : 25;
+    for (size_t i = 0; i < top_n; ++i) {
+        const uint64_t              kernel_id = ranked[i].first;
+        const DispatchProfileEntry & entry     = ranked[i].second;
+        const KernelResolveResult    resolved  =
+            context.corpus != nullptr ? resolve_kernel_definition(*context.corpus, context.target, kernel_id) :
+                                         KernelResolveResult{};
+        const std::string name = kernel_definition_name_or_id(resolved.definition, kernel_id);
+        GGML_LOG_INFO("HRX dispatch profile #%zu: %s calls=%llu total_ms=%.3f avg_ms=%.4f max_ms=%.4f pct=%.1f%%\n",
+                      i + 1, name.c_str(), static_cast<unsigned long long>(entry.count), entry.total_ms,
+                      entry.total_ms / static_cast<double>(entry.count), entry.max_ms,
+                      grand_total_ms > 0.0 ? 100.0 * entry.total_ms / grand_total_ms : 0.0);
+    }
 }
 
 static void trace_kernel_preparation(const KernelDefinition & definition, const Dispatch & dispatch) {
@@ -1332,11 +1417,38 @@ static bool execute_prepared_kernel_command(const CommandProgramExecutionContext
         executable.launch.subgroup_size,
     };
     const clock::time_point t_dispatch = timing ? clock::now() : clock::time_point{};
+    const bool profiling = hrx_profile_dispatches_enabled() && context.device_timing != nullptr;
+    DeviceTimingManager::GraphMeasurement dispatch_measurement;
+    if (profiling) {
+        dispatch_measurement = context.device_timing->begin_graph_measurement(context.stream);
+    }
     if (ErrorResult error = take_status(hrx_stream_dispatch(
             context.stream, executable.executable, executable.export_ordinal, &config, command.kernel.constants.data(),
             command.kernel.constants.size(), refs.data(), refs.size(), 0))) {
+        if (profiling) {
+            context.device_timing->cancel_graph_measurement(dispatch_measurement);
+        }
         GGML_LOG_ERROR("%s: failed to execute %s: %s\n", __func__, command_context.c_str(), error->c_str());
         return false;
+    }
+    if (profiling) {
+        // Bracketing the single dispatch above with begin/finish measurement forces a
+        // synchronize per kernel, which is why this path is diagnostic-only (see the flag doc
+        // comment); it is what makes the resulting per-kernel-id total_ms a real device time
+        // rather than a host submission/queueing estimate.
+        const std::optional<double> device_ms = context.device_timing->finish_graph_measurement(dispatch_measurement);
+        if (device_ms.has_value()) {
+            record_dispatch_profile_sample(command.kernel.specialization.kernel_id, *device_ms, context);
+            uint64_t samples_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(g_dispatch_profile_mutex);
+                samples_snapshot = g_dispatch_profile_samples;
+            }
+            if (samples_snapshot % 20 == 0) {
+                std::lock_guard<std::mutex> lock(g_dispatch_profile_mutex);
+                log_dispatch_profile_summary_locked(context);
+            }
+        }
     }
     if (timing) {
         const clock::time_point t_end   = clock::now();
@@ -2053,17 +2165,35 @@ RecordedCommandGraphExecutionResult bind_and_launch_recorded_command_graph(
         static double   transient_ms = 0.0;
         static double   build_ms     = 0.0;
         static double   launch_ms    = 0.0;
+        static double   upload_ms      = 0.0;
+        static double   execlaunch_ms  = 0.0;
+        static double   download_ms    = 0.0;
         calls += 1;
         rebind_ms += elapsed(t_entry, t_rebound);
         transient_ms += elapsed(t_rebound, t_transient);
         build_ms += elapsed(t_transient, t_built);
         launch_ms += elapsed(t_built, t_end);
-        static double upload_ms   = 0.0;
-        static double execlaunch_ms = 0.0;
-        static double download_ms = 0.0;
         upload_ms += elapsed(t_built, t_uploaded);
         execlaunch_ms += elapsed(t_uploaded, t_launched);
         download_ms += elapsed(t_launched, t_end);
+        static const bool registered_replaypath_atexit = [] {
+            std::atexit([] {
+                if (calls == 0) {
+                    return;
+                }
+                GGML_LOG_INFO("HRX launchphase (final): upload=%.1fms exec_launch=%.1fms download=%.1fms\n",
+                              upload_ms, execlaunch_ms, download_ms);
+                const double total = rebind_ms + transient_ms + build_ms + launch_ms;
+                GGML_LOG_INFO(
+                    "HRX replaypath (final): calls=%llu rebind=%.1fms(%.0f%%) transient=%.1fms(%.0f%%) "
+                    "build=%.1fms(%.0f%%) launch=%.1fms(%.0f%%) total=%.1fms\n",
+                    static_cast<unsigned long long>(calls), rebind_ms, 100.0 * rebind_ms / total, transient_ms,
+                    100.0 * transient_ms / total, build_ms, 100.0 * build_ms / total, launch_ms,
+                    100.0 * launch_ms / total, total);
+            });
+            return true;
+        }();
+        (void) registered_replaypath_atexit;
         if (calls % 5000 == 0) {
             GGML_LOG_INFO("HRX launchphase: upload=%.1fms exec_launch=%.1fms download=%.1fms\n", upload_ms,
                           execlaunch_ms, download_ms);

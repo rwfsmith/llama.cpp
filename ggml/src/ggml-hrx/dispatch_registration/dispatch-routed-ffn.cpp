@@ -1882,7 +1882,15 @@ static DecodeRoutedDownPlainMatch match_decode_routed_ffn_down_qwen4exp(const Di
         return {};
     }
     if (!is_routed_ffn_down_weight_qwen4exp(*weight)) {
-        trace_moe_down_reject("down weight quant/shape");
+        if (trace_moe_down_enabled()) {
+            std::fprintf(stderr,
+                        "hrx: qwen4exp routed down matcher rejected node: down weight quant/shape "
+                        "(type=%d contiguous=%d ne=[%lld,%lld,%lld,%lld])\n",
+                        static_cast<int>(weight->type), weight->contiguous ? 1 : 0,
+                        static_cast<long long>(weight->ne[0]), static_cast<long long>(weight->ne[1]),
+                        static_cast<long long>(weight->ne[2]), static_cast<long long>(weight->ne[3]));
+            std::fflush(stderr);
+        }
         return {};
     }
     const int64_t tokens = input->ne[2];
